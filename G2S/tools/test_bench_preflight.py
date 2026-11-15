@@ -122,6 +122,18 @@ def main():
           bp.ours([SS_UDP_NO_OWNER], "start-dhcp-enhanced.py", True) is True)
     check("no owner shown and our DHCP not running: unknown, so a conflict",
           not bp.ours([SS_UDP_NO_OWNER], "start-dhcp-enhanced.py", False))
+    dhcp = "start-dhcp-enhanced.py"
+    check("the systemd unit's command line counts as running the script",
+          bp.runs_script("/usr/bin/python3 -u start-dhcp-enhanced.py "
+                         "--interface eth0", dhcp))
+    check("so does a sudo'd bench start with a path",
+          bp.runs_script("sudo python3 /home/pi/CabiNet/G2S/"
+                         "start-dhcp-enhanced.py", dhcp))
+    check("a shell or editor that only mentions the name does not",
+          not bp.runs_script("bash -c python3 start-dhcp-enhanced.py", dhcp)
+          and not bp.runs_script("nano start-dhcp-enhanced.py", dhcp)
+          and not bp.runs_script("python3 other.py start-dhcp-enhanced.py",
+                                 dhcp))
     check("pids parsed from every owner on a line",
           bp.holder_pids(['users:(("a",pid=11,fd=3),("b",pid=22,fd=4))'])
           == [11, 22])

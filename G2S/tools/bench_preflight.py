@@ -107,8 +107,10 @@ def pick_nic(explicit, addr_out, unit_text, link_out):
         addressed = {m.group(1).split("@")[0] for m in re.finditer(
             r"^\d+:\s+(\S+)\s+inet\s", addr_out, re.M)}
         nics.sort(key=lambda n: n in addressed)
-        return nics[0], "a guess: first wired NIC without another address" + (
-            f"; others: {', '.join(nics[1:])}" if nics[1:] else "")
+        if len(nics) == 1:
+            return nics[0], "the only wired NIC"
+        return nics[0], ("a guess: first wired NIC without another address"
+                         f"; others: {', '.join(nics[1:])}")
     return None, "no wired NIC found"
 
 
@@ -133,13 +135,21 @@ def ours(ss_lines, script, running):
     answer."""
     pids = holder_pids(ss_lines)
     if pids:
-        return all(script in cmdline(p) for p in pids)
+        return all(runs_script(cmdline(p), script) for p in pids)
     return True if running else None
+
+
+def runs_script(cmd, script):
+    """Is cmd (a process command line) a Python interpreter running
+    `script`? A shell, editor or log viewer that merely mentions the name
+    does not count."""
+    return re.match(r"(sudo\s+(-\S+\s+)*)?\S*python[\d.]*\s+(-\S+\s+)*"
+                    r"(\S*/)?" + re.escape(script) + r"(\s|$)", cmd) is not None
 
 
 def running(script):
     out = sh(f"pgrep -af '{script}' 2>/dev/null")
-    return any(script in ln and "pgrep" not in ln and "/bin/sh" not in ln
+    return any(runs_script(ln.partition(" ")[2], script)
                for ln in out.splitlines())
 
 
