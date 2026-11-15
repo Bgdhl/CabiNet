@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.3.4
+- **Use a ticket again.** Open any ticket on the Tickets page and press
+  **Set back to Issued**: the same paper can be redeemed once more. It
+  works on redeemed, voided and expired tickets, and on a ticket stuck at
+  "minted" because the hub never heard it print. It is refused while a
+  machine is in the middle of redeeming that ticket.
+- **Reusable tickets.** Tick **Reusable ticket** on a ticket and it goes
+  back to Issued by itself every time it is redeemed, so you can keep a
+  stack of round-number tickets to hand out. A reusable ticket never
+  expires, the list shows how many times it has been used, and unticking
+  the box makes the next redemption use it up. Both controls work for
+  tickets printed over SAS and over G2S, and with the machine that
+  printed them switched off.
+
 ## v0.3.3
 - **Updating no longer needs every machine switched on.** The updater
   used to stop with "could not read WorkingDirectory" if any satellite Pi

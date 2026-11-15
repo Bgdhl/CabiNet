@@ -124,7 +124,7 @@ if "tournament_names" not in _hub_store_mod.HOST_SETTING_KEYS:
 # the MINOR bump per the repo's version rule). Surfaced in engine_meta() ->
 # /api/status ["_engine"]["version"]; bump this and add a CHANGELOG.md
 # section on every commit with a user-visible change.
-CABINET_VERSION = "0.3.3"
+CABINET_VERSION = "0.3.4"
 
 WSDL_NS = "http://www.gamingstandards.com/wsdl/g2s/v1.0"
 SCHEMA_NS = "http://www.gamingstandards.com/g2s/schemas/v1.0.3"
@@ -2708,10 +2708,18 @@ class VoucherStore:
                 # not the holder (or no hold exists) — nothing to close
                 return info.get("state")
             if egm_action == "G2S_redeemed":
-                info["state"] = "redeemed"
+                # A REUSABLE voucher (operator flag, #10) is paid like any
+                # other and goes straight back to 'issued' for its next use.
+                # The caller still hears "redeemed" — this redemption DID
+                # complete (the hub ledger's tito_close does the same).
+                again = bool(info.get("reusable"))
+                info["state"] = "issued" if again else "redeemed"
                 info["redeemedTxn"] = txn_id
                 info["redeemedAt"] = now_iso()
+                info["uses"] = int(info.get("uses") or 0) + 1
                 info.pop("pending", None)
+                self._save_locked()
+                return "redeemed"
             elif info.get("state") == "redeemPending":
                 info["state"] = "issued"
                 info.pop("pending", None)
@@ -2735,6 +2743,64 @@ class VoucherStore:
             info.pop("pending", None)
             self._save_locked()
         return prior
+
+    def reissue_id(self, validation_id):
+        """Operator action (#10): set a voucher back to 'issued' so the same
+        paper can be used again. Allowed from redeemed/committed, void and
+        issued (which only lifts an expiry). Refused while a redemption is
+        in progress, for an id no ticket was ever printed against (unused —
+        there is no amount to pay), and without a known amount. The voucher
+        also stops expiring: the operator has said this paper is good.
+        Returns {"ok", "prior", "state"} or {"ok": False, "error"}; None for
+        an id this store never issued."""
+        with self.lock:
+            info = self.state["issuedIds"].get(validation_id)
+            if info is None:
+                return None
+            prior = info.get("state") or "unused"
+            if prior == "redeemPending":
+                return {"ok": False, "prior": prior,
+                        "error": "a redemption is in progress at %s — wait "
+                                 "for it to finish, or void the ticket first"
+                                 % ((info.get("pending") or {}).get("egmId")
+                                    or "a machine")}
+            if prior not in ("redeemed", "committed", "void", "issued"):
+                return {"ok": False, "prior": prior,
+                        "error": "no ticket was ever printed against this "
+                                 "number"}
+            amt = info.get("voucherAmt")
+            if not amt or not str(amt).isdigit() or int(amt) <= 0:
+                return {"ok": False, "prior": prior,
+                        "error": "this ticket has no amount on record"}
+            info["state"] = "issued"
+            info["operatorAt"] = now_iso()
+            info.pop("pending", None)
+            info.pop("expireDateTime", None)
+            info.pop("voidedAt", None)
+            self._save_locked()
+        return {"ok": True, "prior": prior, "state": "issued"}
+
+    def set_reusable(self, validation_id, reusable):
+        """Operator action (#10): mark a voucher reusable (or not). While
+        reusable, each completed redemption puts it straight back to
+        'issued' and it never expires. Turning it ON for an already
+        redeemed voucher also sets it back to 'issued'; a void or unused id
+        keeps its state. Returns {"ok", "reusable", "state"}; None for an
+        unknown id."""
+        on = bool(reusable)
+        with self.lock:
+            info = self.state["issuedIds"].get(validation_id)
+            if info is None:
+                return None
+            info["reusable"] = on
+            info["operatorAt"] = now_iso()
+            if on:
+                info.pop("expireDateTime", None)
+                if info.get("state") in ("redeemed", "committed"):
+                    info["state"] = "issued"
+            self._save_locked()
+            return {"ok": True, "reusable": on,
+                    "state": info.get("state") or "unused"}
 
     def has_id(self, validation_id):
         """True if this store ever issued the id — the TitoAuthority union
@@ -2865,7 +2931,13 @@ class VoucherStore:
                         info["creditType"] = e.get("creditType")
                     pend = info.get("pending") or {}
                     if e.get("egmAction") == "G2S_redeemed":
-                        if info.get("state") not in ("redeemed", "void"):
+                        # An operator reissued this voucher or made it
+                        # reusable (#10): a redemption replayed from the
+                        # EGM's log is history, not a reason to consume it
+                        # again.
+                        if info.get("reusable") or info.get("operatorAt"):
+                            pass
+                        elif info.get("state") not in ("redeemed", "void"):
                             info["state"] = "redeemed"
                             info["redeemedTxn"] = txn
                             info["redeemedAt"] = when
@@ -2923,6 +2995,10 @@ class VoucherStore:
             "voidedAt": info.get("voidedAt"),
             "transactionId": info.get("issueTxn")
             or pend.get("transactionId") or info.get("redeemedTxn"),
+            # operator controls (#10) — the UI feature-detects on "reusable"
+            "reusable": bool(info.get("reusable")),
+            "uses": int(info.get("uses") or 0),
+            "operatorAt": info.get("operatorAt"),
         }
 
     def api_vouchers(self, limit=50, offset=0, state=None, egm_id=None,
@@ -24017,7 +24093,7 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                 log.error("tito commit(%s) failed: %s", validation, e)
                 return fail(503, f"ledger unavailable: {e}")
             if redeemed and state == "redeemed":
-                log.info("🎟️ TICKET REDEEMED at %s — %s consumed",
+                log.info("🎟️ TICKET REDEEMED at %s — %s",
                          machine, validation)
                 # Activity tape: the consumed moment, with amount/origin
                 # from the hub ledger when it owns the row (tito_list is a
@@ -24062,6 +24138,51 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                 log.error("tito void(%s) failed: %s", validation, e)
                 return fail(503, f"ledger unavailable: {e}")
             return ok(prior=prior)
+
+        if sub in ("reissue", "reusable"):
+            # Operator ticket controls (#10): set a ticket back to 'issued',
+            # or mark it reusable. ONE door for both ledgers, routed like
+            # the TitoAuthority union — an id the VoucherStore issued (a
+            # G2S-printed voucher) is changed there, anything else in the
+            # hub ledger. Deliberately NOT an /api/command action: those
+            # need the ticket's machine to be online, and the tickets a
+            # collector reuses were often printed by a machine that is
+            # switched off today. Same posture as the void above (the
+            # Tickets page posts smibId "webui").
+            validation = digits("canonical") or digits("vn16")
+            if not validation:
+                return fail(400, "canonical or vn16 required (digits)")
+            if sub == "reusable" and not isinstance(req.get("reusable"),
+                                                    bool):
+                return fail(400, "reusable required (true or false)")
+            try:
+                g2s = engine.voucher_store.has_id(validation)
+                if sub == "reissue":
+                    r = engine.voucher_store.reissue_id(validation) if g2s \
+                        else engine.hub_store.tito_reissue(validation)
+                else:
+                    r = engine.voucher_store.set_reusable(
+                        validation, req["reusable"]) if g2s \
+                        else engine.hub_store.tito_set_reusable(
+                            validation, req["reusable"])
+                if g2s and r and r.get("ok"):
+                    # the hub ledger logs its own; say it for vouchers too
+                    log.warning("🎟️ voucher %s %s by an operator", validation,
+                                "set back to ISSUED (was %s)" % r.get("prior")
+                                if sub == "reissue" else "marked %s" % (
+                                    "REUSABLE" if r.get("reusable")
+                                    else "single-use"))
+            except Exception as e:  # noqa: BLE001
+                log.error("tito %s(%s) failed: %s", sub, validation, e)
+                return fail(503, f"ledger unavailable: {e}")
+            if r is None:
+                return fail(404, "unknown ticket")
+            if not r.get("ok"):
+                return self._send(200, json.dumps(
+                    {"ok": False, "error": r.get("error"),
+                     "prior": r.get("prior")}),
+                    "application/json", soap=False)
+            return ok(**{k: v for k, v in r.items() if k != "ok"})
 
         if sub == "sync":
             tickets = req.get("tickets")

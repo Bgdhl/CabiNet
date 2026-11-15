@@ -72,7 +72,7 @@ import time
 
 log = logging.getLogger("g2s.hub_store")
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 # Hard bounds — /api/names is unauthenticated (anyone on the floor VLAN/AP),
 # so the registry must stay bounded: without these, one hostile poster loops
@@ -710,6 +710,31 @@ class HubStore:
                           "device_tail TEXT NOT NULL DEFAULT ''")
             c.execute("CREATE INDEX IF NOT EXISTS satellites_device_idx "
                       "ON satellites(device_tail)")
+        if current < 15:
+            # v15: operator ticket controls (GitHub #10). A collector keeps
+            # a stack of round-number tickets to hand out and wants to use
+            # them again and again.
+            #   reusable    — 1 = a completed redemption puts the row straight
+            #                 back to 'issued' instead of consuming it
+            #   uses        — how many times it has been redeemed
+            #   operator_at — when an operator last reissued it or changed
+            #                 its reusable flag. Once set, a satellite's
+            #                 ledger sync never changes the row's state: the
+            #                 satellite mirror only knows the OLD redemption
+            #                 and would re-consume the ticket.
+            # PRAGMA-guarded ALTERs keep the step rerun-safe (the v4
+            # DDL-autocommit landmine).
+            cols = {r["name"] for r in
+                    c.execute("PRAGMA table_info(tito_tickets)").fetchall()}
+            if "reusable" not in cols:
+                c.execute("ALTER TABLE tito_tickets ADD COLUMN "
+                          "reusable INTEGER NOT NULL DEFAULT 0")
+            if "uses" not in cols:
+                c.execute("ALTER TABLE tito_tickets ADD COLUMN "
+                          "uses INTEGER NOT NULL DEFAULT 0")
+            if "operator_at" not in cols:
+                c.execute("ALTER TABLE tito_tickets ADD COLUMN "
+                          "operator_at TEXT")
         if current < SCHEMA_VERSION:
             c.execute("INSERT INTO schema_meta(key,value) VALUES('version',?) "
                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -2249,7 +2274,8 @@ class HubStore:
                         "UPDATE tito_tickets SET state='issued', amount_mc=?, "
                         "ticket_number=?, issued_at=?, minted_at=?, "
                         "expire_days=?, redeemed_at=NULL, redeemed_by=NULL, "
-                        "pending_json=NULL, extra_json=? WHERE canonical=?",
+                        "pending_json=NULL, reusable=0, uses=0, "
+                        "operator_at=NULL, extra_json=? WHERE canonical=?",
                         (amt, ticket_number, issued_at or now, now,
                          self._expire_days_now(c), note, row["canonical"]))
                     c.commit()
@@ -2383,15 +2409,24 @@ class HubStore:
                      and pend.get("txn") == txn)
             if redeemed:
                 if holds:
+                    # A REUSABLE ticket (operator flag, #10) is paid like any
+                    # other but goes straight back to 'issued' for its next
+                    # use. The caller still hears "redeemed": this redemption
+                    # DID complete, and every call site keys its own
+                    # bookkeeping on that word.
+                    again = bool(row["reusable"])
                     c.execute(
-                        "UPDATE tito_tickets SET state='redeemed', "
-                        "redeemed_at=?, redeemed_by=?, pending_json=NULL "
-                        "WHERE canonical=?",
-                        (_now_iso(), machine, row["canonical"]))
+                        "UPDATE tito_tickets SET state=?, "
+                        "redeemed_at=?, redeemed_by=?, pending_json=NULL, "
+                        "uses=uses+1 WHERE canonical=?",
+                        ("issued" if again else "redeemed", _now_iso(),
+                         machine, row["canonical"]))
                     c.commit()
                     log.info("🎟️ tito ledger: %s REDEEMED at %s "
-                             "(%dmc)", row["canonical"], machine,
-                             int(row["amount_mc"] or 0))
+                             "(%dmc)%s", row["canonical"], machine,
+                             int(row["amount_mc"] or 0),
+                             " — reusable, back to issued (use #%d)"
+                             % (int(row["uses"] or 0) + 1) if again else "")
                     return "redeemed"
             elif row["state"] == "redeemPending" and holds:
                 c.execute("UPDATE tito_tickets SET state='issued', "
@@ -2465,6 +2500,12 @@ class HubStore:
                              str(t.get("redeemedBy"))
                              if t.get("redeemedBy") is not None else None))
                         inserted += 1
+                    elif row["reusable"] or row["operator_at"]:
+                        # An operator reissued this ticket or made it
+                        # reusable. The satellite's mirror still holds the
+                        # OLD redemption and would consume it again — the
+                        # operator's word outranks it (v15). Not a conflict.
+                        pass
                     else:
                         have = _TITO_STATE_RANK.get(row["state"], 0)
                         want = _TITO_STATE_RANK[state]
@@ -2528,6 +2569,90 @@ class HubStore:
             log.warning("tito ledger: %s VOIDED (was %s)",
                         row["canonical"], prior)
             return prior
+
+    #: States an operator may set back to 'issued'. NOT redeemPending: a
+    #: machine is holding that ticket in escrow right now, and pulling the
+    #: row out from under it is how one ticket pays twice.
+    _REISSUABLE = ("redeemed", "void", "minted", "issued")
+
+    def tito_reissue(self, validation):
+        """Operator action (#10): set a ticket back to 'issued' so the same
+        paper can be used again. Allowed from redeemed, void, minted (paper
+        the hub never saw print — the operator is vouching it exists) and
+        issued (which only lifts a printed expiry). Refused while a
+        redemption is in progress, and for a row with no amount. The row
+        also stops expiring: the operator has said this paper is good.
+        Returns {"ok", "prior", "state"} or {"ok": False, "error"}; None for
+        a ticket this ledger never held."""
+        self._refuse_ephemeral("reissue")
+        now = _now_iso()
+        with self.lock:
+            c = self._conn
+            row = self._tito_lookup(c, validation)
+            if row is None:
+                c.commit()
+                return None
+            prior = row["state"]
+            if prior == "redeemPending":
+                c.commit()
+                return {"ok": False, "prior": prior,
+                        "error": "a redemption is in progress at %s — wait "
+                                 "for it to finish, or void the ticket first"
+                                 % (self._tito_pending(row).get("machine")
+                                    or "a machine")}
+            if prior not in self._REISSUABLE:
+                c.commit()
+                return {"ok": False, "prior": prior,
+                        "error": f"cannot reissue from state {prior!r}"}
+            if int(row["amount_mc"] or 0) <= 0:
+                c.commit()
+                return {"ok": False, "prior": prior,
+                        "error": "this ticket has no amount on record"}
+            c.execute(
+                "UPDATE tito_tickets SET state='issued', pending_json=NULL, "
+                "issued_at=COALESCE(issued_at, ?), expire_days=NULL, "
+                "operator_at=? WHERE canonical=?",
+                (now, now, row["canonical"]))
+            c.commit()
+            log.warning("tito ledger: %s set back to ISSUED by an operator "
+                        "(was %s, %dmc)", row["canonical"], prior,
+                        int(row["amount_mc"] or 0))
+            return {"ok": True, "prior": prior, "state": "issued"}
+
+    def tito_set_reusable(self, validation, reusable):
+        """Operator action (#10): mark a ticket reusable (or not). While
+        reusable, each completed redemption puts it straight back to
+        'issued' and it never expires. Turning it ON for a ticket that is
+        already redeemed also sets it back to 'issued' — otherwise the
+        checkbox would do nothing until some later, separate step. A void
+        or minted ticket keeps its state (the flag waits for a reissue).
+        Returns {"ok", "reusable", "state"}; None for an unknown ticket."""
+        self._refuse_ephemeral("set_reusable")
+        on = bool(reusable)
+        now = _now_iso()
+        with self.lock:
+            c = self._conn
+            row = self._tito_lookup(c, validation)
+            if row is None:
+                c.commit()
+                return None
+            state = row["state"]
+            if on and state == "redeemed":
+                state = "issued"
+            if on:
+                c.execute(
+                    "UPDATE tito_tickets SET reusable=1, expire_days=NULL, "
+                    "operator_at=?, state=? WHERE canonical=?",
+                    (now, state, row["canonical"]))
+            else:
+                c.execute(
+                    "UPDATE tito_tickets SET reusable=0, operator_at=? "
+                    "WHERE canonical=?", (now, row["canonical"]))
+            c.commit()
+            log.warning("tito ledger: %s marked %s by an operator (state %s)",
+                        row["canonical"],
+                        "REUSABLE" if on else "single-use", state)
+            return {"ok": True, "reusable": on, "state": state}
 
     def tito_counts(self):
         """Best-effort {total, <state>: n} for /api/status — must never
@@ -2651,6 +2776,9 @@ class HubStore:
             "issuedAt": r["issued_at"], "redeemedAt": r["redeemed_at"],
             "redeemedBy": r["redeemed_by"],
             "pending": self._tito_pending(r) or None,
+            # v15 operator controls — the UI feature-detects on "reusable"
+            "reusable": bool(r["reusable"]), "uses": int(r["uses"] or 0),
+            "operatorAt": r["operator_at"],
         } for r in rows]}
 
     def close(self):

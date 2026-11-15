@@ -412,6 +412,11 @@
     text-overflow:ellipsis;vertical-align:1px;
     background:linear-gradient(180deg,#2e2211,#271c0e)}
   .xm .ar{color:var(--felt);font-weight:700}
+  .tkreuse{display:flex;gap:10px;align-items:flex-start;margin:0 0 10px;padding:10px 12px;
+    background:var(--inset);border:1px solid var(--line);border-radius:12px;cursor:pointer}
+  .tkreuse input{width:20px;height:20px;margin:2px 0 0;flex:none;accent-color:var(--gold-hi)}
+  .tkreuse b{display:block;font-weight:600}
+  .tkreuse small{display:block;opacity:.7;font-size:12px;line-height:1.35;margin-top:2px}
   .vidbox{background:var(--inset);border:1px solid var(--line);border-radius:12px;
     padding:14px 12px;margin:0 auto;width:min(340px,86vw);text-align:center}
   .vidbox .vid{font:700 clamp(19px,5.2vw,26px) var(--mono);color:var(--gold-hi);
@@ -1406,7 +1411,7 @@ async function fetchTickets(append){
     if(append) S.tk.list=S.tk.list.concat(rows);
     else {S.tk.list=rows; S.tk.offset=0;}
     if(S.tab==="tickets") renderTickets();
-    if(S.modal && S.modal.kind==="ticket") renderTicketModal(S.modal.id);
+    if(S.modal && S.modal.kind==="ticket" && !ARM) renderTicketModal(S.modal.id);
   }catch(e){}
 }
 async function fetchTito(append){
@@ -4322,7 +4327,7 @@ function voucherRow(v){
       <span class="st ${esc(v.state)}"></span>
       <span class="ta">${esc(fmtAmt(v.amountMillicents))}</span>
       <span class="ti"><span class="id">${esc(fmtVid(v.validationId))}</span>
-        <span class="mt">${esc(machineName(snap(v.egmId),v.egmId))} · ${esc(stateLabel(v.state))}</span>
+        <span class="mt">${esc(machineName(snap(v.egmId),v.egmId))} · ${esc(stateLabel(v.state))}${tkReuseTag(v)}</span>
         ${cross?xmBadge(v.egmId,v.redeemedBy):""}</span>
       <span class="tst">${esc(v.issuedAt?ago(v.issuedAt):"")}</span>
     </button>`;
@@ -4341,10 +4346,71 @@ function hubRow(t){
       <span class="ta">${esc(fmtAmt(t.amountMc))}</span>
       <span class="ti"><span class="id">${esc(fmtVid(t.canonical))}</span>
         <span class="mt">${esc(titoName(t.origin))} · ${esc(stateLabel(t.state))}${
-          pendAt?" · redeeming at "+esc(titoName(t.pending.machine)):""}</span>
+          pendAt?" · redeeming at "+esc(titoName(t.pending.machine)):""}${tkReuseTag(t)}</span>
         ${cross?xmBadge(t.origin,t.redeemedBy):""}</span>
       <span class="tst">${esc(when?ago(when):"")}</span>
     </button>`;
+}
+/* ---- operator ticket controls (GitHub #10) -------------------------------
+   Two controls on every ticket: "Set back to Issued" (use the same paper
+   again once) and a "Reusable ticket" checkbox (it goes back to Issued by
+   itself after every redemption). Both are feature-detected on the record
+   carrying a `reusable` key — an older hub simply shows neither. */
+function tkReuseTag(t){
+  if(!t||!t.reusable) return "";
+  return " · reusable"+(t.uses?" ×"+esc(String(t.uses)):"");
+}
+function tkControls(t, kind, reissuable, attrs){
+  // kind: "hub" (tito ledger) | "g2s" (voucher store); attrs = data-* string
+  if(!t||!("reusable" in t)) return "";
+  return `
+    <label class="tkreuse"><input type="checkbox" ${t.reusable?"checked":""} ${attrs}
+        onchange="tkReuse(this,'${kind}')">
+      <span><b>Reusable ticket</b>
+        <small>Goes back to Issued every time it is redeemed, and never expires.
+        Use it for tickets you hand out again and again.</small></span></label>
+    ${reissuable?`<button class="btn" style="width:100%;text-align:center;margin:0 0 10px" ${attrs}
+      onclick="tkReissue(this,'${kind}')">
+      <span class="bl">Set back to Issued</span>
+      <span class="ba">the same paper can be redeemed again</span></button>`:""}`;
+}
+async function tkOp(kind, op, d, reusable){
+  /* ONE door for both ledgers: POST /api/tito/<reissue|reusable>. The hub
+     routes a G2S voucher's 18-digit id to the voucher store and anything
+     else to the tito ledger — and it works with the ticket's machine
+     switched off. Returns {ok, j} or {ok:false, msg}. */
+  try{
+    const body={smibId:"webui", address:0};
+    if(kind==="hub") body.vn16=d.vn; else body.canonical=d.vid;
+    if(op==="reusable") body.reusable=reusable;
+    const r=await fetch("/api/tito/"+op,{method:"POST",
+      headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
+    const j=await r.json().catch(()=>null);
+    if(r.status===404&&!j) return {ok:false, msg:"Awaiting host update"};
+    return j&&j.ok?{ok:true, j}:{ok:false, msg:String((j&&j.error)||("HTTP "+r.status)).slice(0,160)};
+  }catch(e){return {ok:false, msg:"Host unreachable — nothing was changed"};}
+}
+function tkAfter(kind, id){
+  if(kind==="hub"){ if(S.modal&&S.modal.kind==="htk") renderHubTicketModal(id); }
+  else if(S.modal&&S.modal.kind==="ticket") renderTicketModal(id);
+  S.tk.at=0; S.tk.offset=0; fetchTito(false); fetchTickets(false);
+}
+async function tkReissue(btn, kind){
+  if(!armCheck(btn,"set this ticket back to Issued")) return;
+  const d=btn.dataset, id=kind==="hub"?d.cid:d.vid;
+  const r=await tkOp(kind,"reissue",d);
+  TKV={id, ok:r.ok, msg:r.ok?"Set back to Issued ✓"+(r.j&&r.j.prior
+      ?" — was "+stateLabel(r.j.prior):""):"Not changed · "+r.msg};
+  flash(btn, r.ok);
+  tkAfter(kind, id);
+}
+async function tkReuse(box, kind){
+  const d=box.dataset, id=kind==="hub"?d.cid:d.vid, want=box.checked;
+  const r=await tkOp(kind,"reusable",d,want);
+  if(!r.ok) box.checked=!want;       // the server said no — show the truth
+  TKV={id, ok:r.ok, msg:r.ok?(want?"Reusable ✓ — it goes back to Issued after each use"
+      :"Single-use ✓ — the next redemption consumes it"):"Not changed · "+r.msg};
+  tkAfter(kind, id);
 }
 function fmtVid(v){
   const s=String(v||"");
@@ -4375,6 +4441,8 @@ function renderTicketModal(vid){
     ["redeemed",v.redeemedAt?clock(v.redeemedAt)+" · "+ago(v.redeemedAt):"—"],
     ["voided",v.voidedAt?clock(v.voidedAt):"—"],
     ["transaction",v.transactionId||"—"]];
+  if(v.uses) rows.push(["times redeemed",String(v.uses)]);
+  const vAttrs=`data-egm="${esc(v.egmId||"")}" data-vid="${esc(vid)}"`;
   setHTML($("m-body"),`
     <div style="text-align:center;margin:0 0 12px">
       <div style="font:700 36px var(--display);color:var(--gold-hi)">${esc(fmtAmt(v.amountMillicents))}</div>
@@ -4387,10 +4455,13 @@ function renderTicketModal(vid){
       onclick="vidCopy('${esc(vid)}')"><span class="bl">Copy number</span></button>
     <div class="kv" style="margin:14px 0">${rows.map(([k,val])=>
       `<div class="k">${esc(k)}</div><div class="v">${esc(val)}</div>`).join("")}</div>
+    ${tkControls(v,"g2s",["redeemed","void","expired"].includes(v.state),vAttrs)}
     ${v.state==="issued"?`<button class="btn danger" style="width:100%;text-align:center"
       data-egm="${esc(v.egmId||"")}" data-vid="${esc(vid)}" onclick="tkVoid(this)">
       <span class="bl">Void this ticket</span>
-      <span class="ba">redemption will refuse it</span></button>`:""}`);
+      <span class="ba">redemption will refuse it</span></button>`:""}
+    ${TKV.id===vid&&TKV.msg?`<p class="none" style="margin:10px 0 0${
+      TKV.ok?"":";color:var(--ruby);font-style:normal"}">${esc(TKV.msg)}</p>`:""}`);
 }
 async function vidCopy(vid){
   /* the printed barcode is what phones scan — here the 18 digits themselves
@@ -4437,7 +4508,9 @@ function renderHubTicketModal(cid){
     rows.push(["redeem pending",titoName(t.pending.machine)
       +(t.pending.at?" · "+clock(t.pending.at):"")]);
   if(t.vn16) rows.push(["system id (vn16)",fmtVid(t.vn16)]);
+  if(t.uses) rows.push(["times redeemed",String(t.uses)]);
   const voidable=t.state==="issued"||t.state==="redeemPending";
+  const hAttrs=`data-vn="${esc(t.vn16||t.canonical)}" data-cid="${esc(t.canonical)}"`;
   setHTML($("m-body"),`
     <div style="text-align:center;margin:0 0 12px">
       <div style="font:700 36px var(--display);color:var(--gold-hi)">${esc(fmtAmt(t.amountMc))}</div>
@@ -4451,6 +4524,7 @@ function renderHubTicketModal(cid){
       onclick="vidCopy('${jsq(t.canonical)}')"><span class="bl">Copy number</span></button>
     <div class="kv" style="margin:14px 0">${rows.map(([k,val])=>
       `<div class="k">${esc(k)}</div><div class="v">${esc(val)}</div>`).join("")}</div>
+    ${tkControls(t,"hub",["redeemed","void","expired","minted"].includes(t.state),hAttrs)}
     ${voidable?`<button class="btn danger" style="width:100%;text-align:center"
       data-vn="${esc(t.vn16||t.canonical)}" data-cid="${esc(t.canonical)}" onclick="tkVoidHub(this)">
       <span class="bl">Void this ticket</span>
