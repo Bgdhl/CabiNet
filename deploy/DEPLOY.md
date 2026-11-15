@@ -107,8 +107,16 @@ that is not signed in can read only what the wall board shows.
 
 A login is signed out after 30 minutes without a tap or a key press; the
 Hub login card changes that. The hub's own touchscreen asks for a sign-in
-like any other browser and draws its own keyboard. Adding logins needs a
-real keyboard, so do that from a phone or a computer.
+like any other browser.
+
+**No keyboard on the hub?** The hub's touchscreen draws its own. Tap any
+text box on the hub page, the sign-in page, the Test Panel or the console
+and a keyboard slides up from the bottom; number boxes get a number pad.
+**next** moves to the next box, **enter** submits, **⌄** hides it. It turns
+on by itself on the kiosk (`kiosk_setup.sh` opens `/home?kiosk=1`) and on
+the 800x480 touchscreen. Phones and tablets use their own keyboard. To
+force it on or off in one browser, open the hub once with `?osk=1` or
+`?osk=0` on the address; that browser remembers.
 
 **Locked out?** Log in to the hub over SSH as the account the hub runs as:
 

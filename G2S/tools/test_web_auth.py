@@ -90,6 +90,7 @@ def pure():
             ("/webui/glass.html", P), ("/webui/smib.html", P),
             ("/webui/glass/EGM/1/glass.html", P), ("/webui/login.html", P),
             ("/webui/board.html", P), ("/board", P), ("/login", P),
+            ("/webui/osk.js", P),
             ("/api/status", P), ("/api/accounts", P), ("/api/hubkey", P),
             ("/api/glass/state", P), ("/api/auth/state", P),
             ("/api/players", N), ("/api/fobs", N), ("/api/vouchers", N),
@@ -664,6 +665,17 @@ def http_layer():
                  "/webui/glass/EGM_1/1/glass.html"):
         st, _, raw, _ = anon.get(page)
         check(f"display: {page} is served", st == 200 and "<" in raw, st)
+    # The sign-in page is shown to signed-out browsers, and on the hub's own
+    # touchscreen it can only be typed into with the on-screen keyboard.
+    st, _, raw, _ = anon.get("/webui/osk.js")
+    check("keyboard: /webui/osk.js is served to a signed-out browser",
+          st == 200 and "CabiOSK" in raw, st)
+    webui = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "webui")
+    for name in ("login.html", "home.html", "index.html", "console.html"):
+        with open(os.path.join(webui, name), encoding="utf-8") as f:
+            check(f"keyboard: {name} loads the on-screen keyboard",
+                  '<script src="/webui/osk.js"></script>' in f.read())
     st, js, raw, _ = anon.get("/api/status?slim=1")
     check("display: /api/status answers, as the display view",
           st == 200 and js.get("loginRequired") is True

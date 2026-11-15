@@ -504,6 +504,8 @@
     display:flex;flex-direction:column;gap:8px;align-items:center;width:max-content;
     max-width:92vw;pointer-events:none}
   html.bottomnav #toasts{bottom:76px}
+  /* on-screen keyboard up (osk.js): messages sit above it, not under it */
+  html.osk-open #toasts{bottom:calc(var(--osk-h,260px) + 10px);z-index:1001}
   .toast{background:rgba(38,27,17,.96);border:1px solid var(--line);
     border-left:3px solid var(--felt);border-radius:10px;padding:11px 18px;
     font:13px var(--sans);box-shadow:0 8px 22px #000b;max-width:92vw}
@@ -531,6 +533,8 @@
     .brand .sub{display:none}
   }
 </style>
+<!-- on-screen keyboard for a hub with no physical one (touch kiosk) -->
+<script src="/webui/osk.js"></script>
 </head>
 <body>
 <header id="hdr">
@@ -6287,12 +6291,19 @@ function renderLogin(){
       The lock keeps people out of these pages; it does not encrypt the connection, and it
       does not stop a device on the slot network from talking to the hub the way a machine does.</p>`);
 }
+/* Enter in one of the login forms presses that form's main button — the
+   on-screen keyboard covers the button on the hub's small touchscreen. */
+function lgEnter(e){
+  if(e.key!=="Enter"||e.target.tagName!=="INPUT") return;
+  const b=$("m-body").querySelector("button[data-enter]");
+  if(b&&!b.disabled){e.preventDefault(); b.click();}
+}
 function loginEdit(name){
   const cur=(AUTH.logins||[]).find(l=>l.username===name)||null;
   S.modal={kind:"login", id:name};
   $("m-title").textContent=cur?("Login — "+name):"Add a login";
   setHTML($("m-body"),`
-    <div class="lgform">
+    <div class="lgform" onkeydown="lgEnter(event)">
       ${cur?"":`<input type="text" id="lg-user" maxlength="32" autocapitalize="none"
         autocomplete="off" spellcheck="false" placeholder="username (lowercase)" aria-label="Username">`}
       <select id="lg-role" aria-label="Kind of login">
@@ -6308,7 +6319,7 @@ function loginEdit(name){
       lock and unlock machines and load credits. Settings, logins, players and cards,
       updates, forgetting machines and reusable tickets need an admin.${
       cur?" A new password signs that login out everywhere.":""}</p>
-    <div class="btnrow"><button class="btn slim gold" onclick="loginSave(this,'${jsq(name)}')">
+    <div class="btnrow"><button class="btn slim gold" data-enter onclick="loginSave(this,'${jsq(name)}')">
       <span class="bl">${cur?"Save":"Add login"}</span></button></div>`);
   $("modal").classList.add("on");
 }
@@ -6341,13 +6352,13 @@ function lockOnOpen(){
     <p class="none" style="margin:0 0 10px">Sign in with an admin login to turn the lock on.
       This proves the login works before anything is locked, and keeps this browser signed in.
       Every other browser — and the hub's own touchscreen — will be asked to sign in.</p>
-    <div class="lgform">
+    <div class="lgform" onkeydown="lgEnter(event)">
       <input type="text" id="lk-user" maxlength="32" autocapitalize="none" autocomplete="username"
         spellcheck="false" placeholder="admin username" aria-label="Admin username">
       <input type="password" id="lk-pw" maxlength="128" autocomplete="current-password"
         placeholder="password" aria-label="Password">
     </div>
-    <div class="btnrow"><button class="btn slim gold" onclick="lockOn(this)">
+    <div class="btnrow"><button class="btn slim gold" data-enter onclick="lockOn(this)">
       <span class="bl">Turn the lock on</span></button></div>`);
   $("modal").classList.add("on");
 }
@@ -6381,7 +6392,7 @@ function whoOpen(){
     <p class="none" style="margin:0 0 10px">${isAdmin()
       ?"Admin login — everything."
       :"Normal login — you can see everything and run the floor day to day. Settings and setup need an admin."}</p>
-    <div class="lgform">
+    <div class="lgform" onkeydown="lgEnter(event)">
       <input type="password" id="pw-cur" maxlength="128" autocomplete="current-password"
         placeholder="current password" aria-label="Current password">
       <input type="password" id="pw-new" maxlength="128" autocomplete="new-password"
@@ -6390,7 +6401,7 @@ function whoOpen(){
         placeholder="new password again" aria-label="New password again">
     </div>
     <div class="btnrow">
-      <button class="btn slim" onclick="pwChange(this)"><span class="bl">Change password</span></button>
+      <button class="btn slim" data-enter onclick="pwChange(this)"><span class="bl">Change password</span></button>
       <button class="btn slim gold" onclick="signOut()"><span class="bl">Sign out</span></button>
     </div>`);
   $("modal").classList.add("on");

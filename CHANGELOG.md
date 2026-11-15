@@ -13,6 +13,13 @@
   the box makes the next redemption use it up. Both controls work for
   tickets printed over SAS and over G2S, and with the machine that
   printed them switched off.
+- **On-screen keyboard for a hub with no keyboard.** On the hub's
+  touchscreen, tapping any text box now brings up a keyboard along the
+  bottom of the screen (a number pad for number boxes). It works on the
+  hub page, the sign-in page, the Test Panel and the console, so names,
+  players, settings and logins can all be typed on the hub itself. Phones
+  and tablets keep using their own keyboard. Add `?osk=1` or `?osk=0` to
+  the hub's address once to force it on or off in that browser.
 - **Optional sign-in for the hub pages.** Settings has a new **Hub
   login** card. Add a login, turn the lock on, and the hub pages ask for
   a username and password. It is off until you turn it on, and nothing
@@ -29,8 +36,7 @@
     shows.
   - **Signs out when unused.** A login is signed out after 30 minutes
     with no taps or typing (you can change this, or turn it off). The
-    hub's own touchscreen asks for a sign-in too and has an on-screen
-    keyboard.
+    hub's own touchscreen asks for a sign-in too.
   - **Locked out?** On the hub, run `python3 G2S/tools/hub_login.py`. It
     can reset a password, add an admin or turn the lock off, and needs no
     sign-in.
