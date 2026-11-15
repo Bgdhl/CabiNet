@@ -448,10 +448,17 @@ be identical on both, and a hub-only `git pull` breaks a satellite in one of
 two ways: loudly, with an `ImportError` crash-loop, or **silently**, where the
 service reports `active`, logs nothing at all, and the SAS link is simply dead.
 The silent one is why this script exists instead of a line in these docs
-telling you to `git pull`. Readers are updated best-effort: one that is
-powered off or unreachable is **named** in the output (never silently skipped)
-but does not block the rest of the fleet — re-run the update, or
-`deploy/companion_setup.sh`, when it is back.
+telling you to `git pull`.
+
+**Not every machine has to be on.** A satellite or reader Pi that is powered
+off or unreachable is **named** in the output (never silently skipped) and the
+rest of the fleet updates without it. You do not have to remember it: when
+that Pi starts reporting again, the hub compares its code with its own and, if
+it differs, copies the current version over and restarts that Pi's service —
+usually within a minute of it coming up. The hub log says so
+(`was running out-of-date code — brought up to this hub's version`), and each
+satellite's entry in `/api/status` carries a `codeSync` state. To do the same
+by hand: `python3 deploy/update.py --catch-up <the Pi's IP>`.
 
 **Your data is protected, and that is not optional.** Before anything is
 touched, the updater takes a full snapshot of `G2S/data/` — `hub.db` (via

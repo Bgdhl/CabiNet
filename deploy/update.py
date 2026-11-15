@@ -26,6 +26,18 @@ that combination fails in two ways we have both actually hit:
 So this script updates the WHOLE set, gates it BEFORE restarting anything, and
 rolls back if the floor does not come back.
 
+A MACHINE THAT IS SWITCHED OFF DOES NOT BLOCK THE UPDATE
+--------------------------------------------------------
+A collector's machines are never all on at once. A satellite that cannot be
+reached is skipped and named, the rest of the floor updates, and the hub brings
+the missing one current by itself the moment it starts reporting again:
+
+    python3 deploy/update.py --catch-up 192.168.50.104
+
+is what the hub runs for it (and you can run it by hand). It copies the hub's
+own SAS/ and Companion/ trees to that one Pi and restarts its service ONLY if a
+file's content differs, so the quiet split above cannot outlive a power-on.
+
 WHAT IT WILL NOT DO
 -------------------
   * It never touches `data/` — hub.db, voucher state, config inventory,
@@ -62,6 +74,7 @@ G2S_GATES = (
     "test_companion_rfid.py",
     "test_aft_push.py",
     "test_machine_linking.py",
+    "test_satellite_catchup.py",
 )
 
 # Satellites get the whole SAS tree minus data/caches. It is a SET, not a file:
@@ -548,8 +561,8 @@ def sat_companion_dir(peer, key, user=None):
     """The companion's install dir, read from ITS cabinet-companion unit —
     never guessed. Returns (dir, None) or (None, why): companions update
     best-effort, LOUDLY, because a powered-off or never-keyed reader must not
-    hold the money-path update hostage the way a SAS satellite (rightly)
-    does."""
+    hold the money-path update hostage. (SAS satellites are skipped the same
+    way since v0.3.3 — the hub catches a late one up; see catch_up.)"""
     try:
         rc, out = sat_ssh(peer, key,
                           "grep -h '^WorkingDirectory=' "
@@ -622,19 +635,55 @@ def sat_clock(peer, key, user=None):
         pass
 
 
-def sat_sas_dir(peer, key, user=None):
-    """Read the satellite's own service file for its working directory rather
-    than guessing the path — a wrong guess would 'succeed' into nowhere."""
-    rc, out = sat_ssh(peer, key,
-                      "grep -h '^WorkingDirectory=' "
-                      "/etc/systemd/system/cabinet-sas.service 2>/dev/null "
-                      "|| true", check=False, user=user)
+def sat_probe_sas(peer, key, user=None):
+    """The satellite's SAS directory, read from ITS OWN service file rather
+    than guessed — a wrong guess would 'succeed' into nowhere. Returns
+    (dir, None) or (None, why), and tells a box that cannot be reached (powered off, off the network, key
+    not authorized) from one that answers but is not a satellite — both are
+    skipped, loudly, and named differently."""
+    try:
+        rc, out = sat_ssh(peer, key,
+                          "grep -h '^WorkingDirectory=' "
+                          "/etc/systemd/system/cabinet-sas.service "
+                          "2>/dev/null || true", check=False, user=user,
+                          timeout=40)
+    except Exception as e:      # TimeoutExpired: a wedged box, not a dead one
+        return None, "hung while probing (%s)" % e
+    if rc != 0:
+        return None, "unreachable (powered off, or the hub's key isn't " \
+                     "authorized there)"
     for line in out.splitlines():
         if line.startswith("WorkingDirectory="):
             d = line.split("=", 1)[1].strip()
             if d:
-                return d
-    return None
+                return d, None
+    return None, "answers, but has no cabinet-sas service"
+
+
+def rsync_cmd(key, src, dest, dry=False, checksum=False):
+    """The one rsync both trees ship with. `checksum` compares CONTENT
+    instead of size+time — the catch-up uses it so a satellite whose files
+    are identical but carry other timestamps is not restarted for nothing."""
+    cmd = ["rsync", "-a", "--no-owner", "--no-group",
+           "-e", "ssh -i %s -o BatchMode=yes "
+                 "-o StrictHostKeyChecking=accept-new "
+                 "-o ConnectTimeout=8" % key]
+    if checksum:
+        cmd += ["--checksum", "--itemize-changes"]
+    for ex in SAT_EXCLUDES:
+        cmd += ["--exclude", ex]
+    if dry:
+        cmd.append("--dry-run")
+    return cmd + [src, dest]
+
+
+def tree_differs(itemized):
+    """Does rsync --itemize-changes output name anything that would be SENT?
+    '>f' is a file whose content goes over, 'c' a directory or link to be
+    created. Lines starting '.' are attribute-only (a timestamp), which is
+    not a reason to restart a machine's SAS link."""
+    return any(ln[:2] == ">f" or ln[:1] == "c"
+               for ln in (itemized or "").splitlines())
 
 
 # ---------------------------------------------------------------------------
@@ -1194,33 +1243,45 @@ def _gates_in(root, py):
 
 
 def push_satellites(root, sats, key, dry, touched=None):
-    """`touched` is a dict this marks the INSTANT a satellite's files are
+    """Rsync SAS/ to every satellite that can take it. Returns the entries
+    actually pushed; only those are restarted, and a rollback puts the old
+    tree back on exactly those.
+
+    A satellite that cannot be reached is SKIPPED, named, and left to the
+    hub: the host checks every satellite that starts reporting and brings an
+    out-of-date one current by itself (`--catch-up`, below). It used to stop
+    the whole update, which meant one powered-off Pi kept every other machine
+    on old code. A satellite that IS reachable and then fails mid-copy still
+    stops the run — its tree is half new, and that has to be rolled back.
+
+    `touched` is a dict this marks the INSTANT a satellite's files are
     about to change. Rollback needs to know that a push began even if it then
     failed on satellite 2 of 3 — a return code cannot express "partly done"."""
+    done = []
+    if touched is not None:
+        touched["sats"] = done
     if not sats:
-        return
+        return done
     step("Pushing the SAS tree to %d satellite(s)" % len(sats))
     src = os.path.join(root, "SAS") + "/"
     for s in sats:
         peer = s["peer"]
         u = sat_user(s)
-        dest = sat_sas_dir(peer, key, u)
+        dest, why = sat_probe_sas(peer, key, u)
         if not dest:
-            raise Fail("%s: could not read WorkingDirectory from its "
-                       "/etc/systemd/system/cabinet-sas.service — is it a "
-                       "CabiNet satellite?" % peer)
+            # "NOT updated" is the token the Updates card unfolds — keep it.
+            say('   ⚠️  Satellite "%s" NOT updated — it can\'t be reached '
+                "right now. The hub brings it up to date by itself when it "
+                "is back." % s["smibId"])
+            say("      detail: %s at %s — %s" % (s["smibId"], peer, why))
+            continue
         say("   %s -> %s:%s" % (s["smibId"], peer, dest))
-        cmd = ["rsync", "-a", "--no-owner", "--no-group",
-               "-e", "ssh -i %s -o BatchMode=yes "
-                     "-o StrictHostKeyChecking=accept-new" % key]
-        for ex in SAT_EXCLUDES:
-            cmd += ["--exclude", ex]
-        if dry:
-            cmd.append("--dry-run")
-        cmd += [src, "%s@%s:%s/" % (u, peer, dest.rstrip("/"))]
         if touched is not None and not dry:
             touched["pushed"] = True
-        run(cmd, timeout=600)
+        done.append(s)
+        run(rsync_cmd(key, src, "%s@%s:%s/" % (u, peer, dest.rstrip("/")),
+                      dry=dry), timeout=600)
+    return done
 
 
 def push_companions(root, comps, key, dry, touched=None):
@@ -1459,6 +1520,9 @@ def rollback(root, old, sats, comps, key, hub_url, machines, snapshot=None,
     tile if someone is mid-config at a machine, and puts back byte-identical
     code."""
     touched = touched or {}
+    # only the satellites whose files this run actually began to change — a
+    # skipped (unreachable) one has nothing to put back and cannot be reached
+    sats = touched.get("sats", sats)
     pushed, restarted = touched.get("pushed"), touched.get("restarted")
     sat_restarted = touched.get("sat_restarted")
     step("ROLLING BACK to %s" % old[:12])
@@ -1633,6 +1697,142 @@ def rollback(root, old, sats, comps, key, hub_url, machines, snapshot=None,
             raise
 
 
+# ---------------------------------------------------------------------------
+# catch-up — one Pi that missed an update, brought current on its own
+# ---------------------------------------------------------------------------
+#: Exit codes of `--catch-up`, read by the hub that launched it.
+CATCHUP_OK, CATCHUP_FAILED, CATCHUP_DEFERRED, CATCHUP_UNREACHABLE = 0, 1, 3, 4
+#: The last stdout line of a catch-up starts with this, then a JSON object.
+CATCHUP_TAG = "CATCHUP "
+
+
+def _catch_up_tree(key, src, dest, unit, peer, user):
+    """Make one tree on one Pi match the hub's. 'current' | 'updated' |
+    'failed: why'. The service restarts ONLY if a file's content differed."""
+    try:
+        rc, out = run(rsync_cmd(key, src, dest, dry=True, checksum=True),
+                      check=False, timeout=300)
+    except Exception as e:
+        return "failed: comparing the files hung (%s)" % e
+    if rc != 0:
+        return "failed: could not compare the files (%s)" % (
+            (out.strip().splitlines() or ["rsync rc=%d" % rc])[-1][:120])
+    if not tree_differs(out):
+        return "current"
+    try:
+        rc, out = run(rsync_cmd(key, src, dest, checksum=True), check=False,
+                      timeout=600)
+    except Exception as e:
+        return "failed: the copy hung (%s)" % e
+    if rc != 0:
+        return "failed: the copy didn't finish (%s)" % (
+            (out.strip().splitlines() or ["rsync rc=%d" % rc])[-1][:120])
+    sat_clock(peer, key, user=user)
+    try:
+        rc, out = sat_ssh(peer, key, "sudo systemctl restart %s" % unit,
+                          check=False, user=user)
+    except Exception as e:
+        rc, out = 1, str(e)
+    if rc != 0:
+        return ("failed: new files are on it but %s did not restart (%s)"
+                % (unit, (out.strip().splitlines() or ["rc=%d" % rc])[-1][:120]))
+    return "updated"
+
+
+def catch_up(root, hub_url, key, peer):
+    """Bring ONE Pi (its SAS tree and, if it is also a card reader, its
+    Companion tree) in line with the code this hub is running. No fetch, no
+    pull, no gates, no hub restart: the hub's own tree already passed its
+    gates when it was installed, and this only copies it.
+
+    The hub runs this by itself whenever a satellite starts reporting — a Pi
+    that was powered off during an update, or one set up from an older copy,
+    is otherwise the quiet hub-new/satellite-old split (see the header). It
+    is also safe to run by hand.
+
+    Returns (exit code, result dict). Nothing is restarted unless a file's
+    content actually differs, so checking a Pi that is already current costs
+    one ssh round-trip and touches nothing."""
+    res = {"peer": peer, "sas": None, "companion": None, "detail": ""}
+
+    def done(code, detail=""):
+        res["detail"] = detail
+        say(("   " + detail) if detail else "")
+        say(CATCHUP_TAG + json.dumps(res, sort_keys=True))
+        return code, res
+
+    say("CabiNet catch-up — %s" % peer)
+    import fcntl
+    lock = open(os.path.join(root, ".cabinet-update.lock"), "a+")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock.close()
+        return done(CATCHUP_DEFERRED, "an update is running — will retry")
+    try:
+        status = hub_status(hub_url)
+        if "__error__" in status:
+            return done(CATCHUP_DEFERRED, "the hub is not answering (%s)"
+                        % status["__error__"])
+        phase = ((status.get("tournament") or {}).get("phase") or "").lower()
+        if phase in ("armed", "countdown", "running"):
+            return done(CATCHUP_DEFERRED, "a tournament is %s — not "
+                        "restarting a machine's link under it" % phase)
+        if not os.path.isfile(key):
+            return done(CATCHUP_FAILED, "no satellite key at %s" % key)
+        sat = next((x for x in find_satellites(status) if x["peer"] == peer),
+                   None)
+        comp = next((x for x in find_companions(status) if x["peer"] == peer),
+                    None)
+        if not sat and not comp:
+            return done(CATCHUP_OK, "the hub knows no satellite or card "
+                        "reader at %s" % peer)
+        if sat:
+            u = sat_user(sat)
+            dest, why = sat_probe_sas(peer, key, u)
+            if not dest:
+                res["sas"] = ("absent" if why.startswith("answers")
+                              else "unreachable")
+                say("   satellite %s: %s" % (sat["smibId"], why))
+            else:
+                res["sas"] = _catch_up_tree(
+                    key, os.path.join(root, "SAS") + "/",
+                    "%s@%s:%s/" % (u, peer, dest.rstrip("/")),
+                    "cabinet-sas", peer, u)
+                say("   satellite %s: %s" % (sat["smibId"], res["sas"]))
+        if comp and res["sas"] != "unreachable":
+            u = sat_user(comp)
+            cdir, why = sat_companion_dir(peer, key, user=u)
+            if not cdir:
+                res["companion"] = ("absent" if why.startswith("no cabinet")
+                                    else "unreachable")
+                say("   card reader %s: %s" % (comp["companionId"], why))
+            else:
+                res["companion"] = _catch_up_tree(
+                    key, os.path.join(root, "Companion") + "/",
+                    "%s@%s:%s/" % (u, peer, cdir.rstrip("/")),
+                    "cabinet-companion", peer, u)
+                say("   card reader %s: %s"
+                    % (comp["companionId"], res["companion"]))
+        elif comp:
+            res["companion"] = "unreachable"
+        states = [v for v in (res["sas"], res["companion"]) if v]
+        if any(v.startswith("failed") for v in states):
+            return done(CATCHUP_FAILED,
+                        next(v for v in states if v.startswith("failed")))
+        if "unreachable" in states:
+            return done(CATCHUP_UNREACHABLE, "could not reach %s" % peer)
+        if "updated" in states:
+            return done(CATCHUP_OK, "%s was out of date — it now runs this "
+                        "hub's version" % peer)
+        return done(CATCHUP_OK, "%s is already on this hub's version" % peer)
+    finally:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+        finally:
+            lock.close()
+
+
 def self_update(root, argv):
     """Re-exec from the INCOMING version of this script, if it differs.
 
@@ -1677,7 +1877,6 @@ def self_update(root, argv):
 
 
 def main():
-    global SAT_USER_OVERRIDE
     ap = argparse.ArgumentParser(
         description="Bring a CabiNet hub and its satellites current.")
     ap.add_argument("--hub-url", default=DEFAULT_HUB,
@@ -1699,12 +1898,25 @@ def main():
                     help="run the gates against your working tree (uncommitted "
                          "edits included) in an isolated copy, then exit — no "
                          "fetch, no pull, no adopt, no restart")
+    ap.add_argument("--catch-up", metavar="IP", default=None,
+                    help="bring ONE satellite / card-reader Pi in line with "
+                         "the code this hub already runs, restarting it only "
+                         "if its files differ — no fetch, no hub restart (the "
+                         "hub runs this by itself when a Pi comes back)")
     ap.add_argument("--verbose", action="store_true",
                     help="echo every command as it runs (the old default; "
                          "failures always show their command regardless)")
     ap.add_argument("--remote", default=DEFAULT_REMOTE,
                     help="repo to adopt/track (default %s)" % DEFAULT_REMOTE)
     a = ap.parse_args()
+
+    if a.catch_up:
+        # Its own small path, ahead of everything git: it never fetches,
+        # never writes the Updates card's transcript, never asks.
+        global SAT_USER_OVERRIDE, VERBOSE
+        SAT_USER_OVERRIDE, VERBOSE = a.ssh_user, a.verbose
+        code, _ = catch_up(repo_root(), a.hub_url, a.ssh_key, a.catch_up)
+        return code
 
     # Everything below IS git. A curl-fetched update.py on a git-less box
     # (the README's "installed before July 2026" path) must say so plainly,
@@ -1715,7 +1927,6 @@ def main():
                    "first:\n     sudo apt-get install -y git")
 
     SAT_USER_OVERRIDE = a.ssh_user
-    global VERBOSE
     VERBOSE = a.verbose
 
     # If self_update() re-exec'd us, we ARE the temp copy. Clean it up on the
@@ -1938,10 +2149,11 @@ def main():
     touched = {"pushed": False, "restarted": False, "sat_restarted": False}
     try:
         gates(root, venv_python(root))
-        push_satellites(root, sats, a.ssh_key, dry=False, touched=touched)
+        pushed_sats = push_satellites(root, sats, a.ssh_key, dry=False,
+                                      touched=touched)
         pushed_comps = push_companions(root, comps, a.ssh_key, dry=False,
                                        touched=touched)
-        restart_fleet(sats, pushed_comps, a.ssh_key, dry=False,
+        restart_fleet(pushed_sats, pushed_comps, a.ssh_key, dry=False,
                       touched=touched)
         if not verify(a.hub_url, sats, machines, comps, dry=False):
             raise Fail("the floor did not come back")

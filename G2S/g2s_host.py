@@ -124,7 +124,7 @@ if "tournament_names" not in _hub_store_mod.HOST_SETTING_KEYS:
 # the MINOR bump per the repo's version rule). Surfaced in engine_meta() ->
 # /api/status ["_engine"]["version"]; bump this and add a CHANGELOG.md
 # section on every commit with a user-visible change.
-CABINET_VERSION = "0.3.2"
+CABINET_VERSION = "0.3.3"
 
 WSDL_NS = "http://www.gamingstandards.com/wsdl/g2s/v1.0"
 SCHEMA_NS = "http://www.gamingstandards.com/g2s/schemas/v1.0.3"
@@ -4227,6 +4227,11 @@ class G2SHost:
         self._update = {"behind": 0, "commits": [], "checkedAt": None,
                         "error": None, "state": "idle"}
         self._update_auto_at = 0.0
+        # Satellite catch-up (see sat_sync_note): per-Pi record of whether
+        # its code has been checked against ours since it last appeared.
+        self.sat_sync_lock = threading.Lock()
+        self._sat_sync = {}
+        self.listen_port = 8081     # main() overwrites with --port
         # The Back Office ▸ Fleet Doctor. ONE job at a time (a sweep shells
         # out to ssh per device; two at once would double the wedge surface
         # for no gain), state in memory only — nothing here writes a file,
@@ -4947,6 +4952,201 @@ class G2SHost:
                 except Exception as e:      # never let this kill the thread
                     log.debug("update auto-check skipped: %s", e)
                 time.sleep(300)
+
+        threading.Thread(target=loop, daemon=True).start()
+
+    # ── Satellite catch-up ────────────────────────────────────────────────
+    #
+    # A Pi that was powered off while the hub updated comes back running OLD
+    # SAS code against a NEW hub — the quiet split deploy/update.py's header
+    # describes. The updater used to refuse to run at all unless every
+    # satellite was reachable, which made one switched-off machine block the
+    # whole floor's update (and a collector's machines are never all on).
+    # Now the updater skips what it cannot reach and the hub closes the gap
+    # here: every Pi that STARTS reporting (first report since this process
+    # started, a report after a silence, or a restarted daemon) is checked
+    # once against this hub's own SAS/ and Companion/ trees and, only if a
+    # file's content differs, brought current and its service restarted.
+    #
+    # The work itself is deploy/update.py --catch-up (ssh + rsync live there,
+    # never here — same rule as the fleet doctor). Slot-network traffic only:
+    # this never reaches the internet. It holds off while an update runs or a
+    # tournament is live, and a Pi it cannot reach is retried on a slowing
+    # schedule for as long as it keeps reporting.
+    SAT_SYNC_SETTLE_SEC = 15            # let a booting Pi finish coming up
+    SAT_SYNC_DEFER_SEC = 60             # update running / tournament live
+    SAT_SYNC_RETRY_SEC = (60, 300, 900, 1800)   # unreachable / failed
+    SAT_SYNC_TIMEOUT_SEC = 1200
+    SAT_SYNC_GONE_SEC = 120             # not reporting: nothing to check
+    #: this many "was out of date" fixes inside the window means the copy is
+    #: not sticking — stop restarting the machine's link and say so.
+    SAT_SYNC_FLAP = (3, 900)
+    SAT_SYNC_STALE = {"sas": 20, "companion": 20}
+
+    def sat_sync_supported(self):
+        """Can this host run a catch-up at all? Not on Windows (no ssh/rsync
+        fleet tooling — lite mode), and not without the updater script."""
+        return (not IS_WINDOWS and os.path.isfile(os.path.join(
+            self._repo_dir(), "deploy", "update.py")))
+
+    def sat_sync_note(self, peer, role, started_at=None):
+        """Called on EVERY satellite / card-reader report (hot path: one
+        dict lookup under a lock). Marks the Pi 'pending' a check when it
+        has just appeared: never seen by this process, silent for longer
+        than its stale threshold, or its daemon restarted. A daemon restart
+        that happens while WE are checking it is our own restart, not news."""
+        # getattr: gate tests build partial engines without __init__ — the
+        # report path must never depend on this bookkeeping existing
+        lock = getattr(self, "sat_sync_lock", None)
+        if not peer or lock is None:
+            return
+        now = time.time()
+        with lock:
+            r = self._sat_sync.get(peer)
+            if r is None:
+                r = self._sat_sync[peer] = {
+                    "state": "pending", "detail": "", "at": None,
+                    "nextAt": now + self.SAT_SYNC_SETTLE_SEC, "tries": 0,
+                    "last": {}, "started": {}, "fixes": []}
+            else:
+                seen = r["last"].get(role)
+                appeared = seen is None or \
+                    now - seen > self.SAT_SYNC_STALE.get(role, 20)
+                restarted = bool(started_at) and \
+                    r["started"].get(role) not in (None, started_at)
+                if (appeared or restarted) and r["state"] != "checking":
+                    r.update(state="pending", tries=0,
+                             nextAt=now + self.SAT_SYNC_SETTLE_SEC)
+            r["last"][role] = now
+            if started_at:
+                r["started"][role] = started_at
+
+    def sat_sync_view(self, peer):
+        """The small public shape for /api/status ({state, detail, at}), or
+        None for a Pi this process has not seen."""
+        lock = getattr(self, "sat_sync_lock", None)
+        if lock is None:
+            return None
+        with lock:
+            r = self._sat_sync.get(peer)
+            if r is None:
+                return None
+            return {"state": r["state"], "detail": r["detail"], "at": r["at"]}
+
+    def _sat_sync_due(self, now=None):
+        """The next Pi whose check is due and that is still reporting."""
+        now = time.time() if now is None else now
+        with self.sat_sync_lock:
+            for peer, r in self._sat_sync.items():
+                if r["state"] not in ("pending", "deferred", "unreachable",
+                                      "failed"):
+                    continue
+                if r["nextAt"] > now:
+                    continue
+                if now - max(r["last"].values() or [0]) > self.SAT_SYNC_GONE_SEC:
+                    continue        # gone again — its return re-arms the check
+                r["state"] = "checking"
+                return peer
+        return None
+
+    def _sat_sync_settle(self, peer, rc, result, now=None):
+        """Fold one catch-up run's outcome into the record."""
+        now = time.time() if now is None else now
+        detail = str((result or {}).get("detail") or "")[:200]
+        states = [str(v) for v in ((result or {}).get("sas"),
+                                   (result or {}).get("companion")) if v]
+        with self.sat_sync_lock:
+            r = self._sat_sync.get(peer)
+            if r is None:
+                return None
+            r["at"], r["detail"] = now_iso(), detail
+            if rc == 0:
+                if "updated" in states:
+                    n, win = self.SAT_SYNC_FLAP
+                    r["fixes"] = [t for t in r["fixes"] if now - t < win] + [now]
+                    if len(r["fixes"]) >= n:
+                        r.update(state="failed", tries=len(
+                            self.SAT_SYNC_RETRY_SEC), nextAt=now +
+                            self.SAT_SYNC_RETRY_SEC[-1],
+                            detail="its files keep coming back different "
+                                   "after being updated — left alone for now")
+                    else:
+                        r.update(state="updated", tries=0)
+                else:
+                    r.update(state="current", tries=0)
+            elif rc == 3:
+                r.update(state="deferred",
+                         nextAt=now + self.SAT_SYNC_DEFER_SEC)
+            else:
+                r["tries"] += 1
+                wait = self.SAT_SYNC_RETRY_SEC[
+                    min(r["tries"], len(self.SAT_SYNC_RETRY_SEC)) - 1]
+                r.update(state="unreachable" if rc == 4 else "failed",
+                         nextAt=now + wait)
+            return dict(r)
+
+    def _sat_sync_run(self, peer):
+        """Run deploy/update.py --catch-up for one Pi and settle the result.
+        Blocking (the supervisor thread calls it); never raises."""
+        script = os.path.join(self._repo_dir(), "deploy", "update.py")
+        rc, result = 1, {"detail": "the catch-up did not run"}
+        try:
+            p = subprocess.run(
+                [sys.executable, script, "--catch-up", peer, "--hub-url",
+                 "http://127.0.0.1:%d" % self.listen_port,
+                 "--ssh-key", self.HUB_KEY],
+                cwd=self._repo_dir(), capture_output=True, text=True,
+                stdin=subprocess.DEVNULL, timeout=self.SAT_SYNC_TIMEOUT_SEC)
+            rc = p.returncode
+            result = {"detail": ((p.stdout or p.stderr or "").strip()
+                                 .splitlines() or ["no output"])[-1][:200]}
+            for ln in reversed((p.stdout or "").splitlines()):
+                if ln.startswith("CATCHUP "):
+                    parsed = json.loads(ln[len("CATCHUP "):])
+                    if isinstance(parsed, dict):
+                        result = parsed
+                    break
+        except Exception as e:      # noqa: BLE001 — timeout, bad JSON, no python
+            rc, result = 1, {"detail": "the catch-up did not finish: %s" % e}
+        r = self._sat_sync_settle(peer, rc, result)
+        if r is None:
+            return
+        if r["state"] == "updated":
+            log.warning("⬆️  [satellite:%s] was running out-of-date code — "
+                        "brought up to this hub's version and restarted",
+                        peer)
+        elif r["state"] == "current":
+            log.info("⬆️  [satellite:%s] code checked — already on this "
+                     "hub's version", peer)
+        elif r["state"] == "deferred":
+            log.info("⬆️  [satellite:%s] code check put off: %s", peer,
+                     r["detail"])
+        elif r["tries"] == 1 or r["tries"] == len(self.SAT_SYNC_RETRY_SEC):
+            # say it once when it starts failing and once when the schedule
+            # bottoms out — not on every retry
+            log.warning("⬆️  [satellite:%s] could not be checked against "
+                        "this hub's version (%s) — it may be running OLD "
+                        "code; retrying", peer, r["detail"])
+
+    def start_sat_sync(self):
+        """The catch-up supervisor: one Pi at a time, never while an update
+        is running. A no-op thread on a host that cannot run it."""
+        if not self.sat_sync_supported():
+            return
+
+        def loop():
+            while True:
+                time.sleep(5)
+                try:
+                    with self.update_lock:
+                        busy = self._update.get("state") == "running"
+                    if busy:
+                        continue
+                    peer = self._sat_sync_due()
+                    if peer:
+                        self._sat_sync_run(peer)
+                except Exception as e:      # never let this kill the thread
+                    log.debug("satellite catch-up pass skipped: %s", e)
 
         threading.Thread(target=loop, daemon=True).start()
 
@@ -5835,6 +6035,7 @@ class G2SHost:
         if _pt:
             entry["piTail"] = _pt
         entry["receivedAt"] = time.time()
+        self.sat_sync_note(peer, "sas", entry.get("startedAt"))
         # Echo the operator prefs back so /api/status carries them (the UI
         # prefers them over its local cache — kiosk and phone agree). ONE
         # SELECT per report (same cost as the old get_nickname read),
@@ -6653,6 +6854,14 @@ class G2SHost:
                 d["reportAgeSec"] = round(age, 1)
                 d["stale"] = age > self.SAS_STALE_SEC
                 out[key] = d
+        # codeSync: has this satellite's code been checked against ours since
+        # it appeared? ({state: pending|checking|current|updated|deferred|
+        # unreachable|failed, detail, at}; absent until it reports to THIS
+        # process.) Taken outside sas_lock — the two locks never nest.
+        for d in out.values():
+            cs = self.sat_sync_view(d.get("peer"))
+            if cs:
+                d["codeSync"] = cs
         return out
 
     def sas_forget(self, key):
@@ -6760,6 +6969,7 @@ class G2SHost:
             and comp_id.strip() else str(peer)[:64]
         started = payload.get("startedAt")
         started = started[:40] if isinstance(started, str) else ""
+        self.sat_sync_note(peer, "companion", started)
         g2s_egm = payload.get("g2sEgmId")
         g2s_egm = g2s_egm.strip()[:64] if isinstance(g2s_egm, str) \
             and g2s_egm.strip() else None
@@ -25693,6 +25903,10 @@ def main():
     # not — it re-reads update_auto_check every pass and stays silent while
     # that is off, which is the shipped default.
     engine.start_update_auto_check()
+    # Satellite catch-up: a Pi that missed an update is brought current when
+    # it comes back. Slot-network only; idle until a satellite reports.
+    engine.listen_port = args.port
+    engine.start_sat_sync()
     # Mint the hub's satellite key if it has none, so a freshly deployed hub is
     # update-capable with zero manual key work. Idempotent and never fatal.
     engine.ensure_hub_key()
