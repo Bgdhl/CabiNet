@@ -81,6 +81,53 @@ your home network. Two things to know:
 Non-Pi hosts: join your home network however that box usually does; steps 2–3
 are the same.
 
+## Putting a sign-in on the hub pages (optional)
+
+Out of the box anyone who can reach the hub on your network can use its
+pages. To require a username and password:
+
+1. Open the hub page, go to **Settings**, find **Hub login**.
+2. **Add a login** and make it an **Admin**. Add **Normal** logins for
+   anyone who should run the floor but not change the setup.
+3. **Turn the lock on.** You are asked to sign in with an admin login
+   first, so the lock cannot be turned on with a password that does not
+   work.
+
+| | Normal | Admin |
+|---|---|---|
+| See machines, tickets, players, activity | yes | yes |
+| Clear handpays, void tickets, lock/unlock machines, load credits | yes | yes |
+| Settings, logins, players and cards, naming machines and games | no | yes |
+| Forget a machine, updates, Test Panel, console, debug log | no | yes |
+| Set a ticket back to Issued, reusable tickets | no | yes |
+
+Slot machines, satellite and card-reader Pis, the screens on the machines
+and the wall board (`/board`) never sign in and keep working. A browser
+that is not signed in can read only what the wall board shows.
+
+A login is signed out after 30 minutes without a tap or a key press; the
+Hub login card changes that. The hub's own touchscreen asks for a sign-in
+like any other browser and draws its own keyboard. Adding logins needs a
+real keyboard, so do that from a phone or a computer.
+
+**Locked out?** Log in to the hub over SSH as the account the hub runs as:
+
+```
+python3 G2S/tools/hub_login.py              # show the lock and the logins
+python3 G2S/tools/hub_login.py passwd NAME  # set a new password
+python3 G2S/tools/hub_login.py add NAME     # add an admin login
+python3 G2S/tools/hub_login.py off          # turn the lock off
+```
+
+The updater and the support bundle keep working with the lock on when run
+as that same account: the hub writes a secret to `G2S/data/hub_api_token`
+that only that account can read.
+
+Two limits, so nobody is surprised. The hub speaks plain HTTP, so a
+password crosses your network unencrypted. And the lock is for people: a
+device on the slot network can still talk to the hub the way a machine
+does. Keep strangers off the slot network as before.
+
 ## Host hardware — any Linux box
 
 The reference host is a Raspberry Pi 5, but the stack is **stdlib-only Python 3

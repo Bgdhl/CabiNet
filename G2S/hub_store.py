@@ -72,7 +72,7 @@ import time
 
 log = logging.getLogger("g2s.hub_store")
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 # Hard bounds — /api/names is unauthenticated (anyone on the floor VLAN/AP),
 # so the registry must stay bounded: without these, one hostile poster loops
@@ -147,7 +147,14 @@ HOST_SETTING_KEYS = ("sysval_fallback", "house_allow_negative",
                      # surface; "" = follow the machines' own currencyId
                      # (a European floor showed "$" next to a machine paying
                      # in euro, 2026-09-12).
-                     "currency_symbol")
+                     "currency_symbol",
+                     # Optional hub login (v16). "1" = the operator pages and
+                     # API need a signed-in login; absent/"0" = open, as it
+                     # always was. Written ONLY by /api/auth/config and
+                     # tools/hub_login.py — /api/settings never touches them.
+                     # web_login_idle_min: minutes of no use before a session
+                     # is signed out, "0" = never.
+                     "web_login_required", "web_login_idle_min")
 TICKET_TEXT_KEYS = ("ticket_prop_name", "ticket_line1", "ticket_line2",
                     "ticket_title_cash")
 MAX_TICKET_FIELD_LEN = 64
@@ -735,6 +742,29 @@ class HubStore:
             if "operator_at" not in cols:
                 c.execute("ALTER TABLE tito_tickets ADD COLUMN "
                           "operator_at TEXT")
+        if current < 16:
+            # v16: optional hub login. web_logins are the people who may use
+            # the operator pages (NOT player accounts — those are wallets and
+            # live in accounts.json); web_sessions are their signed-in
+            # browsers, keyed by the SHA-256 of the cookie so a copy of this
+            # file cannot be replayed as a session. CREATE IF NOT EXISTS keeps
+            # the step rerun-safe.
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS web_logins (
+                    username      TEXT PRIMARY KEY,   -- lowercase
+                    role          TEXT NOT NULL,      -- 'admin' | 'normal'
+                    pw            TEXT NOT NULL,      -- web_auth.hash_password
+                    created_at    TEXT NOT NULL,
+                    updated_at    TEXT NOT NULL,
+                    last_login_at TEXT
+                )""")
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS web_sessions (
+                    token_hash  TEXT PRIMARY KEY,
+                    username    TEXT NOT NULL,
+                    created_at  REAL NOT NULL,        -- epoch seconds
+                    last_active REAL NOT NULL
+                )""")
         if current < SCHEMA_VERSION:
             c.execute("INSERT INTO schema_meta(key,value) VALUES('version',?) "
                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -2653,6 +2683,135 @@ class HubStore:
                         row["canonical"],
                         "REUSABLE" if on else "single-use", state)
             return {"ok": True, "reusable": on, "state": state}
+
+    # ---- optional hub login (v16) -------------------------------------
+    # Storage only: hashing, policy and session rules live in web_auth.py.
+    # Reads are best-effort-quiet (None/[] on a db fault — the gate then
+    # treats the caller as signed out); writes propagate sqlite errors.
+
+    def login_list(self):
+        try:
+            with self.lock:
+                rows = self._conn.execute(
+                    "SELECT username, role, created_at, updated_at, "
+                    "last_login_at FROM web_logins ORDER BY username"
+                ).fetchall()
+            return [{"username": r["username"], "role": r["role"],
+                     "createdAt": r["created_at"],
+                     "updatedAt": r["updated_at"],
+                     "lastLoginAt": r["last_login_at"]} for r in rows]
+        except sqlite3.Error as e:
+            self._warn_limited("login_list", e)
+            return []
+
+    def login_get(self, username):
+        """{"username","role","pw"} or None."""
+        try:
+            with self.lock:
+                r = self._conn.execute(
+                    "SELECT username, role, pw FROM web_logins "
+                    "WHERE username=?", (username,)).fetchone()
+            return dict(r) if r else None
+        except sqlite3.Error as e:
+            self._warn_limited("login_get", e)
+            return None
+
+    def login_put(self, username, role=None, pw=None):
+        """Create or update a login. A new one needs both role and pw; an
+        update changes whichever is given. Returns "created" | "updated"."""
+        now = _now_iso()
+        with self.lock:
+            c = self._conn
+            cur = c.execute("SELECT role FROM web_logins WHERE username=?",
+                            (username,)).fetchone()
+            if cur is None:
+                if not role or not pw:
+                    c.commit()
+                    raise ValueError("a new login needs a role and a password")
+                c.execute("INSERT INTO web_logins(username, role, pw, "
+                          "created_at, updated_at) VALUES(?,?,?,?,?)",
+                          (username, role, pw, now, now))
+                c.commit()
+                return "created"
+            if role:
+                c.execute("UPDATE web_logins SET role=?, updated_at=? "
+                          "WHERE username=?", (role, now, username))
+            if pw:
+                c.execute("UPDATE web_logins SET pw=?, updated_at=? "
+                          "WHERE username=?", (pw, now, username))
+            c.commit()
+            return "updated"
+
+    def login_delete(self, username):
+        with self.lock:
+            c = self._conn
+            n = c.execute("DELETE FROM web_logins WHERE username=?",
+                          (username,)).rowcount
+            c.execute("DELETE FROM web_sessions WHERE username=?",
+                      (username,))
+            c.commit()
+        return bool(n)
+
+    def login_mark(self, username):
+        try:
+            with self.lock:
+                self._conn.execute(
+                    "UPDATE web_logins SET last_login_at=? WHERE username=?",
+                    (_now_iso(), username))
+                self._conn.commit()
+        except sqlite3.Error as e:
+            self._warn_limited("login_mark", e)
+
+    def session_put(self, token_hash, username, now):
+        with self.lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO web_sessions(token_hash, username, "
+                "created_at, last_active) VALUES(?,?,?,?)",
+                (token_hash, username, now, now))
+            self._conn.commit()
+
+    def session_get(self, token_hash):
+        """{"username","created_at","last_active"} or None."""
+        try:
+            with self.lock:
+                r = self._conn.execute(
+                    "SELECT username, created_at, last_active FROM "
+                    "web_sessions WHERE token_hash=?",
+                    (token_hash,)).fetchone()
+            return dict(r) if r else None
+        except sqlite3.Error as e:
+            self._warn_limited("session_get", e)
+            return None
+
+    def session_touch(self, token_hash, last_active):
+        try:
+            with self.lock:
+                self._conn.execute(
+                    "UPDATE web_sessions SET last_active=? WHERE "
+                    "token_hash=? AND last_active<?",
+                    (last_active, token_hash, last_active))
+                self._conn.commit()
+        except sqlite3.Error as e:
+            self._warn_limited("session_touch", e)
+
+    def session_delete(self, token_hash=None, username=None, before=None):
+        """Drop one session, every session of a login, or every session
+        last used before an epoch time."""
+        try:
+            with self.lock:
+                c = self._conn
+                if token_hash is not None:
+                    c.execute("DELETE FROM web_sessions WHERE token_hash=?",
+                              (token_hash,))
+                if username is not None:
+                    c.execute("DELETE FROM web_sessions WHERE username=?",
+                              (username,))
+                if before is not None:
+                    c.execute("DELETE FROM web_sessions WHERE last_active<?",
+                              (before,))
+                c.commit()
+        except sqlite3.Error as e:
+            self._warn_limited("session_delete", e)
 
     def tito_counts(self):
         """Best-effort {total, <state>: n} for /api/status — must never

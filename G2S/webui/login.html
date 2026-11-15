@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CabiNet — Sign in</title>
+<!--
+  The hub's sign-in page (optional hub login, web_auth.py). Served at /login
+  only while the lock is on. Self-contained: no CDN, the slot VLAN is offline.
+  POSTs /api/auth/login {username, password}; the hub answers with the
+  session cookie and this page goes to ?next= (same-origin paths only).
+
+  The hub's own touchscreen has no keyboard, so on a touch kiosk (the
+  800x480 DSI, or ?kiosk=1 carried in next=) the page draws its own.
+-->
+<style>
+  :root{
+    --bg:#150f0b; --bg-hi:#241812; --card:#1e1510; --inset:#0d0906;
+    --line:#3b2b1d; --ivory:#f4ead7; --dim:#b69d7c; --faint:#7e6950;
+    --gold:#d9a94f; --gold-hi:#f2d492; --ruby:#e0564d;
+    --display:Georgia,"Palatino Linotype","Book Antiqua","Times New Roman",serif;
+    --sans:-apple-system,"Segoe UI",Roboto,"DejaVu Sans",Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{background:var(--bg);
+    background-image:radial-gradient(1100px 520px at 50% -160px,var(--bg-hi),transparent 70%);
+    color:var(--ivory);font:15px/1.5 var(--sans);
+    display:flex;flex-direction:column;align-items:center;justify-content:center;
+    padding:16px;touch-action:manipulation}
+  :focus-visible{outline:2px solid var(--gold);outline-offset:2px}
+  .box{width:100%;max-width:360px;background:var(--card);
+    border:1px solid var(--line);border-radius:12px;padding:22px 22px 18px}
+  .brand{font:700 20px var(--display);letter-spacing:.3em;text-align:center}
+  .brand b{color:var(--gold)}
+  .sub{font:600 10px var(--sans);letter-spacing:.28em;color:var(--faint);
+    text-align:center;margin:2px 0 18px}
+  label{display:block;font-size:12px;color:var(--dim);margin:12px 0 4px}
+  input{width:100%;padding:11px 12px;border-radius:8px;font:16px var(--sans);
+    background:var(--inset);border:1px solid var(--line);color:var(--ivory)}
+  input.on{border-color:var(--gold)}
+  button.go{width:100%;margin-top:18px;padding:12px;border-radius:8px;border:0;
+    background:var(--gold);color:#1a1108;font:700 15px var(--sans);cursor:pointer}
+  button.go:disabled{opacity:.55;cursor:default}
+  #msg{min-height:20px;margin-top:12px;font-size:13px;color:var(--ruby);
+    text-align:center}
+  .foot{margin-top:10px;font-size:11px;color:var(--faint);text-align:center}
+
+  /* ---- on-screen keyboard (touch kiosk only) --------------------------- */
+  #kb{display:none;width:100%;max-width:780px;margin-top:10px;user-select:none}
+  html.kiosk #kb{display:block}
+  html.kiosk body{justify-content:flex-start;padding:8px}
+  html.kiosk .box{max-width:560px;padding:10px 14px 10px;
+    display:grid;grid-template-columns:1fr 1fr;gap:0 12px}
+  html.kiosk .brand,html.kiosk .sub,html.kiosk .foot{display:none}
+  html.kiosk label{margin:0 0 3px}
+  html.kiosk button.go,html.kiosk #msg{grid-column:1/3}
+  html.kiosk button.go{margin-top:10px;padding:10px}
+  html.kiosk #msg{margin-top:6px;min-height:18px}
+  .kr{display:flex;gap:5px;margin-top:5px;justify-content:center}
+  .k{flex:1;min-width:0;height:52px;border-radius:7px;border:1px solid var(--line);
+    background:#281c13;color:var(--ivory);font:600 19px var(--sans);padding:0}
+  .k:active{background:var(--gold);color:#1a1108}
+  .k.w{flex:1.7;font-size:14px}
+  .k.sp{flex:5}
+  .k.act{border-color:var(--gold);color:var(--gold-hi)}
+</style>
+</head>
+<body>
+<form class="box" id="f" autocomplete="on">
+  <div class="brand">CABI<b>NET</b></div>
+  <div class="sub">SIGN IN</div>
+  <div><label for="u">Username</label>
+    <input id="u" name="username" autocomplete="username" autocapitalize="none"
+           autocorrect="off" spellcheck="false" maxlength="32"></div>
+  <div><label for="p">Password</label>
+    <input id="p" name="password" type="password"
+           autocomplete="current-password" maxlength="128"></div>
+  <button class="go" id="go" type="submit">Sign in</button>
+  <div id="msg" role="alert"></div>
+  <div class="foot">Locked out? On the hub itself, run
+    <code>python3 G2S/tools/hub_login.py</code></div>
+</form>
+<div id="kb" aria-hidden="true"></div>
+
+<script>
+"use strict";
+var $=function(id){return document.getElementById(id);};
+var QS=new URLSearchParams(location.search);
+
+/* next= must be a plain same-origin path — never a full URL, never "//host". */
+function nextPath(){
+  var n=QS.get("next")||"/";
+  if(n.charAt(0)!=="/"||n.charAt(1)==="/"||n.charAt(1)==="\\"||
+     n.indexOf("/login")===0) n="/";
+  return n;
+}
+var NEXT=nextPath();
+
+/* ---- kiosk detection: same rule as the hub page -------------------------- */
+(function(){
+  var k;
+  if(/[?&]kiosk=1\b/.test(NEXT)||QS.get("kiosk")==="1") k=true;
+  else if(/[?&]kiosk=0\b/.test(NEXT)||QS.get("kiosk")==="0") k=false;
+  else k=window.innerWidth<=860&&window.innerHeight<=560;
+  document.documentElement.classList.toggle("kiosk",k);
+  if(k) buildKb();
+})();
+
+/* ---- sign in ------------------------------------------------------------- */
+var busy=false;
+function say(t){$("msg").textContent=t||"";}
+async function signIn(){
+  if(busy) return;
+  var u=$("u").value.trim(), p=$("p").value;
+  if(!u||!p){say("Enter your username and password."); return;}
+  busy=true; $("go").disabled=true; say("");
+  try{
+    var r=await fetch("/api/auth/login",{method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({username:u,password:p})});
+    var j=await r.json().catch(function(){return {};});
+    if(j.ok===true){location.replace(NEXT); return;}
+    say(String(j.error||("Sign-in failed (HTTP "+r.status+")")));
+    $("p").value="";
+    if(!document.documentElement.classList.contains("kiosk")) $("p").focus();
+  }catch(e){
+    say("The hub did not answer — try again.");
+  }
+  busy=false; $("go").disabled=false;
+}
+$("f").addEventListener("submit",function(e){e.preventDefault(); signIn();});
+
+/* Already signed in (or the lock was turned off)? Skip the form. */
+fetch("/api/auth/state",{cache:"no-store"}).then(function(r){return r.json();})
+  .then(function(s){if(s&&(s.required===false||s.signedIn)) location.replace(NEXT);})
+  .catch(function(){});
+
+/* ---- on-screen keyboard -------------------------------------------------- */
+var kbTarget=null, kbShift=false, kbSym=false;
+function buildKb(){
+  var LET=["1234567890","qwertyuiop","asdfghjkl","zxcvbnm"];
+  var SYM=["1234567890","!@#$%^&*()","-_=+[]{};:","'\",.<>/?\\|"];
+  function draw(){
+    var rows=kbSym?SYM:LET, h="";
+    for(var i=0;i<rows.length;i++){
+      h+='<div class="kr">';
+      if(i===3) h+='<button type="button" class="k w'+(kbShift?" act":"")+
+        '" data-k="shift">⇧</button>';
+      for(var c=0;c<rows[i].length;c++){
+        var ch=rows[i].charAt(c);
+        if(kbShift&&!kbSym) ch=ch.toUpperCase();
+        h+='<button type="button" class="k" data-c="'+
+          ch.replace(/&/g,"&amp;").replace(/"/g,"&quot;").replace(/</g,"&lt;")+
+          '">'+ch.replace(/&/g,"&amp;").replace(/</g,"&lt;")+'</button>';
+      }
+      if(i===3) h+='<button type="button" class="k w" data-k="bk">⌫</button>';
+      h+='</div>';
+    }
+    h+='<div class="kr"><button type="button" class="k w'+(kbSym?" act":"")+
+       '" data-k="sym">'+(kbSym?"abc":"#+=")+'</button>'+
+       '<button type="button" class="k" data-c=".">.</button>'+
+       '<button type="button" class="k sp" data-c=" ">space</button>'+
+       '<button type="button" class="k w" data-k="next">next</button>'+
+       '<button type="button" class="k w act" data-k="go">Sign in</button></div>';
+    $("kb").innerHTML=h;
+  }
+  function target(el){
+    kbTarget=el;
+    $("u").classList.toggle("on",el===$("u"));
+    $("p").classList.toggle("on",el===$("p"));
+  }
+  /* readOnly keeps any system keyboard down; the page's keys do the typing. */
+  $("u").readOnly=true; $("p").readOnly=true;
+  $("u").addEventListener("pointerdown",function(){target($("u"));});
+  $("p").addEventListener("pointerdown",function(){target($("p"));});
+  $("kb").addEventListener("pointerdown",function(e){
+    var b=e.target.closest?e.target.closest(".k"):null;
+    if(!b) return;
+    e.preventDefault();
+    var k=b.getAttribute("data-k"), c=b.getAttribute("data-c");
+    if(c!==null){
+      if(kbTarget.value.length<kbTarget.maxLength) kbTarget.value+=c;
+      if(kbShift){kbShift=false; draw();}
+    }else if(k==="bk") kbTarget.value=kbTarget.value.slice(0,-1);
+    else if(k==="shift"){kbShift=!kbShift; draw();}
+    else if(k==="sym"){kbSym=!kbSym; kbShift=false; draw();}
+    else if(k==="next") target(kbTarget===$("u")?$("p"):$("u"));
+    else if(k==="go") signIn();
+  });
+  draw(); target($("u"));
+}
+if(!document.documentElement.classList.contains("kiosk")) $("u").focus();
+</script>
+</body>
+</html>

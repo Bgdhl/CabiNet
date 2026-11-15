@@ -13,6 +13,32 @@
   the box makes the next redemption use it up. Both controls work for
   tickets printed over SAS and over G2S, and with the machine that
   printed them switched off.
+- **Optional sign-in for the hub pages.** Settings has a new **Hub
+  login** card. Add a login, turn the lock on, and the hub pages ask for
+  a username and password. It is off until you turn it on, and nothing
+  changes if you never do.
+  - **Two kinds of login.** An **admin** can do everything. A **normal**
+    login can see everything and run the floor day to day: clear
+    handpays, void tickets, lock and unlock machines, load credits.
+    Settings, logins, players and cards, naming, forgetting machines,
+    updates, the Test Panel, and the two ticket controls above need an
+    admin.
+  - **Machines keep working without a login.** Slot machines, satellite
+    and card-reader Pis, the screens on the machines and the wall board
+    never sign in. A signed-out browser can read only what the wall board
+    shows.
+  - **Signs out when unused.** A login is signed out after 30 minutes
+    with no taps or typing (you can change this, or turn it off). The
+    hub's own touchscreen asks for a sign-in too and has an on-screen
+    keyboard.
+  - **Locked out?** On the hub, run `python3 G2S/tools/hub_login.py`. It
+    can reset a password, add an admin or turn the lock off, and needs no
+    sign-in.
+  - **What it does not do.** The hub still speaks plain HTTP, so a
+    password crosses your network unencrypted, and a device on the slot
+    network can still talk to the hub the way a machine does. The lock
+    keeps people out of the hub pages; keep strangers off the slot
+    network as before.
 
 ## v0.3.3
 - **Updating no longer needs every machine switched on.** The updater

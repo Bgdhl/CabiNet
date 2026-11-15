@@ -110,6 +110,7 @@ except ImportError:
 # like every other tenant, and the widened value ceiling only ever admits
 # that already-validated JSON (64 names × worst-case JSON escaping < 4096).
 import hub_store as _hub_store_mod  # noqa: E402  (sibling module, above)
+import web_auth  # noqa: E402  (sibling module: the optional hub login)
 if "tournament_names" not in _hub_store_mod.HOST_SETTING_KEYS:
     _hub_store_mod.HOST_SETTING_KEYS = (
         _hub_store_mod.HOST_SETTING_KEYS + ("tournament_names",))
@@ -4193,6 +4194,11 @@ class G2SHost:
         # tables migrate here in a later phase; this slice is names only.
         self.hub_store = HubStore(os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "data", "hub.db"))
+        # Optional hub login (web_auth.py): off unless the owner turns it
+        # on. Handlers reach it with getattr — a bench engine built without
+        # __init__ has none, and no gate means open, as it always was.
+        self.web_auth = web_auth.WebAuth(self.hub_store, os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "data"))
         # Money symbol: the stored setting wins; else the first cabinet's
         # currencyId adopts it when its profile arrives (refresh_currency).
         self.refresh_currency()
@@ -22036,13 +22042,15 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
         log.debug("http: " + fmt, *args)
 
     def _send(self, code, body, content_type="text/xml; charset=utf-8",
-              soap=True, etag=None):
+              soap=True, etag=None, headers=None):
         data = body.encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
         if etag:
             self.send_header("ETag", etag)
+        for hk, hv in headers or ():
+            self.send_header(hk, hv)
         if soap:
             self.send_header("SOAPAction", '""')
         try:
@@ -22056,6 +22064,187 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
             log.info("http: client %s dropped mid-response (%s, %d bytes)",
                      getattr(self, "client_address", ("?",))[0],
                      e.__class__.__name__, len(data))
+
+    # ---- optional hub login (web_auth.py) ------------------------------
+    def _json(self, code, obj, headers=None):
+        return self._send(code, json.dumps(obj), "application/json",
+                          soap=False, headers=headers)
+
+    def _auth_gate(self, level, is_page=False, active=False):
+        """True = carry on. With the lock off (or on a bench engine that has
+        no web_auth) everything passes and self._signed_out stays False.
+        With it on, a caller short of `level` is answered here: a browser
+        asking for a page is sent to /login, an API call gets 401 (nobody
+        signed in) or 403 (signed in, not allowed)."""
+        self._signed_out = False
+        self._who = None
+        wa = getattr(self.host_engine, "web_auth", None)
+        if wa is None or not wa.required():
+            return True
+        who = self._who = wa.identify(self.headers, active=active)
+        self._signed_out = who is None
+        if web_auth.allows(who, level):
+            return True
+        peer = getattr(self, "client_address", ("?",))[0]
+        if who is None:
+            if is_page:
+                nxt = self.path if self.path.startswith("/") else "/"
+                try:
+                    self.send_response(302)
+                    self.send_header("Location", "/login?next="
+                                     + urllib.parse.quote(nxt, safe=""))
+                    self.send_header("Content-Length", "0")
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                return False
+            self._json(401, {"ok": False, "login": True,
+                             "error": "sign in required"})
+            return False
+        log.warning("🔐 %s (%s) from %s REFUSED %s %s — admin only",
+                    who["user"], who["role"], peer, self.command,
+                    self.path.split("?", 1)[0])
+        if is_page:
+            self._send(403, "<!doctype html><meta charset=utf-8>"
+                       "<title>Admin only</title><body style=\"font:16px "
+                       "system-ui;background:#0e1014;color:#e8e8ea;"
+                       "padding:40px\"><h1>Admin only</h1><p>This page "
+                       "needs an admin login.</p><p><a style=\"color:#7cc4ff"
+                       "\" href=\"/\">Back to the hub</a></p>",
+                       "text/html; charset=utf-8", soap=False)
+            return False
+        self._json(403, {"ok": False, "admin": True,
+                         "error": "admin login required"})
+        return False
+
+    def _handle_auth_get(self, path):
+        engine = self.host_engine
+        wa = getattr(engine, "web_auth", None)
+        if wa is None:
+            return self._json(404, {"error": "not found"})
+        who = getattr(self, "_who", None) or \
+            wa.identify(self.headers, active=False)
+        if path.startswith("/api/auth/state"):
+            return self._json(200, wa.state(who))
+        if path.startswith("/api/auth/logins"):
+            return self._json(200, {
+                "logins": engine.hub_store.login_list(),
+                "required": wa.required(), "idleMin": wa.idle_min(),
+                "me": who["user"] if who and not who.get("local") else None})
+        return self._json(404, {"error": "not found"})
+
+    def _handle_auth_post(self, raw, peer):
+        """POST /api/auth/<verb>. The body is NEVER written to any log —
+        do_POST routes here ahead of the wire logger."""
+        engine = self.host_engine
+        wa = getattr(engine, "web_auth", None)
+        if wa is None:
+            return self._json(404, {"ok": False, "error": "not found"})
+        sub = self.path[len("/api/auth/"):].split("?", 1)[0].strip("/")
+        try:
+            req = json.loads(raw) if raw.strip() else {}
+            if not isinstance(req, dict):
+                raise ValueError("payload must be an object")
+        except (ValueError, TypeError) as e:
+            return self._json(400, {"ok": False,
+                                    "error": f"invalid JSON: {e}"})
+        who = getattr(self, "_who", None) or \
+            wa.identify(self.headers, active=True)
+        try:
+            if sub == "login":
+                token, res = wa.login(req.get("username"),
+                                      req.get("password"), peer)
+                if token is None:
+                    return self._json(401, dict(res, ok=False))
+                return self._json(
+                    200, {"ok": True, "role": res},
+                    headers=[("Set-Cookie", web_auth.set_cookie(token))])
+            if sub == "logout":
+                wa.logout(web_auth.cookie_token(self.headers.get("Cookie")))
+                return self._json(
+                    200, {"ok": True},
+                    headers=[("Set-Cookie", web_auth.clear_cookie())])
+            if sub == "touch":
+                return self._json(200, {"ok": True})
+            if sub == "password":
+                if not who or who.get("local"):
+                    return self._json(401, {"ok": False, "login": True,
+                                            "error": "sign in first"})
+                rec = engine.hub_store.login_get(who["user"])
+                cur = req.get("current")
+                if not rec or not isinstance(cur, str) or \
+                        not web_auth.check_password(cur, rec["pw"]):
+                    return self._json(200, {
+                        "ok": False,
+                        "error": "current password is wrong"})
+                wa.set_login(who["user"], password=req.get("new"))
+                # set_login signed every browser of this login out —
+                # including this one — so hand this one a fresh session.
+                token, _ = wa.login(who["user"], req.get("new"), peer)
+                log.info("🔐 hub login: %s changed their password",
+                         who["user"])
+                return self._json(
+                    200, {"ok": True},
+                    headers=[("Set-Cookie", web_auth.set_cookie(token))]
+                    if token else None)
+            if sub == "logins":
+                act = req.get("action")
+                name = req.get("username")
+                name = name.strip().lower() if isinstance(name, str) else ""
+                by = who["user"] if who else f"(lock off) {peer}"
+                if act == "set":
+                    what = wa.set_login(name, req.get("role"),
+                                        req.get("password"))
+                    log.warning("🔐 hub login %r %s by %s (role %s%s)",
+                                name, what, by, req.get("role") or "kept",
+                                ", new password"
+                                if req.get("password") is not None else "")
+                    return self._json(200, {"ok": True, "result": what})
+                if act == "delete":
+                    if not wa.delete_login(name):
+                        return self._json(404, {"ok": False,
+                                                "error": "unknown login"})
+                    log.warning("🔐 hub login %r deleted by %s", name, by)
+                    return self._json(200, {"ok": True})
+                return self._json(400, {
+                    "ok": False, "error": "action must be 'set' or 'delete'"})
+            if sub == "config":
+                headers = None
+                want = req.get("required")
+                if want is True and not wa.required() and not (
+                        who and who["role"] == web_auth.ROLE_ADMIN):
+                    # Turning the lock ON must be done by someone who can
+                    # get back in: prove an admin login works, and stay
+                    # signed in with it.
+                    token, res = wa.login(req.get("username"),
+                                          req.get("password"), peer)
+                    if token is None:
+                        return self._json(200, {
+                            "ok": False, "error":
+                            "sign in with an admin login to turn the lock "
+                            "on (" + res["error"] + ")"})
+                    if res != web_auth.ROLE_ADMIN:
+                        wa.logout(token)
+                        return self._json(200, {
+                            "ok": False,
+                            "error": "that login is not an admin"})
+                    headers = [("Set-Cookie", web_auth.set_cookie(token))]
+                wa.configure(required=want, idle_min=req.get("idleMin"))
+                log.warning("🔐 hub login lock: required=%s idleMin=%s "
+                            "(changed by %s)", wa.required(), wa.idle_min(),
+                            who["user"] if who else peer)
+                return self._json(200, {"ok": True,
+                                        "required": wa.required(),
+                                        "idleMin": wa.idle_min()},
+                                  headers=headers)
+        except ValueError as e:
+            return self._json(200, {"ok": False, "error": str(e)})
+        except Exception as e:  # noqa: BLE001 — a db fault is not a 500
+            log.error("hub login %s failed: %s", sub, e)
+            return self._json(503, {"ok": False,
+                                    "error": f"login store unavailable: {e}"})
+        return self._json(404, {"ok": False, "error": "not found"})
 
     def _serve_webui(self, rel_path, head_only=False):
         """G2S-36: static serving for the Test Panel — files under G2S/webui/
@@ -22197,6 +22386,24 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
         # percent-encoded traversal (%2e%2e) is normalized away by the
         # realpath prefix check in _serve_webui rather than sneaking past it.
         path = urllib.parse.unquote(self.path.split("?", 1)[0])
+        _lvl, _is_page = web_auth.get_level(path)
+        if not self._auth_gate(_lvl, is_page=_is_page, active=_is_page):
+            return
+        if path.startswith("/api/auth/"):
+            return self._handle_auth_get(path)
+        if path in ("/login", "/login.html"):
+            wa = getattr(self.host_engine, "web_auth", None)
+            if wa is None or not wa.required():
+                # nothing to sign in to — straight to the hub page
+                try:
+                    self.send_response(302)
+                    self.send_header("Location", "/")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                return
+            return self._serve_webui("login.html")
         if path.startswith("/api/status"):
             engine = self.host_engine
             # ?slim=1 — the POLLER view (2026-07-22). The full payload
@@ -22209,6 +22416,12 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
             # full view on demand (e.g. when the games modal opens).
             slim = (urllib.parse.parse_qs(self.path.partition("?")[2])
                     .get("slim") or ["0"])[0] not in ("", "0", "false")
+            # Lock on, nobody signed in (the wall board, a satellite's "is
+            # this a CabiNet hub?" probe): the display view only — built
+            # from the slim body below, whatever was asked for.
+            _public = getattr(self, "_signed_out", False)
+            if _public:
+                slim = True
             # Hub-perf fix (2026-07-25, see STATUS_CACHE_TTL_SEC): the
             # build+serialize+ETag below runs ONCE per TTL window per
             # variant; every other poll serves the cached bytes. Single
@@ -22523,6 +22736,18 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                 finally:
                     with engine.status_cache_lock:
                         engine.status_cache_building[variant] = False
+            if _public:
+                with engine.status_cache_lock:
+                    _pub = engine.status_cache.get("public")
+                if not _pub or _pub["src"] != etag:
+                    _pbody = web_auth.public_status(body)
+                    _pub = {"src": etag, "body": _pbody,
+                            "etag": '"p' + hashlib.md5(
+                                self._ETAG_CLOCK_NOISE.sub(r'"\1": 0', _pbody)
+                                .encode("utf-8")).hexdigest() + '"'}
+                    with engine.status_cache_lock:
+                        engine.status_cache["public"] = _pub
+                body, etag = _pub["body"], _pub["etag"]
             if self.headers.get("If-None-Match") == etag:
                 try:
                     self.send_response(304)
@@ -22554,10 +22779,11 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
             # G2S-39: the enthusiast WAT accounts + last-100 ledger tail.
             # Compact — polled endpoint, indent would force the pure-Python
             # encoder (see the /api/status build).
-            self._send(200, json.dumps(
-                self.host_engine.account_store.snapshot(),
-                separators=(",", ":")),
-                "application/json", soap=False)
+            _acct = self.host_engine.account_store.snapshot()
+            if getattr(self, "_signed_out", False):
+                _acct = web_auth.public_accounts(_acct)
+            self._send(200, json.dumps(_acct, separators=(",", ":")),
+                       "application/json", soap=False)
         elif path.startswith("/api/players"):
             # Player Maintenance: the Players composite (accounts ⋈ fobs
             # ⋈ carded/glass sessions + the House row + the unassigned-fob
@@ -25576,6 +25802,17 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length).decode("utf-8", errors="replace")
         peer = self.client_address[0]
         action = (self.headers.get("SOAPAction") or "").strip('"')
+        # Optional hub login: machines, satellites and the glass pass as
+        # PUBLIC; an operator action needs a signed-in login of the right
+        # kind. Sign-in bodies carry passwords, so /api/auth/ is routed
+        # here — ahead of the wire logger below, which records bodies.
+        _lvl = web_auth.post_level(self.path, raw)
+        if not self._auth_gate(_lvl, active=_lvl != web_auth.PUBLIC):
+            return
+        if self.path.startswith("/api/auth/"):
+            wire.info("IN  <<< POST %s from %s (%d bytes, body withheld)",
+                      self.path.split("?", 1)[0], peer, len(raw))
+            return self._handle_auth_post(raw, peer)
         # SAS floor reports are periodic (every 1s per satellite) — route them
         # AROUND the verbatim wire logger below (like the meterInfo digest) so
         # steady-state satellite traffic never spams the wire capture (F1).

@@ -75,6 +75,7 @@ G2S_GATES = (
     "test_aft_push.py",
     "test_machine_linking.py",
     "test_satellite_catchup.py",
+    "test_web_auth.py",
 )
 
 # Satellites get the whole SAS tree minus data/caches. It is a SET, not a file:
@@ -477,12 +478,36 @@ def _adopt_inner(root, remote, assume_yes, snap, before):
     return snap
 
 
+def hub_token():
+    """The hub's local-tool secret (G2S/web_auth.py), or '' — sent as
+    X-CabiNet-Token so this script still sees the whole floor when the
+    optional hub login is turned on. Only whoever the hub runs as can read
+    the file."""
+    try:
+        with open(os.path.join(repo_root(), "G2S", "data",
+                               "hub_api_token"), encoding="ascii") as f:
+            return f.read().strip()
+    except (OSError, UnicodeError):
+        return ""
+
+
 def hub_status(hub_url, timeout=8):
     try:
-        with urllib.request.urlopen(hub_url + "/api/status", timeout=timeout) as r:
-            return json.load(r)
+        req = urllib.request.Request(hub_url + "/api/status")
+        tok = hub_token()
+        if tok:
+            req.add_header("X-CabiNet-Token", tok)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            st = json.load(r)
     except Exception as e:
         return {"__error__": str(e)}
+    if isinstance(st, dict) and st.get("loginRequired"):
+        # The signed-out display view: no satellite addresses, no readers.
+        # Acting on it would look like an empty floor — refuse instead.
+        return {"__error__": "the hub's login lock is on and this account "
+                "cannot read G2S/data/hub_api_token — run this as the "
+                "account the hub service runs as"}
+    return st
 
 
 def venv_python(root):

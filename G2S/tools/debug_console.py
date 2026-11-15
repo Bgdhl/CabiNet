@@ -469,7 +469,15 @@ def status_reader():
         api = None
         api_ok = False
         try:
-            with urllib.request.urlopen(API_URL, timeout=2) as r:
+            _req = urllib.request.Request(API_URL)
+            try:   # optional hub login: the local-tool secret, if readable
+                with open(os.path.join(os.path.dirname(os.path.dirname(
+                        os.path.abspath(__file__))), "data",
+                        "hub_api_token"), encoding="ascii") as _tf:
+                    _req.add_header("X-CabiNet-Token", _tf.read().strip())
+            except (OSError, UnicodeError):
+                pass
+            with urllib.request.urlopen(_req, timeout=2) as r:
                 api = json.loads(r.read().decode())
                 api_ok = True
         except Exception:
