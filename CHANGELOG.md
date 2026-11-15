@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.3.1
+## v0.3.2
 - **A machine whose clock runs ahead of the hub can now join.** Such a
   machine treated every request from the hub as already expired (the
   "Time-to-live Expired" refusal), including the one that completes the
@@ -12,6 +12,23 @@
   A machine set weeks or more ahead (a wrong month or year) gets requests
   that never expire instead, since that much extra time does not fit in
   the field. Machines running behind the hub were never affected.
+
+## v0.3.1
+- **SAS on a Raspberry Pi 4 now reads long replies.** On a Pi 4 the SAS
+  box cut every machine reply longer than 16 bytes in two and threw both
+  halves away. Short replies still got through, so the machine looked
+  healthy: credits showed, bonuses landed, tickets were issued. But AFT
+  never registered ("silence on registration initialize"), and a printed
+  ticket was never recorded as printed, so it was refused when you fed it
+  back in. Found from a tester's support bundle and reproduced on a WMS
+  BB2. If you saw "Invalid CRC in packet" filling the SAS log, this was it.
+- **Satellite Pis keep the right time.** A Pi on the slot network has no
+  route to the internet and no battery clock, so it sat at whatever date
+  its image was made. It now takes its time from the host. Existing
+  satellites get this on their next Update.
+- **Setup on a brand-new card no longer stops at "mkdir ... failed".**
+  `smib_setup.sh` and `companion_setup.sh` now create the folder they copy
+  into.
 
 ## v0.3.0
 - **Log in with a PIN, no card needed.** A machine's player screen now

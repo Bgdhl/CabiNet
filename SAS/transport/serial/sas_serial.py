@@ -35,8 +35,16 @@ TIMING — the two hazards the adversarial review caught (both real):
    machine's deadline to START its response, NOT the host's read-completion
    budget. So we: wait up to first_byte_timeout (default 50 ms, lenient — a
    forgiving host is safe point-to-point) for byte 1, then drain the reply
-   stopping on a >gap_timeout silence (the spec's own 5 ms inter-byte limit
-   means a real gap = end of frame).
+   stopping on a >gap_timeout silence.
+   gap_timeout is 25 ms, NOT the spec's 5 ms inter-byte limit: that limit
+   is about the WIRE, and userspace never sees the wire. The PL011 hands
+   bytes up in FIFO-sized bursts — BENCH-PROVEN 2026-11-15 on a Pi 4B
+   (Bookworm 64-bit, kernel 6.12): 16 bytes at a time, i.e. one burst every
+   ~9 ms at 19200 baud, on a reply the BB2 sent gaplessly. With a 6 ms gap
+   every reply longer than 16 bytes was cut in two, both halves failed CRC,
+   and AFT registration (0x73) and ticket capture (0x4D/0x3D) read as
+   "silence" while 8-byte meters looked healthy. The Zero 2 W's driver
+   delivers smaller bursts, which is why the reference rig never showed it.
 
 Frame facts: [address][command][data...][crc-lo][crc-hi]; NO sync byte;
 two-byte (type R read) polls carry no CRC; general poll = single 0x80|addr
@@ -65,7 +73,7 @@ class SASSerialPort:
 
     def __init__(self, port: str, baudrate: int = SAS_BAUD,
                  first_byte_timeout: float = 0.050,
-                 gap_timeout: float = 0.006):
+                 gap_timeout: float = 0.025):
         if serial is None:
             raise RuntimeError("pyserial is required: pip install pyserial")
         self.port_path = port

@@ -598,6 +598,30 @@ def sat_ssh(peer, key, remote_cmd, check=True, timeout=120, user=None):
                check=check, timeout=timeout)
 
 
+#: Point a satellite's clock at the hub. The slot segment has no route to the
+#: internet, so the Pi's stock NTP pool is unreachable and it sits at its
+#: image date; the host serves NTP, but Bookworm's NetworkManager does not hand
+#: the DHCP offer to systemd-timesyncd. Gateway first (the host, on a slot
+#: segment), public pool behind it (a lite install's gateway is a home router).
+#: Skipped when the drop-in is already there, so it costs nothing per update.
+SAT_CLOCK_CMD = (
+    "test -f /etc/systemd/timesyncd.conf.d/cabinet.conf && exit 0; "
+    "GW=$(ip route | awk '/^default/{print $3; exit}'); "
+    "[ -n \"$GW\" ] || exit 0; "
+    "sudo mkdir -p /etc/systemd/timesyncd.conf.d && "
+    "printf '[Time]\\nNTP=%s 0.debian.pool.ntp.org 1.debian.pool.ntp.org\\n' "
+    "\"$GW\" | sudo tee /etc/systemd/timesyncd.conf.d/cabinet.conf "
+    ">/dev/null && sudo systemctl restart systemd-timesyncd")
+
+
+def sat_clock(peer, key, user=None):
+    """Best-effort: a clock we could not set must never fail an update."""
+    try:
+        sat_ssh(peer, key, SAT_CLOCK_CMD, check=False, timeout=30, user=user)
+    except Exception:
+        pass
+
+
 def sat_sas_dir(peer, key, user=None):
     """Read the satellite's own service file for its working directory rather
     than guessing the path — a wrong guess would 'succeed' into nowhere."""
@@ -1274,12 +1298,14 @@ def restart_fleet(sats, comps, key, dry, touched=None):
         # sudo prompt still triggered a restore over the live hub.db.
         if touched is not None:
             touched["sat_restarted"] = True
+        sat_clock(s["peer"], key, user=sat_user(s))
         sat_ssh(s["peer"], key, "sudo systemctl restart cabinet-sas",
                 user=sat_user(s))
     for c in comps:
         say("   companion %s" % c["companionId"])
         if touched is not None:
             touched["sat_restarted"] = True
+        sat_clock(c["peer"], key, user=sat_user(c))
         try:
             rc, _ = sat_ssh(c["peer"], key,
                             "sudo systemctl restart cabinet-companion",
