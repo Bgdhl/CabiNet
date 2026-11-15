@@ -679,10 +679,16 @@ def rsync_cmd(key, src, dest, dry=False, checksum=False):
 
 def tree_differs(itemized):
     """Does rsync --itemize-changes output name anything that would be SENT?
-    '>f' is a file whose content goes over, 'c' a directory or link to be
-    created. Lines starting '.' are attribute-only (a timestamp), which is
-    not a reason to restart a machine's SAS link."""
-    return any(ln[:2] == ">f" or ln[:1] == "c"
+    '<f' is a file whose content goes to the remote ('>f' when pulling), 'c'
+    a directory or link to be created. Lines starting '.' are attribute-only
+    (a timestamp), which is not a reason to restart a machine's SAS link.
+
+    Real output from a hub pushing to a satellite whose file differed
+    (rsync 3.4.1 -> 3.2.7, 2026-11-15):
+        <fcst...... transport/serial/sas_serial.py
+    The first cut of this looked only for '>f' — the PULL direction — so a
+    genuinely out-of-date satellite was reported current."""
+    return any(ln[:2] in ("<f", ">f") or ln[:1] == "c"
                for ln in (itemized or "").splitlines())
 
 

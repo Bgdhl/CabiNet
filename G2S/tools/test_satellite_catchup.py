@@ -68,7 +68,9 @@ STATUS = {
     },
     "tournament": {"phase": "idle"},
 }
-SENT = ">f+++++++++ core/sas_meters.py\n"
+# verbatim from a real hub -> satellite run (rsync 3.4.1 -> 3.2.7): a PUSH
+# marks a sent file '<f', not '>f'
+SENT = "<fcst...... transport/serial/sas_serial.py\n"
 TIME_ONLY = ".f..t...... core/sas_meters.py\n.d..t...... core/\n"
 
 
@@ -173,7 +175,12 @@ def updater_checks(root):
           and [s["smibId"] for s in touched["sats"]] == ["smib-on"])
 
     print("— updater: what counts as 'differs'")
-    check("a file to be sent differs", up.tree_differs(SENT))
+    check("a file to be sent differs (push direction, '<f')",
+          up.tree_differs(SENT))
+    check("a brand-new file differs",
+          up.tree_differs("<f+++++++++ core/new_module.py\n"))
+    check("the pull-direction marker counts too",
+          up.tree_differs(">f.st...... core/sas_meters.py\n"))
     check("a new directory differs", up.tree_differs("cd+++++++++ core/\n"))
     check("timestamps alone do not (no restart for nothing)",
           not up.tree_differs(TIME_ONLY))
