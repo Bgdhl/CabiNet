@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.3.3
+- **Updating no longer needs every machine switched on.** The updater
+  used to stop with "could not read WorkingDirectory" if any satellite Pi
+  was powered off, so one dark machine blocked the update for the whole
+  floor. It now skips a Pi it cannot reach, names it, and updates
+  everything else.
+- **A machine that comes back later is brought up to date by itself.**
+  When a satellite or card-reader Pi starts reporting, the hub checks its
+  code against its own and, if it is older, copies the current version
+  over and restarts that Pi's service. Nothing is restarted if it is
+  already current. It waits if an update or a tournament is running.
+
 ## v0.3.2
 - **A machine whose clock runs ahead of the hub can now join.** Such a
   machine treated every request from the hub as already expired (the
