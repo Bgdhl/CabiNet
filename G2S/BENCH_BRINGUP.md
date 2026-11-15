@@ -16,10 +16,17 @@ firewall, config sanity) and prints GO/NO-GO with fix commands:
 python3 tools/bench_preflight.py
 ```
 
+It finds the slot NIC itself (the one holding 192.168.50.2, else the one
+the `cabinet-dhcp` unit is pinned to, else the wired NIC with no other
+address) and prints which one it chose; name it with `--interface <nic>`
+if the guess is wrong. On a hub built from `deploy/DEPLOY.md` the CabiNet
+services already hold TCP 8081 and UDP 67, and the check passes those.
+
 Manual equivalents, if you prefer:
 
 ```bash
 # slot VLAN NIC up with the server IP the whole stack assumes
+# (eno1 is the dev bench PC's NIC; a Pi's is eth0 or end0 — see: ip link)
 sudo ip addr add 192.168.50.2/24 dev eno1
 sudo ip link set eno1 up
 ip addr show eno1                          # verify 192.168.50.2/24, carrier UP

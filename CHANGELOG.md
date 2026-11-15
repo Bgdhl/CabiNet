@@ -12,6 +12,12 @@
   A machine set weeks or more ahead (a wrong month or year) gets requests
   that never expire instead, since that much extra time does not fit in
   the field. Machines running behind the hub were never affected.
+- **The bench pre-flight check works on a Raspberry Pi hub.**
+  `bench_preflight.py` looked for a network port called `eno1`, which a
+  Pi does not have, and reported the hub's own running services as
+  intruders on ports 8081 and 67, so a correctly built hub got NO-GO. It
+  now finds the slot network port itself (or takes `--interface`), and
+  recognises CabiNet's own servers.
 
 ## v0.3.1
 - **SAS on a Raspberry Pi 4 now reads long replies.** On a Pi 4 the SAS
