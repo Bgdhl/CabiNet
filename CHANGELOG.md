@@ -9,7 +9,9 @@
   lead from the machine's own timestamps and gives its requests that much
   extra time to live; once the machine has joined, the existing clock
   sync sets its clock right and the extra time is no longer needed.
-  Machines running behind the hub were never affected.
+  A machine set weeks or more ahead (a wrong month or year) gets requests
+  that never expire instead, since that much extra time does not fit in
+  the field. Machines running behind the hub were never affected.
 
 ## v0.3.0
 - **Log in with a PIN, no card needed.** A machine's player screen now
