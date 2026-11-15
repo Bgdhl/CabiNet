@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.3.2
+- **A machine whose clock runs ahead of the hub can now join.** Such a
+  machine treated every request from the hub as already expired (the
+  "Time-to-live Expired" refusal), including the one that completes the
+  handshake, so it sat at "waiting to join" forever. Found on a Bally
+  Alpha 2 Pro Curve running 70 seconds fast. The hub now measures the
+  lead from the machine's own timestamps and gives its requests that much
+  extra time to live; once the machine has joined, the existing clock
+  sync sets its clock right and the extra time is no longer needed.
+  A machine set weeks or more ahead (a wrong month or year) gets requests
+  that never expire instead, since that much extra time does not fit in
+  the field. Machines running behind the hub were never affected.
+- **The bench pre-flight check works on a Raspberry Pi hub.**
+  `bench_preflight.py` looked for a network port called `eno1`, which a
+  Pi does not have, and reported the hub's own running services as
+  intruders on ports 8081 and 67, so a correctly built hub got NO-GO. It
+  now finds the slot network port itself (or takes `--interface`), and
+  recognises CabiNet's own servers.
+
 ## v0.3.1
 - **SAS on a Raspberry Pi 4 now reads long replies.** On a Pi 4 the SAS
   box cut every machine reply longer than 16 bytes in two and threw both

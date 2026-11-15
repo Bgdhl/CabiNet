@@ -124,7 +124,7 @@ if "tournament_names" not in _hub_store_mod.HOST_SETTING_KEYS:
 # the MINOR bump per the repo's version rule). Surfaced in engine_meta() ->
 # /api/status ["_engine"]["version"]; bump this and add a CHANGELOG.md
 # section on every commit with a user-visible change.
-CABINET_VERSION = "0.3.1"
+CABINET_VERSION = "0.3.2"
 
 WSDL_NS = "http://www.gamingstandards.com/wsdl/g2s/v1.0"
 SCHEMA_NS = "http://www.gamingstandards.com/g2s/schemas/v1.0.3"
@@ -635,6 +635,23 @@ GP_PERSIST_MAX_WAIT_SEC = 30.0
 # once (--no-auto-clock disables). Spec §3.13 recommends host correction only
 # beyond 5s; 30s is our conservative "actually breaks things" line.
 CLOCK_SKEW_SYNC_SEC = 30
+
+# An EGM whose clock runs AHEAD of ours judges every host request expired
+# the moment it arrives once the lead exceeds the request's timeToLive
+# (G2S_APX011 "Time-to-live Expired") — and that includes the very
+# setCommsState that would let it join, so the join-time clock sync above
+# never gets to run. Bench 2026-09-14: a Bally Alpha 2 Pro Curve 70 s
+# fast sat in SYNC forever. Fix: every outbound timeToLive is stretched by
+# the measured lead (plus this margin) while the lead exceeds the margin;
+# an EGM running BEHIND needs nothing (our stamps are in its future).
+# After the join-time setDateTime the lead is ~0 and the stretch vanishes.
+CLOCK_LEAD_TTL_MARGIN_SEC = 5
+# timeToLive is an xs:int of milliseconds, so a stretch past this (a lead of
+# about 24.8 days — a clock set a month or a year ahead) would put an
+# out-of-schema value on every request. Past it we send 0 (unexpirable)
+# instead: a clamp to the maximum would still read as expired on a machine
+# that far ahead, and 0 lets the join-time clock sync run.
+G2S_TTL_MAX_MS = 2147483647
 
 # Standing meter-subscription cadence in ms (G2S-16). 60000 is the schema
 # MINIMUM periodicInterval (spec §5.21 Table 5.19, minIncl 60000; default
@@ -11700,10 +11717,49 @@ class G2SHost:
             f"</g2s:g2sMessage>"
         )
 
+    def _ttl_for(self, assoc, time_to_live):
+        """The timeToLive to put on the wire: the caller's, stretched by the
+        EGM's measured clock LEAD (egm_clock_skew_sec > 0, refreshed from
+        every inbound dateTimeSent) plus CLOCK_LEAD_TTL_MARGIN_SEC, so an
+        EGM running ahead of us does not read the request as already
+        expired (G2S_APX011). 0 (unexpirable) and an EGM running behind
+        pass through untouched. A lead so large that the stretched value
+        would leave the schema's int range (G2S_TTL_MAX_MS) sends 0
+        instead. Logged once per association."""
+        try:
+            ttl = int(time_to_live)
+        except (TypeError, ValueError):
+            return time_to_live
+        if ttl <= 0:
+            return time_to_live
+        lead = getattr(assoc, "egm_clock_skew_sec", None)
+        if lead is None or lead <= CLOCK_LEAD_TTL_MARGIN_SEC:
+            return time_to_live
+        extra_ms = int((lead + CLOCK_LEAD_TTL_MARGIN_SEC) * 1000)
+        if ttl + extra_ms > G2S_TTL_MAX_MS:
+            if not getattr(assoc, "_ttl_lead_logged", False):
+                assoc._ttl_lead_logged = True
+                log.warning("[%s] EGM clock runs %.1f days AHEAD of the hub "
+                            "— too far to stretch timeToLive within its "
+                            "range, so requests go out unexpirable "
+                            "(timeToLive 0); the join-time clock sync "
+                            "corrects the machine", assoc.egm_id,
+                            lead / 86400)
+            return 0
+        if not getattr(assoc, "_ttl_lead_logged", False):
+            assoc._ttl_lead_logged = True
+            log.warning("[%s] EGM clock runs %.0f s AHEAD of the hub — "
+                        "stretching every timeToLive by %d ms so requests "
+                        "are not read as expired (G2S_APX011); the join-time "
+                        "clock sync corrects the machine", assoc.egm_id,
+                        lead, extra_ms)
+        return ttl + extra_ms
+
     def build_inner_command(self, assoc, command_xml, session_type, session_id,
                             time_to_live):
         cid = assoc.next_command_id()
         ts = now_iso()
+        time_to_live = self._ttl_for(assoc, time_to_live)
         return (
             f'<g2s:g2sMessage xmlns:g2s="{SCHEMA_NS}">\n'
             f'   <g2s:g2sBody g2s:hostId="{self.host_id}" '
@@ -11726,6 +11782,7 @@ class G2SHost:
         exactly; only the class element and deviceId are parameterized."""
         cid = assoc.next_command_id()
         ts = now_iso()
+        time_to_live = self._ttl_for(assoc, time_to_live)
         return (
             f'<g2s:g2sMessage xmlns:g2s="{SCHEMA_NS}">\n'
             f'   <g2s:g2sBody g2s:hostId="{self.host_id}" '
@@ -11766,6 +11823,7 @@ class G2SHost:
         Returns (inner_xml, cid) like the sibling."""
         cid = assoc.next_command_id()
         ts = now_iso()
+        time_to_live = self._ttl_for(assoc, time_to_live)
         pfx = EXT_NS_PREFIX.get(class_ns, "ext")
         return (
             f'<g2s:g2sMessage xmlns:g2s="{SCHEMA_NS}" '
