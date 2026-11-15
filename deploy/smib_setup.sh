@@ -97,6 +97,9 @@ say() { printf '\n=== %s\n' "$*"; }
 copy_tree() {
     local src="$1" dst="$2"; shift 2
     if command -v rsync >/dev/null 2>&1; then
+        # rsync creates the last path component only — on a fresh card
+        # ~/CabiNet does not exist yet and the copy died here.
+        "${SSH[@]}" "$HOST" "mkdir -p '$dst'"
         rsync -a -e "$RSYNC_SSH" "$@" "$src" "$HOST:$dst"
         return
     fi
@@ -170,6 +173,22 @@ sudo systemctl mask serial-getty@ttyAMA0.service 2>/dev/null || true
 sudo usermod -aG dialout "$USER"
 [ "$CHANGED" = 1 ] && echo uart-changed || echo uart-nochange')
 echo "$UART_OUT"
+
+say "clock: take time from the hub"
+# WHY: the slot segment has no route to the internet, so the Pi's stock NTP
+# pool is unreachable and a Pi has no battery clock — it boots at the image
+# date and stays there. The host serves NTP and offers itself in DHCP, but
+# Bookworm's NetworkManager does not hand that to systemd-timesyncd. So name
+# the gateway (the host, on a slot segment) first and keep the public pool
+# behind it for a lite install on a home LAN, where the gateway is a router.
+"${SSH[@]}" "$HOST" '
+GW=$(ip route | awk "/^default/{print \$3; exit}")
+[ -n "$GW" ] || { echo "no default route yet — clock left alone"; exit 0; }
+sudo mkdir -p /etc/systemd/timesyncd.conf.d
+printf "[Time]\nNTP=%s 0.debian.pool.ntp.org 1.debian.pool.ntp.org\n" "$GW" \
+  | sudo tee /etc/systemd/timesyncd.conf.d/cabinet.conf >/dev/null
+sudo systemctl restart systemd-timesyncd 2>/dev/null || true
+echo "time source: $GW, then the public pool"'
 
 say "python venv + deps"
 # ALREADY-SATISFIED FIRST. The slot segment is deliberately isolated (DEPLOY.md:
