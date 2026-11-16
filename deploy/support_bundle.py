@@ -40,7 +40,50 @@ import tarfile
 import tempfile
 import urllib.request
 
-VERSION = "1.1"
+VERSION = "1.2"
+
+# Left out of every bundle. With any of these a copy of the bundle could be
+# used to get INTO the hub, or to work out a login password or a player's
+# PIN, and no diagnosis needs them. Up to v1.1 all three went out with the
+# rest of G2S/data (found 2026-11-16 in a tester's bundle; the hub login and
+# its token only exist since CabiNet v0.3.4).
+SECRET_FILES = ("hub_api_token",)             # lets a local tool skip the login
+SECRET_JSON_KEYS = ("pinSecret", "pinHash")   # account_state.json: the PIN key
+#                                               and every player's PIN hash
+DB_SCRUB = (                                  # run on the COPY of a database,
+    ("web_logins", "UPDATE web_logins SET pw = ''"),    # never the live file
+    ("web_sessions", "DELETE FROM web_sessions"),
+)
+REMOVED = "(removed from the bundle)"
+_SECRET_JSON_RE = re.compile(
+    rb'("(?:' + "|".join(SECRET_JSON_KEYS).encode("ascii")
+    + rb')"\s*:\s*")[^"]*(")')
+
+
+def scrub_json_secrets(data):
+    """Blank the PIN key and PIN hashes in a state file's bytes. Done on the
+    text, not by parsing, so a damaged file is scrubbed too. The key stays,
+    so "this player has a PIN" still shows."""
+    return _SECRET_JSON_RE.sub(
+        rb"\g<1>" + REMOVED.encode("ascii") + rb"\g<2>", data)
+
+
+def scrub_sqlite(path):
+    """Take the login password hashes and the signed-in sessions out of a
+    database COPY, then rebuild the file so the old values are not left
+    behind in freed pages. Usernames, roles and every other table stay."""
+    db = sqlite3.connect(path, isolation_level=None)
+    try:
+        db.execute("PRAGMA journal_mode=DELETE")    # keep it all in one file
+        have = {r[0] for r in db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        for table, statement in DB_SCRUB:
+            if table in have:
+                db.execute(statement)
+        db.execute("VACUUM")
+    finally:
+        db.close()
+
 UNITS = [
     "cabinet-g2s", "cabinet-dhcp", "cabinet-dns", "cabinet-ntp",
     "cabinet-tftp", "cabinet-console", "cabinet-sas",
@@ -181,7 +224,7 @@ class Bundle:
         self.add_bytes(name, truncate_bytes(
             text.encode("utf-8", "replace")))
 
-    def add_file(self, name, src, cap=None, keep=None):
+    def add_file(self, name, src, cap=None, keep=None, scrub=None):
         try:
             size = os.path.getsize(src)
             if not cap or size <= cap:
@@ -198,6 +241,8 @@ class Bundle:
                         f.seek(size - cap)
                     data = truncate_bytes(f.read(), cap,
                                           rescued=_rescue(head, keep))
+            if scrub:
+                data = scrub(data)
             self.add_bytes(name, data, mtime=os.path.getmtime(src))
         except Exception as e:  # noqa: BLE001
             self.skip(name, str(e))
@@ -326,7 +371,13 @@ def copy_dir_files(bundle, srcdir, arcprefix, cap=None, group_limit=None):
 
 
 def snapshot_sqlite(bundle, src, arcname):
-    """Consistent copy of a live WAL-mode SQLite db via the backup API."""
+    """Consistent copy of a live WAL-mode SQLite db via the backup API, with
+    the login secrets taken out of the copy (scrub_sqlite). The live file is
+    opened read-only and never changed.
+
+    When the copy cannot be made or cleaned the database is LEFT OUT. Up to
+    v1.1 this fell back to copying the raw file and its sidecars, which is
+    exactly the copy that cannot be scrubbed."""
     tmp = None
     try:
         if not os.path.exists(src):
@@ -337,23 +388,51 @@ def snapshot_sqlite(bundle, src, arcname):
             return
         fd, tmp = tempfile.mkstemp(suffix=".db-snapshot")
         os.close(fd)
-        with sqlite3.connect(f"file:{src}?mode=ro", uri=True) as srcdb, \
-                sqlite3.connect(tmp) as dstdb:
+        srcdb = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
+        dstdb = sqlite3.connect(tmp)
+        try:
             srcdb.backup(dstdb)
+        finally:
+            dstdb.close()
+            srcdb.close()
+        scrub_sqlite(tmp)
         bundle.add_file(arcname, tmp)
     except Exception as e:  # noqa: BLE001
-        bundle.skip(arcname, f"sqlite backup failed ({e}) — raw-copying "
-                             "main + sidecars instead")
-        for suffix in ("", "-wal", "-shm"):
-            if os.path.exists(src + suffix):
-                bundle.add_file(arcname + suffix + (".raw" if not suffix
-                                                   else ""), src + suffix)
+        bundle.skip(arcname, f"could not be copied and cleaned ({e}) — left "
+                             "out, because a raw copy would carry the hub's "
+                             "login password hashes. Send the file by hand "
+                             "only if the developer asks for it")
     finally:
-        if tmp:
+        for leftover in ((tmp, tmp + "-wal", tmp + "-shm", tmp + "-journal")
+                         if tmp else ()):
             try:
-                os.remove(tmp)
+                os.remove(leftover)
             except OSError:
                 pass
+
+
+def collect_host_data(b, data):
+    """G2S/data into host/data/, minus what must never leave the hub."""
+    try:
+        entries = sorted(os.listdir(data)) if os.path.isdir(data) else None
+    except OSError as e:
+        entries, _ = None, b.skip("host/data/", str(e))
+    if entries is None:
+        b.skip("host/data/", "directory absent/unreadable")
+        return
+    for f in entries:
+        src = os.path.join(data, f)
+        if not os.path.isfile(src):
+            continue
+        if f in SECRET_FILES:
+            b.skip(f"host/data/{f}", "a secret — never collected")
+        elif f.endswith(".db"):
+            snapshot_sqlite(b, src, f"host/data/{f}")
+        elif re.search(r"\.db(-wal|-shm)$|\.db\.bak.*$|\.seq$", f):
+            b.skip(f"host/data/{f}", "db sidecar (snapshot covers it)")
+        else:
+            b.add_file(f"host/data/{f}", src, cap=TAIL_BYTES,
+                       scrub=scrub_json_secrets)
 
 
 def unit_interpreters(roles):
@@ -390,6 +469,8 @@ def collect(b, args, roles, roles_inferred, root):
         "floor's data — machine ids, player names, fob ids, fun-money\n"
         "balances, protocol traffic — plus this box's network addresses\n"
         "and a list of its listening services.\n"
+        "Left out on purpose: the hub's API token, the hashes of login\n"
+        "passwords and player PINs, and signed-in browser sessions.\n"
         "Send it to the CabiNet developer with a note about what went wrong\n"
         "and when (clock time matters — journals are timestamped).\n"
         "Don't post it publicly.\n"))
@@ -486,24 +567,7 @@ def collect(b, args, roles, roles_inferred, root):
         g2s = os.path.join(root, "G2S")
         copy_dir_files(b, os.path.join(g2s, "logs"), "host/logs",
                        cap=TAIL_BYTES, group_limit=LOG_GROUP_LIMIT)
-        data = os.path.join(g2s, "data")
-        try:
-            entries = sorted(os.listdir(data)) if os.path.isdir(data) else None
-        except OSError as e:
-            entries, _ = None, b.skip("host/data/", str(e))
-        if entries is None:
-            b.skip("host/data/", "directory absent/unreadable")
-        else:
-            for f in entries:
-                src = os.path.join(data, f)
-                if not os.path.isfile(src):
-                    continue
-                if f.endswith(".db"):
-                    snapshot_sqlite(b, src, f"host/data/{f}")
-                elif re.search(r"\.db(-wal|-shm)$|\.db\.bak.*$|\.seq$", f):
-                    b.skip(f"host/data/{f}", "db sidecar (snapshot covers it)")
-                else:
-                    b.add_file(f"host/data/{f}", src, cap=TAIL_BYTES)
+        collect_host_data(b, os.path.join(g2s, "data"))
         for leases in ("/var/lib/misc/dnsmasq.leases",):
             if os.path.exists(leases):
                 b.add_file("host/dnsmasq.leases", leases)
