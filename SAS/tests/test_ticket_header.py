@@ -33,9 +33,14 @@ Tiers, mirroring test_sas_host_settings.py:
   TicketHeaderState rev/session gate, apply_ticket_header's 7C/7D
   decision table against a scripted transport, reporter pass-through.
 * END-TO-END — offline defer, park defer, apply-on-resume, same-rev
-  no-resend, one-attempt-per-rev NACK, and snapshot shape in every
+  no-resend, a NACK that is not hammered, and snapshot shape in every
   state: sas_host.main() against a phased stub hub, every transition
   driven by what the satellite actually reports (never by sleeps).
+* KEEPS TRYING (2026-11-16) — a header the machine did not take is tried
+  again: on a growing wait, and at once when the machine says its setup
+  changed. Unit tests on a pretend clock, a replay of the Bluebird 2 log
+  that showed the gap, and two more sas_host.main() runs against a
+  machine that is online but deaf to 0x7C/0x7D at first.
 """
 
 import http.server
@@ -389,7 +394,7 @@ class TestTicketHeaderStateGating:
         st.mark_attempted(1)
         assert st.due() is None
 
-    def test_failure_burns_the_attempt_until_rev_bump(self):
+    def test_failure_is_not_retried_at_once_and_a_rev_bump_rearms(self):
         st = self._fed(rev=2)
         st.mark_attempted(2)
         st.record_result(2, False, "silence on both")
@@ -416,6 +421,295 @@ class TestTicketHeaderStateGating:
         st = self._fed(rev=1)
         st.mark_attempted(1)
         assert st.due() is None
+
+
+# ---------------------------------------------------------------------------
+# UNIT — a header the machine did not take is tried again (2026-11-16)
+# ---------------------------------------------------------------------------
+
+class _Clock:
+    """A clock the test moves by hand."""
+
+    def __init__(self, t=1000.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+    def tick(self, sec):
+        self.t += sec
+
+
+def _reply(rev):
+    return {"propName": "FUNCINO", "line1": "", "line2": "",
+            "titleCash": None, "rev": rev}
+
+
+def _state(rev=2):
+    clock = _Clock()
+    st = sas_host.TicketHeaderState(clock=clock)
+    st.on_reply(_reply(rev))
+    return st, clock
+
+
+def _fail(st, rev=2, detail="silence on both"):
+    assert st.due() is not None
+    st.mark_attempted(rev)
+    st.record_result(rev, False, detail)
+
+
+class TestTicketHeaderKeepsTrying:
+    def test_a_failed_attempt_is_due_again_after_its_wait(self):
+        st, clock = _state()
+        _fail(st)
+        first = sas_host.TICKET_HEADER_RETRY_SEC[0]
+        assert st.retry_in() == first
+        clock.tick(first - 0.01)
+        assert st.due() is None
+        clock.tick(0.02)
+        assert st.due()["rev"] == 2
+
+    def test_the_wait_grows_then_holds_at_the_last_value(self):
+        st, clock = _state()
+        waits = []
+        for _ in range(len(sas_host.TICKET_HEADER_RETRY_SEC) + 3):
+            _fail(st)
+            waits.append(st.retry_in())
+            clock.tick(st.retry_in() + 0.01)
+        table = list(sas_host.TICKET_HEADER_RETRY_SEC)
+        assert waits == table + [table[-1]] * 3
+        assert table == sorted(table) and table[0] >= 1.0   # never a hot loop
+        assert table[-1] <= 60.0     # a ready machine waits a minute at most
+
+    def test_it_never_gives_up_while_the_header_is_missing(self):
+        st, clock = _state()
+        for _ in range(500):
+            _fail(st)
+            clock.tick(st.retry_in() + 0.01)
+        assert st.due()["rev"] == 2
+
+    def test_success_ends_the_retries(self):
+        st, clock = _state()
+        _fail(st)
+        clock.tick(60)
+        st.mark_attempted(2)
+        st.record_result(2, True, "applied")
+        clock.tick(3600)
+        assert st.due() is None and st.retry_in() is None
+        assert st.failures == 0 and st.snapshot()["appliedRev"] == 2
+
+    def test_a_rejoin_starts_the_wait_over(self):
+        st, clock = _state()
+        for _ in range(4):
+            _fail(st)
+            clock.tick(st.retry_in() + 0.01)
+        st.on_online()
+        _fail(st)                            # due at once in the new session
+        assert st.retry_in() == sas_host.TICKET_HEADER_RETRY_SEC[0]
+
+    def test_an_attempt_that_never_reports_back_stays_burned(self):
+        """mark_attempted runs before the wire. If the apply blew up past
+        record_result there must be no wait left over to re-run it."""
+        st, clock = _state()
+        _fail(st)
+        clock.tick(60)
+        st.mark_attempted(2)                 # ...and no record_result
+        clock.tick(3600)
+        assert st.due() is None
+
+    def test_a_lost_event_sends_an_applied_header_again(self):
+        st, clock = _state()
+        st.mark_attempted(2)
+        st.record_result(2, True, "applied")
+        st.on_machine_event(lost=True)
+        assert st.snapshot()["appliedRev"] is None   # no longer vouched for
+        assert st.due() is None                      # ...but let it settle
+        clock.tick(sas_host.TICKET_HEADER_SETTLE_SEC + 0.01)
+        assert st.due()["rev"] == 2
+        st.mark_attempted(2)
+        st.record_result(2, True, "applied")
+        clock.tick(3600)
+        assert st.due() is None                      # once, not for ever
+
+    def test_a_plain_event_leaves_an_applied_header_alone(self):
+        st, clock = _state()
+        st.mark_attempted(2)
+        st.record_result(2, True, "applied")
+        st.on_machine_event()
+        clock.tick(3600)
+        assert st.due() is None and st.snapshot()["appliedRev"] == 2
+
+    def test_an_event_cuts_a_long_wait_short(self):
+        st, clock = _state()
+        for _ in range(6):
+            _fail(st)
+            clock.tick(st.retry_in() + 0.01)
+        _fail(st)
+        assert st.retry_in() == sas_host.TICKET_HEADER_RETRY_SEC[-1]
+        st.on_machine_event()
+        assert st.retry_in() == sas_host.TICKET_HEADER_SETTLE_SEC
+        clock.tick(sas_host.TICKET_HEADER_SETTLE_SEC + 0.01)
+        _fail(st)                            # due, and the wait starts over
+        assert st.retry_in() == sas_host.TICKET_HEADER_RETRY_SEC[0]
+
+    def test_a_burst_of_events_is_one_attempt(self):
+        st, clock = _state()
+        _fail(st)
+        st.on_machine_event(lost=True)       # 0x7A, 0x3F, the seed: 0.1 s
+        for _ in range(2):                   # apart, as on a RAM clear
+            clock.tick(0.1)
+            st.on_machine_event(lost=True)
+        assert st.due() is None
+        clock.tick(sas_host.TICKET_HEADER_SETTLE_SEC)
+        assert st.due()["rev"] == 2
+        st.mark_attempted(2)
+        st.record_result(2, True, "applied")
+        clock.tick(3600)
+        assert st.due() is None
+
+    def test_a_repeating_event_cannot_hold_the_attempt_off(self):
+        """SAS 6.02 §15: 0x3F comes at power-up "and every fifteen seconds
+        until configured". Whatever the rhythm, an event only ever brings
+        the next attempt forward."""
+        for every in (0.2, 1.0, 15.0):
+            st, clock = _state()
+            _fail(st)
+            attempts, t = 0, 0.0
+            while t < 120.0:
+                st.on_machine_event(lost=True)
+                for _ in range(int(every / 0.1)):
+                    clock.tick(0.1)
+                    t += 0.1
+                    if st.due() is not None:
+                        _fail(st)
+                        attempts += 1
+            assert attempts >= 120 / 60, (every, attempts)
+            # ...and never faster than the settle time allows
+            assert attempts <= 120 / sas_host.TICKET_HEADER_SETTLE_SEC + 1
+
+    def test_tries_count_from_when_the_header_was_last_on(self):
+        st, clock = _state()
+        _fail(st)
+        clock.tick(60)
+        _fail(st)
+        st.on_machine_event(lost=True)       # the wait starts over...
+        assert st.failures == 0 and st.tries == 2    # ...the count does not
+        clock.tick(sas_host.TICKET_HEADER_SETTLE_SEC + 0.01)
+        st.mark_attempted(2)
+        assert st.tries == 3
+        st.record_result(2, True, "applied")
+        assert st.tries == 0
+
+    def test_an_event_before_any_header_arrives_changes_nothing(self):
+        clock = _Clock()
+        st = sas_host.TicketHeaderState(clock=clock)
+        st.on_machine_event(lost=True)
+        clock.tick(60)
+        assert st.due() is None
+        st.on_reply(_reply(1))
+        assert st.due()["rev"] == 1
+
+    def test_the_events_that_count_exist_and_exclude_game_selected(self):
+        """The names must be real SASExceptionInfo events, or the hook is
+        dead code. A player picking a game is not one of them."""
+        from core.sas_exceptions import lookup
+        named = {lookup(code).event for code in (0x7A, 0x3F, 0x3C)}
+        assert named == set(sas_host.TICKET_HEADER_LOST_EVENTS)
+        assert lookup(0x8C).event not in sas_host.TICKET_HEADER_LOST_EVENTS
+
+
+# The Bluebird 2's own log, 2026-11-16, in seconds after it came online at
+# 12:33:53.762. The header attempt two seconds in met silence; the first
+# ticket was printed 422 s in with no header from us on the machine.
+_BB2_EVENTS = (
+    (0.07, "meters_reset"),                    # 0x7A with the online edge
+    (37.07, "validation_id_not_configured"),   # 0x3F
+    (37.12, "seeded"),                         # our 0x4C seed was taken
+    (127.99, "config_changed"),                # 0x3C, operator at the menu
+    (142.72, "config_changed"),
+    (146.44, "config_changed"),
+)
+_BB2_FIRST_TICKET = 422.12
+
+
+def _replay_bluebird(ready_at, until=_BB2_FIRST_TICKET, step=0.05):
+    """Drive the state the way the poll loop does, against a machine that
+    takes ticket data only from `ready_at` (None = never). Returns the
+    attempt times and the time the header went on (or None)."""
+    st, clock = _state()
+    t0 = clock()
+    st.on_online()
+    events = list(_BB2_EVENTS)
+    attempts, applied = [], None
+    while clock() - t0 <= until:
+        now = clock() - t0
+        while events and events[0][0] <= now:
+            _, name = events.pop(0)
+            if name == "seeded" or name in sas_host.TICKET_HEADER_LOST_EVENTS:
+                st.on_machine_event(lost=True)
+        due = st.due()
+        if due is not None:
+            st.mark_attempted(due["rev"])
+            ok = ready_at is not None and now >= ready_at
+            st.record_result(due["rev"], ok, "applied" if ok else "silence")
+            attempts.append(round(now, 2))
+            if ok and applied is None:
+                applied = now
+        clock.tick(step)
+    return attempts, applied
+
+
+class TestBluebirdRamClearReplay:
+    def test_a_deaf_machine_gets_more_than_the_one_attempt(self):
+        """The log shows one try, silence, and nothing more for the
+        rest of the session. The same timeline now gets many."""
+        attempts, applied = _replay_bluebird(ready_at=None)
+        assert applied is None
+        assert len(attempts) > 5
+
+    def test_header_is_on_within_two_seconds_of_the_validation_exception(
+            self):
+        """If the machine takes ticket data once it has a validation ID —
+        the likeliest reading of the log, and what SAS 6.02 §15 describes —
+        the header is on at the latest 2 s after its 0x3F (sooner if a
+        timed attempt happens to fall first), six minutes before the first
+        ticket."""
+        attempts, applied = _replay_bluebird(ready_at=37.2)
+        assert applied is not None
+        assert 37.2 <= applied <= 37.07 + sas_host.TICKET_HEADER_SETTLE_SEC + 0.5
+        assert applied < _BB2_FIRST_TICKET - 360
+
+    def test_with_the_timed_attempts_out_of_the_way_the_event_does_it(self):
+        """The same replay with the waits made far longer than the log, so
+        the 0x3F and the seed are the only thing that can bring it."""
+        saved = sas_host.TICKET_HEADER_RETRY_SEC
+        sas_host.TICKET_HEADER_RETRY_SEC = (3600.0,)
+        try:
+            attempts, applied = _replay_bluebird(ready_at=37.2)
+        finally:
+            sas_host.TICKET_HEADER_RETRY_SEC = saved
+        assert applied is not None
+        assert abs(applied - (37.07 + sas_host.TICKET_HEADER_SETTLE_SEC)) < 0.2
+
+    def test_whenever_the_machine_is_ready_the_header_follows_in_a_minute(
+            self):
+        """We do not know when the Bluebird would have answered. Whatever
+        the moment, the header is on within the longest wait."""
+        longest = sas_host.TICKET_HEADER_RETRY_SEC[-1]
+        for ready_at in (0.5, 3.0, 20.0, 37.2, 90.0, 130.0, 147.0, 200.0,
+                         300.0, 360.0):
+            attempts, applied = _replay_bluebird(ready_at=ready_at)
+            assert applied is not None, ready_at
+            assert applied - ready_at <= longest + 0.1, (ready_at, applied)
+            assert applied < _BB2_FIRST_TICKET, ready_at
+
+    def test_a_machine_that_never_answers_is_not_hammered(self):
+        attempts, applied = _replay_bluebird(ready_at=None, until=3600.0,
+                                             step=0.25)
+        assert applied is None
+        gaps = [b - a for a, b in zip(attempts, attempts[1:])]
+        assert min(gaps) >= sas_host.TICKET_HEADER_SETTLE_SEC - 0.3
+        assert len(attempts) <= 3600 / 60 + 15     # about one a minute
 
 
 # ---------------------------------------------------------------------------
@@ -771,18 +1065,11 @@ class _HubHandler(http.server.BaseHTTPRequestHandler):
 _CACHE = {}
 
 
-def _run_ticket_channel():
-    """Run sas_host.main() once against the phased hub and memoize; every
-    e2e test asserts on this single run (~2 s)."""
-    if _CACHE:
-        return _CACHE
-
-    machine = TicketHeaderMachine(address=1)
-    port = MockSASSerialPort(machine)
+def _drive_main(httpd, port, smib_id, patches=None, backstop_sec=25.0):
+    """Run sas_host.main() against a stub hub and a mock serial port until
+    the hub SIGTERMs it. `patches` are extra sas_host module values for the
+    run. Returns the hub's reports."""
     tmp = tempfile.mkdtemp(prefix="sas_ticket_header_test_")
-
-    httpd = _PhasedHub(("127.0.0.1", 0), _HubHandler)
-    httpd.setup_state(machine)
     server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     server_thread.start()
 
@@ -794,13 +1081,14 @@ def _run_ticket_channel():
             super().__init__(*a, **k)
             captured.append(self)
 
+    patches = dict(patches or {})
     saved_signals = {s: signal.getsignal(s)
                      for s in (signal.SIGTERM, signal.SIGINT)}
     saved = {n: getattr(sas_host, n) for n in
              ("REPORT_SEC", "HubReporter", "open_port",
-              "TicketStore", "HubTicketAuthority")}
+              "TicketStore", "HubTicketAuthority") + tuple(patches)}
     saved_argv = sys.argv
-    backstop = threading.Timer(25.0,
+    backstop = threading.Timer(backstop_sec,
                                lambda: os.kill(os.getpid(), signal.SIGTERM))
     backstop.daemon = True
     try:
@@ -813,9 +1101,11 @@ def _run_ticket_channel():
             HubTicketAuthority(hub, smib, local,
                                journal_path=os.path.join(tmp, "journal.json"),
                                start_sync_thread=False, **kw)
+        for name, value in patches.items():
+            setattr(sas_host, name, value)
         sys.argv = ["sas_host.py", "--mock", "--interval", "0.002",
                     "--hub", f"http://127.0.0.1:{httpd.server_address[1]}",
-                    "--smib-id", "pytest-ticket-smib"]
+                    "--smib-id", smib_id]
         backstop.start()
         sas_host.main()
     finally:
@@ -832,7 +1122,20 @@ def _run_ticket_channel():
         server_thread.join(timeout=2)
 
     with httpd.lock:
-        reports = list(httpd.reports)
+        return list(httpd.reports)
+
+
+def _run_ticket_channel():
+    """Run sas_host.main() once against the phased hub and memoize; every
+    e2e test asserts on this single run (~2 s)."""
+    if _CACHE:
+        return _CACHE
+
+    machine = TicketHeaderMachine(address=1)
+    port = MockSASSerialPort(machine)
+    httpd = _PhasedHub(("127.0.0.1", 0), _HubHandler)
+    httpd.setup_state(machine)
+    reports = _drive_main(httpd, port, "pytest-ticket-smib")
     _CACHE.update(machine=machine, hub=httpd, reports=reports,
                   samples=dict(httpd.samples))
     return _CACHE
@@ -891,7 +1194,8 @@ class TestTicketHeaderEndToEnd:
     def test_nack_gets_exactly_one_attempt_and_an_honest_verdict(self):
         """The machine NACKed rev 3: one 0x7C attempt (no 0x7D of any kind
         — a NACK is understanding, not silence), appliedRev pinned at 2,
-        and the snapshot detail says NACK."""
+        and the snapshot detail says NACK. One attempt across the four
+        reports that follow: the next is seconds away, not the next poll."""
         run = _run_ticket_channel()
         assert run["samples"]["after_nacksoak"] == \
             run["samples"]["after_apply2"] + 1 == 5
@@ -916,3 +1220,179 @@ class TestTicketHeaderEndToEnd:
             assert td["appliedRev"] is None or isinstance(
                 td["appliedRev"], int)
             assert isinstance(td["detail"], str)
+
+
+# ---------------------------------------------------------------------------
+# END-TO-END — a machine that is online but deaf to ticket data at first
+# ---------------------------------------------------------------------------
+
+class DeafAtFirstMachine:
+    """A RAM-cleared machine before it is set up: on the link from the
+    first poll and answering general polls, but silent to 0x7C/0x7D until
+    `ready`. It NEVER drops off the link — the case the one-attempt rule
+    had no answer for. `raise_next` is an exception code handed out on the
+    next general poll (0x3C = operator changed configuration, 0x3F =
+    validation ID not configured). It takes the 0x4C validation seed the
+    satellite sends after a 0x3F, echoing it as §4.6.1 says."""
+
+    def __init__(self, address=1):
+        self.address = address
+        self.ready = False
+        self.raise_next = None
+        self.seeds = 0              # 0x4C validation seeds taken
+        self.deaf_frames = []       # 7C/7D that met silence
+        self.ticket_frames = []     # 7C/7D that were answered
+
+    def __call__(self, frame, wakeup):
+        if not wakeup[0]:
+            return b""
+        if len(frame) == 1:                       # general poll
+            if (frame[0] & 0x7F) != self.address:
+                return b""
+            if self.raise_next is not None:
+                code, self.raise_next = self.raise_next, None
+                return bytes([code])
+            return b"\x00"
+        if frame[0] != self.address or len(frame) < 4:
+            return b""
+        body, crc = frame[:-2], frame[-2:]
+        if sas_crc(body).to_bytes(2, "little") != crc:
+            return b""
+        cmd = frame[1]
+        if cmd in (CMD_SET_EXTENDED_TICKET_DATA, CMD_SET_TICKET_DATA):
+            if not self.ready:
+                self.deaf_frames.append(cmd)
+                return b""
+            self.ticket_frames.append((cmd, bytes(frame)))
+            return _resp(self.address, cmd, 0x01)
+        if cmd == 0x4C:                           # the validation seed
+            self.seeds += 1
+            return bytes(frame)                   # echo: ID + sequence
+        return b""
+
+
+class _DeafHub(http.server.HTTPServer):
+    """deaf  -> serve rev 1 until a report carries the silence verdict;
+                then make the machine ready and have it raise 0x3C
+                ("event" mode) or 0x3F ("seed" mode);
+       wait  -> serve rev 1 until a report shows appliedRev 1, then done."""
+
+    def setup_state(self, machine, mode):
+        self.lock = threading.Lock()
+        self.machine = machine
+        self.mode = mode
+        self.reports = []
+        self.phase = "deaf"
+        self.samples = {}
+        self.signaled = False
+        self.t0 = time.monotonic()
+
+    def reply_for(self, rep):
+        td = rep.get("ticketData") or {}
+        if time.monotonic() - self.t0 > 15 and self.phase != "done":
+            self.phase = "done"                   # never hang the suite
+        if self.phase == "deaf":
+            if "silence on both" in (td.get("detail") or ""):
+                self.samples["deaf_before"] = len(self.machine.deaf_frames)
+                self.samples["ready_at"] = time.monotonic()
+                self.machine.ready = True
+                if self.mode == "event":
+                    self.machine.raise_next = 0x3C
+                elif self.mode == "seed":
+                    self.machine.raise_next = 0x3F
+                self.phase = "wait"
+            return {"ok": True, "sasEnabled": True, "ticketData": _td(1)}
+        if self.phase == "wait":
+            if td.get("appliedRev") == 1:
+                self.samples["applied_after"] = (time.monotonic()
+                                                 - self.samples["ready_at"])
+                self.samples["final_td"] = td
+                self.phase = "done"
+            else:
+                return {"ok": True, "sasEnabled": True, "ticketData": _td(1)}
+        if not self.signaled:
+            self.signaled = True
+            os.kill(os.getpid(), signal.SIGTERM)
+        return {"ok": True}
+
+
+_DEAF_CACHE = {}
+
+
+def _run_deaf_machine(mode):
+    """One sas_host.main() run per mode, memoized.
+
+    "event": the wait after a failure is 30 s, far longer than the run, so
+             only the machine's 0x3C can explain a second attempt.
+    "seed":  the same 30 s wait, the machine raises 0x3F, and the list of
+             exception names that re-arm the header is EMPTY — so only the
+             hook on the validation seed can explain it. This is the path a
+             RAM clear takes, and it cannot be tried on a real machine
+             without one.
+    "timer": the machine raises nothing, so only the wait can."""
+    if mode in _DEAF_CACHE:
+        return _DEAF_CACHE[mode]
+    machine = DeafAtFirstMachine(address=1)
+    port = MockSASSerialPort(machine)
+    httpd = _DeafHub(("127.0.0.1", 0), _HubHandler)
+    httpd.setup_state(machine, mode)
+    patches = {"event": {"TICKET_HEADER_RETRY_SEC": (30.0,),
+                         "TICKET_HEADER_SETTLE_SEC": 0.2,
+                         "MACHINE_INFO_SETTLE_SEC": 0.15},
+               "seed": {"TICKET_HEADER_RETRY_SEC": (30.0,),
+                        "TICKET_HEADER_SETTLE_SEC": 0.2,
+                        "TICKET_HEADER_LOST_EVENTS": ()},
+               "timer": {"TICKET_HEADER_RETRY_SEC": (0.3, 0.3)}}[mode]
+    reports = _drive_main(httpd, port, f"pytest-deaf-{mode}", patches,
+                          backstop_sec=20.0)
+    _DEAF_CACHE[mode] = dict(machine=machine, hub=httpd, reports=reports,
+                             samples=dict(httpd.samples))
+    return _DEAF_CACHE[mode]
+
+
+class TestDeafAtFirstMachineEndToEnd:
+    def _check_common(self, run):
+        assert run["hub"].phase == "done"
+        assert "applied_after" in run["samples"], run["samples"]
+        # the header went on, as one 0x7C + one 0x7D, once
+        assert [cmd for cmd, _ in run["machine"].ticket_frames] == [
+            CMD_SET_EXTENDED_TICKET_DATA, CMD_SET_TICKET_DATA]
+        assert b"FUNCINO" in run["machine"].ticket_frames[0][1]
+        assert "applied" in run["samples"]["final_td"]["detail"]
+        # ...and the machine never left the link to make that happen
+        online = [rep.get("online") for _, rep, _ in run["reports"]]
+        first_on = online.index(True)
+        assert all(online[first_on:]), online
+
+    def test_the_machines_own_event_brings_the_header(self):
+        run = _run_deaf_machine("event")
+        self._check_common(run)
+        # one deaf attempt (7C then the 7D fallback) before the event, and
+        # with a 30 s wait nothing but the 0x3C can have caused the next
+        assert run["samples"]["deaf_before"] == 2
+        assert run["machine"].deaf_frames == [
+            CMD_SET_EXTENDED_TICKET_DATA, CMD_SET_TICKET_DATA]
+        assert run["samples"]["applied_after"] < 5.0
+
+    def test_the_validation_seed_after_a_ram_clear_brings_the_header(self):
+        run = _run_deaf_machine("seed")
+        self._check_common(run)
+        assert run["machine"].seeds == 1              # 0x3F -> our 0x4C
+        assert run["samples"]["deaf_before"] == 2
+        assert run["machine"].deaf_frames == [
+            CMD_SET_EXTENDED_TICKET_DATA, CMD_SET_TICKET_DATA]
+        assert run["samples"]["applied_after"] < 5.0
+
+    def test_with_no_event_at_all_the_wait_brings_it(self):
+        run = _run_deaf_machine("timer")
+        self._check_common(run)
+        assert run["machine"].raise_next is None      # nothing was raised
+        assert len(run["machine"].deaf_frames) >= 2
+        assert run["samples"]["applied_after"] < 5.0
+
+    def test_the_verdict_no_longer_promises_a_rejoin(self):
+        run = _run_deaf_machine("timer")
+        deaf = [rep["ticketData"]["detail"] for ph, rep, _ in run["reports"]
+                if "silence on both" in rep["ticketData"]["detail"]]
+        assert deaf
+        assert all("keeps trying" in d and "rejoin" not in d for d in deaf)

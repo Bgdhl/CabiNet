@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.3.7
+- **The ticket header reaches a machine that was not ready for it.** The
+  SAS box sent the header once each time a machine came onto the link. A
+  WMS Bluebird 2 fresh from a RAM clear answered neither ticket-data poll
+  two seconds after it came up, then stayed on the link, so that one
+  attempt was the only one: the hub showed "ticket header pending" and a
+  ticket was printed in that state. Only restarting the SAS box sent it.
+  Now a header the machine did not take is tried again after 5, 10, 20
+  and 40 seconds and then once a minute for as long as it is missing. It
+  is also sent two seconds after the machine says its setup changed: it
+  reset its meters, it has no validation ID, its validation ID was just
+  set, or an operator changed its options. Those re-send a header that
+  was already on the machine too, because SAS lets a machine go back to
+  its own ticket text when its validation setup is cancelled. A machine
+  that never takes a header gets one log line, not one a minute. Found in
+  the Bluebird's own log and reproduced against a test machine that
+  ignores the header at first; not yet repeated on a real RAM clear.
+
 ## v0.3.6
 - **AFT registration on a machine that follows the SAS acknowledgement
   rule to the letter.** Registering a machine takes three polls with the
