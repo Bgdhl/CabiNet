@@ -382,8 +382,8 @@ def parse_ticket_data_reply(value):
 def note_ticket_capture(addr, result, recent_events) -> None:
     """Log one 0x3D/0x3E capture, whatever it found.
 
-    A record the machine marks as a handpay, a restricted ticket or a
-    ticket-in is NOT a ticket (SAS 6.02 Table 15.13c) and was not stored.
+    A record the machine marks as a handpay or as a ticket that was
+    redeemed is NOT a ticket (SAS 6.02 Table 15.13c) and was not stored.
     It gets its own words here and a line on the hub's event tape, so
     nobody goes looking for a ticket that was never one."""
     if result.outcome is TicketCaptureOutcome.NOT_A_TICKET:

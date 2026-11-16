@@ -13,12 +13,17 @@ First batch from an audit of the SAS code against the SAS 6.02 document.
   also looks at the record first without taking it, and stores that copy
   if the real read still fails. The handpay record is read the same way.
 - **A handpay is no longer stored as a ticket.** A machine keeps handpays,
-  handpay receipts, restricted tickets and redeemed tickets in the same
-  list as the tickets it prints, and says which is which. That was
-  ignored: every record became a redeemable ticket on the hub, so a
-  handpay receipt could have been paid a second time. Only cash tickets
-  are stored now. Anything else is logged and shown on the machine's event
-  list as "validation record, not a ticket".
+  handpay receipts and records of redeemed tickets in the same list as
+  the tickets it prints, and says which is which. That was ignored: every
+  record became a redeemable ticket on the hub, so a handpay receipt could
+  have been paid a second time. Only tickets are stored now. Anything else
+  is logged and shown on the machine's event list as "validation record,
+  not a ticket". Seen on a Bluebird 2: a handpay receipt printed with the
+  attendant key was read as "jackpot handpay, receipt printed" and left
+  off the hub.
+- A restricted ("playable only") ticket is still stored and redeems like
+  any other. The SAS box now keeps its type with the record; the hub does
+  not flag it at the cash desk yet.
 - **The same command is never sent a fourth time in a row.** The document
   defines three; a strict machine stops answering after that.
 - Tests for these run against a new pretend machine that keeps the

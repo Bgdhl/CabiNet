@@ -98,8 +98,8 @@ __all__ = [
     "RedemptionOutcome", "TicketRedemptionResult", "redeem_inserted_ticket",
     "ValidationIdOutcome", "ValidationIdResult", "configure_validation_id",
     "read_validation_record", "SASTITOHost",
-    "VALIDATION_TYPES", "CASHABLE_TICKET_TYPES", "VALIDATION_LOOK_AHEAD",
-    "validation_kind",
+    "VALIDATION_TYPES", "CASH_TICKET_TYPES", "PLAYABLE_ONLY_TICKET_TYPES",
+    "VALIDATION_LOOK_AHEAD", "validation_kind",
     "SYSTEM_VALIDATION_REQUEST_EXCEPTION", "CASHOUT_BUTTON_EXCEPTION",
     "VALIDATION_APPROVE", "VALIDATION_REJECT", "DEFAULT_PAYLOAD_STYLE",
     "build_validation_payload", "SystemValidationOutcome",
@@ -522,23 +522,38 @@ VALIDATION_TYPES = {
     0x81: "restricted promotional ticket redeemed",
     0x82: "nonrestricted promotional ticket redeemed",
 }
-CASHABLE_TICKET_TYPES = frozenset({0x00, 0x02})
+CASH_TICKET_TYPES = frozenset({0x00, 0x02, 0x04})
+PLAYABLE_ONLY_TICKET_TYPES = frozenset({0x01, 0x03})
 
 
 def validation_kind(validation_type: int):
-    """('cash' | 'other' | 'unknown', label) for a Table 15.13c type code.
+    """('cash' | 'playable' | 'other' | 'unknown', label) for a Table
+    15.13c type code. The question it answers is "is this a ticket in a
+    player's hand?"
 
-    Only 'cash' is a ticket the hub may pay. 'other' is a real record that
-    is NOT one: a handpay ("the receipt is not the cash out, the handpay is
-    the cash out", §15), a restricted or debit ticket (the hub has no such
-    money), or a ticket-in record. 'unknown' is a code the table does not
-    have; that is kept as a ticket, as every record was before 2026-11-16,
-    because turning away a real ticket strands a player's money."""
+    'cash'      a ticket worth cash (a debit ticket is the player's own
+                money, so it counts).
+    'playable'  a restricted, promotional ticket: "PLAYABLE ONLY". It IS a
+                ticket and goes back into a machine like any other, so it is
+                stored. What a system does differently is flag it at the
+                cash desk (AJ, 2026-11-16, on the SMIB system he ran before:
+                "they act the same in reality but in the cash desk part ...
+                they would be flagged as playable only"). The hub cannot
+                flag it yet; the type is kept with the stored record so it
+                can.
+    'other'     a real record that is NOT a ticket: a handpay ("the receipt
+                is not the cash out, the handpay is the cash out", §15), or
+                the record of a ticket that was redeemed. Never stored.
+    'unknown'   a code the table does not have. Kept as a ticket, as every
+                record was before 2026-11-16, because turning away a real
+                ticket strands a player's money."""
     label = VALIDATION_TYPES.get(validation_type)
     if label is None:
         return "unknown", f"type {validation_type:02X}, not in Table 15.13c"
-    if validation_type in CASHABLE_TICKET_TYPES:
+    if validation_type in CASH_TICKET_TYPES:
         return "cash", label
+    if validation_type in PLAYABLE_ONLY_TICKET_TYPES:
+        return "playable", label
     return "other", label
 
 
@@ -638,10 +653,10 @@ def capture_printed_ticket(transport, address: int, store: TicketStore,
     that followed acknowledged it, and the hub then refused the paper at
     every machine as an unknown number.
 
-    A record is stored as a ticket only when its type says it is a cash
-    ticket (validation_kind). A handpay raises the same exceptions and sits
-    in the same buffer; stored as a ticket, its receipt would have been
-    paid a second time.
+    A record is stored as a ticket only when its type says it is one
+    (validation_kind). A handpay raises the same exceptions and sits in the
+    same buffer; stored as a ticket, its receipt would have been paid a
+    second time.
 
     The winning record is persisted via TicketStore.record_issued, which is
     idempotent — a duplicate capture (retried exception, re-read) returns
@@ -721,29 +736,34 @@ def capture_printed_ticket(transport, address: int, store: TicketStore,
 
 
 def _persist_4d(store, rec, address, note="") -> TicketCaptureResult:
-    """Store a 0x4D record — if its type says it is a cash ticket."""
+    """Store a 0x4D record — if its type says it is a ticket."""
     kind, label = validation_kind(rec.validation_type)
     if kind == "other":
         return TicketCaptureResult(
             TicketCaptureOutcome.NOT_A_TICKET,
             _canonical_vn(rec.validation_number), rec.amount_cents, "4D",
-            None, f"{label} — not a cash ticket, not stored{note}",
+            None, f"{label} — not a ticket, not stored{note}",
             validation_type=rec.validation_type)
-    if kind == "unknown":
+    if kind == "playable":
+        note = (f" · {label} (playable only): stored as an ordinary ticket, "
+                f"the hub cannot flag it yet{note}")
+    elif kind == "unknown":
         note = f" · {label}; stored as a cash ticket{note}"
     out = _persist(store, rec.validation_number, rec.amount_cents, address,
                    "4D", ticket_number=rec.ticket_number_le,
-                   issued_at=rec.when.isoformat() if rec.when else None)
+                   issued_at=rec.when.isoformat() if rec.when else None,
+                   extra={"validationType": rec.validation_type})
     return replace(out, detail=out.detail + note,
                    validation_type=rec.validation_type)
 
 
 def _persist(store, vn, amount_cents, address, via,
-             ticket_number=None, issued_at=None) -> TicketCaptureResult:
+             ticket_number=None, issued_at=None,
+             extra=None) -> TicketCaptureResult:
     vn = _canonical_vn(vn)
     out = store.record_issued(vn, amount_cents, address,
                               ticket_number=ticket_number, source=f"egm_{via}",
-                              issued_at=issued_at)
+                              issued_at=issued_at, extra=extra)
     if out["duplicate"]:
         return TicketCaptureResult(
             TicketCaptureOutcome.DUPLICATE, vn, amount_cents, via,

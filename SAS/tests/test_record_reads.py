@@ -9,10 +9,10 @@ a different one, which is the ACK, so the only copy of a printed ticket was
 thrown away by the machine and the hub refused the paper as an unknown
 number.
 
-Item 3. The validation buffer also holds handpays, receipts, restricted
-tickets and ticket-in records, and the machine raises the same exceptions
-for them (§15, Table 15.13c). Every one of them was stored as a redeemable
-cash ticket.
+Item 3. The validation buffer also holds handpays, handpay receipts and
+ticket-in records, and the machine raises the same exceptions for them
+(§15, Table 15.13c). Every one of them was stored as a redeemable ticket.
+A restricted ("playable only") ticket IS a ticket and is still stored.
 
 These run against tests/by_the_book.py, a pretend machine that keeps the
 document's rules, through the same ImpliedAckTransport the satellite uses.
@@ -34,8 +34,9 @@ from core.sas_implied_ack import (
 from core.sas_poller import SASPoller
 from core.sas_ticket_store import ISSUED, TicketStore
 from core.sas_tito_host import (
-    CASHABLE_TICKET_TYPES, VALIDATION_TYPES, SASTITOHost,
-    TicketCaptureOutcome, capture_printed_ticket, validation_kind)
+    CASH_TICKET_TYPES, PLAYABLE_ONLY_TICKET_TYPES, VALIDATION_TYPES,
+    SASTITOHost, TicketCaptureOutcome, capture_printed_ticket,
+    validation_kind)
 from transport.serial.sas_serial import MockSASSerialPort
 
 NO_SLEEP = lambda _t: None
@@ -321,27 +322,50 @@ class TestTicketRecordSurvivesADamagedAnswer:
 # Item 3 — what the record IS
 # ---------------------------------------------------------------------------
 
-NOT_TICKETS = sorted(set(VALIDATION_TYPES) - CASHABLE_TICKET_TYPES)
+TICKETS = CASH_TICKET_TYPES | PLAYABLE_ONLY_TICKET_TYPES
+NOT_TICKETS = sorted(set(VALIDATION_TYPES) - TICKETS)
 
 
-class TestOnlyACashTicketIsStored:
+class TestOnlyATicketIsStored:
     def test_the_table_is_table_15_13c(self):
         assert sorted(VALIDATION_TYPES) == [
             0x00, 0x01, 0x02, 0x03, 0x04, 0x10, 0x20, 0x40, 0x60,
             0x80, 0x81, 0x82]
-        assert CASHABLE_TICKET_TYPES == {0x00, 0x02}
-        assert validation_kind(0x00)[0] == validation_kind(0x02)[0] == "cash"
+        assert CASH_TICKET_TYPES == {0x00, 0x02, 0x04}
+        assert PLAYABLE_ONLY_TICKET_TYPES == {0x01, 0x03}
+        # what is left is exactly the handpays and the ticket-in records
+        assert NOT_TICKETS == [0x10, 0x20, 0x40, 0x60, 0x80, 0x81, 0x82]
+        assert {validation_kind(t)[0] for t in CASH_TICKET_TYPES} == {"cash"}
+        assert {validation_kind(t)[0]
+                for t in PLAYABLE_ONLY_TICKET_TYPES} == {"playable"}
         assert {validation_kind(t)[0] for t in NOT_TICKETS} == {"other"}
         assert validation_kind(0x7F)[0] == "unknown"
 
-    @pytest.mark.parametrize("vtype", sorted(CASHABLE_TICKET_TYPES))
+    @pytest.mark.parametrize("vtype", sorted(CASH_TICKET_TYPES))
     def test_a_cash_ticket_is_stored(self, tmp_path, vtype):
         machine, port = _printed(validation_type=vtype)
         store = _store(tmp_path)
         result = _capture(port, store)
         assert result.outcome is TicketCaptureOutcome.RECORDED and result.ok
         assert result.validation_type == vtype
+        assert result.detail == "ticket recorded via 4D"
         assert store.get(VN)["state"] == ISSUED
+        assert store.get(VN)["extra"] == {"validationType": vtype}
+
+    @pytest.mark.parametrize("vtype", sorted(PLAYABLE_ONLY_TICKET_TYPES))
+    def test_a_playable_only_ticket_is_still_a_ticket(self, tmp_path, vtype):
+        """It goes back into a machine like any other ticket, so refusing
+        it would strand what the player is holding. Its type is kept with
+        the stored record, for the day the hub's cash desk can flag it."""
+        machine, port = _printed(validation_type=vtype)
+        store = _store(tmp_path)
+        result = _capture(port, store)
+        assert result.outcome is TicketCaptureOutcome.RECORDED and result.ok
+        assert result.validation_type == vtype
+        assert "(playable only)" in result.detail
+        assert store.get(VN)["state"] == ISSUED
+        assert store.get(VN)["amountCents"] == AMOUNT
+        assert store.get(VN)["extra"] == {"validationType": vtype}
 
     @pytest.mark.parametrize("vtype", NOT_TICKETS)
     def test_anything_else_in_the_buffer_is_not(self, tmp_path, vtype):
