@@ -12,14 +12,6 @@
   button or a G2S status, because that switch does not control its
   tickets. Machines that ticket over G2S are unchanged, and a machine
   with only a SAS side now appears in the row too.
-- **The serial watchdog is back.** v0.3.4 removed it, on the belief that
-  it had never brought a SAS link back. Within the hour a link went dead a
-  second after credits were loaded to a machine, and stayed dead for nine
-  minutes until the satellite's SAS service was restarted. Reopening the
-  serial port is what that restart does, and it is what the watchdog does,
-  so it is restored: a link that dies while the machine is on is reopened
-  after 15 seconds of silence. Why the link dies there is not understood
-  yet. The v0.3.4 fix for a machine that has just started is unchanged.
 - **No scroll bars on the hub's touchscreen.** The kiosk drew a pale
   desktop scroll bar down the side of every page. It is gone on the hub's
   own kiosk; scrolling is still a swipe. Other browsers, small windows and

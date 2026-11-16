@@ -76,13 +76,6 @@ from modules.aft.aft_handler import (
 
 HEARTBEAT_SEC = 300          # journal proof-of-life cadence while silent
 OPEN_RETRY_SEC = 30          # serial-open retry (HAT/device not present yet)
-WEDGE_REOPEN_SEC = 15.0      # silence -> port reopen (fast phase): a link
-#                              that has gone dead with the machine ON comes
-#                              back within one cadence. See RxWedgeWatchdog.
-WEDGE_SLOW_AFTER = 20        # dry reopens (~5 min) before deciding "machine
-#                              is OFF, not wedged" and backing off the churn
-WEDGE_SLOW_SEC = 60.0        # slow-phase cadence — worst-case self-heal
-#                              after a long machine-off spell = one minute
 CHIRP_MIN_RUN = 3            # loop-break chirps in a row before we tell the
 #                              hub "the machine is not hearing this Pi"
 CHIRP_FRESH_SEC = 5.0        # ...and the last one must be this recent. A
@@ -924,99 +917,6 @@ class HubReporter:
         return REPORT_SEC
 
 
-class RxWedgeWatchdog:
-    """Reopen the serial port when the machine has been silent for a while.
-
-    TWO different failures look identical from here — /proc/tty/driver/ttyAMA
-    shows tx climbing and rx frozen — and this class cures only one of them.
-
-    1. A machine that has just STARTED. It ignores polls to its own address
-       until it sees a poll to another one (SAS 6.02 §3.3). Reopening the
-       port does nothing for that (150+ reopens on 2026-11-15 proved it);
-       SASPoller.poll_once fixes it by sending the address-0 poll for as
-       long as the machine is silent.
-
-    2. A link that goes dead while the machine is ON. Seen 2026-11-16, a
-       second after an AFT transfer completed: the machine began chirping
-       (it was no longer hearing us) and stayed dead for nine minutes with
-       the address-0 poll going out the whole time. `systemctl restart
-       cabinet-sas` brought it straight back. The restart's wire-level
-       effect is a close and reopen of the port, which is what this class
-       does. The cause is not understood.
-
-    This watchdog was removed for one evening (v0.3.4, 7584587) on the
-    theory that (1) was the only failure there was. (2) turned up within
-    the hour, with nothing left to catch it. It stays.
-
-    Cadence: reopen every reopen_sec while silent; after slow_after dry
-    reopens (machine genuinely OFF, not wedged) back off to slow_sec so a
-    dead line doesn't churn the device node forever. ANY valid answer
-    resets the dry counter and the fast phase. Logging is throttled: dry
-    reopens #1, #2, then every 10th — plus a recovery line when the link
-    comes back.
-
-    THREADING: tick() runs on the poll thread only (from the run() stop
-    callback, between poll_once calls — the same ownership rule as the
-    park loop), so the reopen never races a wire exchange. bump() marks
-    "silence is expected" (parked / just resumed) and is also poll-thread
-    only. Time is injected by the caller (monotonic seconds) — no clock
-    reads here, so tests drive it deterministically."""
-
-    def __init__(self, port, state,
-                 reopen_sec=WEDGE_REOPEN_SEC,
-                 slow_after=WEDGE_SLOW_AFTER,
-                 slow_sec=WEDGE_SLOW_SEC):
-        self.port = port                  # must expose .reopen()
-        self.state = state                # SASPoller MachineState (.answers)
-        self.reopen_sec = float(reopen_sec)
-        self.slow_after = int(slow_after)
-        self.slow_sec = float(slow_sec)
-        self.dry_reopens = 0              # consecutive reopens with no answer
-        self.reopens_total = 0
-        self._answers_seen = int(state.answers)
-        self._last_ok = None              # set on first tick()/bump()
-
-    def bump(self, now):
-        """Silence is expected right now (poll loop parked, or just
-        resumed) — restart the silence clock without touching the port."""
-        self._last_ok = now
-
-    def tick(self, now):
-        """Call between polls. Returns True if the port was reopened."""
-        if self._last_ok is None:
-            self._last_ok = now           # arm on first sight, never insta-fire
-            return False
-        answers = int(self.state.answers)
-        if answers != self._answers_seen:  # heard the machine since last tick
-            self._answers_seen = answers
-            if self.dry_reopens:
-                logger.info("🔧 RX watchdog: link recovered after {} port "
-                            "reopen(s)", self.dry_reopens)
-            self.dry_reopens = 0
-            self._last_ok = now
-            return False
-        cadence = (self.slow_sec if self.dry_reopens >= self.slow_after
-                   else self.reopen_sec)
-        if now - self._last_ok < cadence:
-            return False
-        self._last_ok = now
-        self.dry_reopens += 1
-        self.reopens_total += 1
-        loud = self.dry_reopens <= 2 or self.dry_reopens % 10 == 0
-        try:
-            self.port.reopen()
-            if loud:
-                logger.info("🔧 RX-silence watchdog: no valid frames for "
-                            "{:.0f}s — serial port reopened (dry reopen #{}: "
-                            "wedge-heal, or the machine is just off)",
-                            cadence, self.dry_reopens)
-        except Exception as e:            # noqa: BLE001 — device may be gone
-            logger.warning("🔧 RX watchdog: port reopen FAILED ({}: {}) — "
-                           "retrying in {:.0f}s", type(e).__name__, e,
-                           cadence)
-        return True
-
-
 def open_port(path, mock, address, protocol):
     """Open the transport, retrying forever on failure. A backup channel
     whose HAT isn't installed yet must wait, not crash-loop the unit."""
@@ -1442,11 +1342,6 @@ def main():
                        on_typed_event=on_typed_event, on_meter=on_meter,
                        on_handpay_reset=on_handpay_reset,
                        on_handpay_info=on_handpay_info)
-
-    # Silence watchdog — only for a real port that can reopen; the mock
-    # transport has no .reopen(). None => no-op.
-    wedge_watch = (RxWedgeWatchdog(port, poller.state)
-                   if not args.mock and hasattr(port, "reopen") else None)
 
 
     def on_system_validation(addr, result):
@@ -2770,16 +2665,6 @@ def main():
         # out a second later by missing five polls.
         if parked:
             poller.state.synced = False
-        # Silence watchdog. Runs on the poll thread, between polls — never
-        # races a wire exchange. A parked stretch is intentional silence:
-        # bump() so the reopen clock restarts from resume, not from the
-        # machine's last answer. Otherwise tick(): polling with no valid
-        # frame for the cadence -> reopen the port.
-        if wedge_watch is not None:
-            if parked:
-                wedge_watch.bump(now)
-            else:
-                wedge_watch.tick(now)
         # Machine-initiated host-cashout (0x6A) answered here, between polls
         # (poll thread, same window as the AFT cache — never races a wire
         # exchange). No-op unless a 0x6A was flagged while armed. Gated ONLINE
