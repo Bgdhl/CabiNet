@@ -13,6 +13,11 @@
   the box makes the next redemption use it up. Both controls work for
   tickets printed over SAS and over G2S, and with the machine that
   printed them switched off.
+- **SAS comes back by itself after a machine restart.** After a slot
+  machine was switched off and on, its SAS link could stay dead until the
+  satellite's SAS service was restarted by hand. The satellite's automatic
+  recovery reopened the serial port without pausing, which never worked;
+  it now stops polling for a few seconds first, the way a restart does.
 - **On-screen keyboard for a hub with no keyboard.** On the hub's
   touchscreen, tapping any text box now brings up a keyboard along the
   bottom of the screen (a number pad for number boxes). It works on the
