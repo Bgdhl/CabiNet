@@ -22642,6 +22642,11 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                         # blanks the page render, the route always serves.
                         "boardEnabled": engine.hub_store.host_setting(
                             "board_enabled", "1") == "1",
+                        # Debug tab on the hub page: ships OFF (it is the
+                        # host log and protocol tools — useful to the few
+                        # who want it, noise to everyone else).
+                        "debugTab": engine.hub_store.host_setting(
+                            "ui_debug_tab", "0") == "1",
                         # Lock-message brand (2026-08-17): ON = a locked
                         # machine's own screen names the GAMEROOM ("Locked
                         # by THE GOLDEN PALACE"), OFF = the neutral "the
@@ -25193,6 +25198,7 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                                                    leg (task #20) — the SAS
                                                    key, null/"" unlinks
           {"sysvalFallback": bool}                 host option
+          {"debugTab": bool}                       show the page's Debug tab
           {"ticketPropName"/"ticketLine1"/"ticketLine2"/"ticketTitleCash":
            str}  ticket-header fields (C3) — strict strings, stripped,
                  64-char bound, "" clears the tenant. ANY accepted ticket
@@ -25426,6 +25432,16 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                 engine.hub_store.set_host_setting(
                     "board_enabled", "1" if be else "0")
                 out["boardEnabled"] = be
+            if "debugTab" in req:
+                # Settings ▸ Debug tab. Strict boolean; stored "1"/"0"; every
+                # open hub page reads it off hostOptions on its next poll
+                # and shows or hides the tab — no restart, no push.
+                dt = req.get("debugTab")
+                if not isinstance(dt, bool):
+                    raise ValueError("debugTab must be a boolean")
+                engine.hub_store.set_host_setting(
+                    "ui_debug_tab", "1" if dt else "0")
+                out["debugTab"] = dt
             if "lockBrandGameroom" in req:
                 # Settings ▸ Gameroom: what a locked machine's screen says.
                 # Strict boolean, stored "1"/"0"; lock_sayer() reads it live
@@ -25636,6 +25652,7 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                                  "machineKey + sasCashoutReady, "
                                  "companionId + g2sEgmId (assign a Companion), "
                                  "sysvalFallback, houseAllowNegative, "
+                                 "debugTab, "
                                  "houseBankrollMc, gameroomName, "
                                  "tournamentNames and/or the "
                                  "ticket-header fields (ticketPropName/"

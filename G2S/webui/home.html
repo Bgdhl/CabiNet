@@ -96,7 +96,9 @@
   #tabs-top .tab.on{color:var(--gold-hi);border-color:var(--gold-deep);
     background:linear-gradient(180deg,#2b2013,#241a0f)}
   #tabbar{position:fixed;left:0;right:0;bottom:0;z-index:40;display:none;
-    grid-template-columns:repeat(7,1fr);height:62px;
+    /* equal columns for the tabs that are SHOWN: a fixed 7 left a gap at the
+       right whenever one was hidden (a normal login, or Debug switched off) */
+    grid-auto-flow:column;grid-auto-columns:1fr;height:62px;
     background:linear-gradient(180deg,#1c130d,#150e09);
     border-top:1px solid var(--line)}
   #tabbar .tab{appearance:none;border:0;background:none;cursor:pointer;
@@ -1364,6 +1366,7 @@ async function tickStatus(){
       if(j&&j.loginRequired===true){goLogin(); return;}
       S.status=j;
       S.statusErr=false;
+      tabsApply();            // the Debug tab follows hostOptions.debugTab
       uiStampCheck(j.uiStamp);
       sasResultCheck(j);
       keyOffCheck(j);
@@ -4874,6 +4877,15 @@ async function ticketSave(){
   const ok=await settingsPost(body,"Ticket header");
   if(ok) tickStatus();
 }
+async function debugTabToggle(btn){
+  /* Debug tab shown/hidden — a display switch, no arm. Every open hub page
+     follows on its next poll; this one reconciles straight away. */
+  const cur=debugTabOn();
+  const ok=await settingsPost({debugTab:!cur},
+    !cur?"Debug tab shown":"Debug tab hidden");
+  flash(btn,ok);
+  if(ok) tickStatus();
+}
 async function boardToggle(btn){
   /* Gameroom board on/off — reversible display toggle, no arm. The board
      page reads hostOptions.boardEnabled every poll and blanks itself. */
@@ -5101,6 +5113,22 @@ function renderSettings(){
        otherwise) — plus the focus hold above. */
     const tk=(ho.ticket&&typeof ho.ticket==="object")?ho.ticket:null;
     const tv=k=>(tk&&tk[k]!=null)?String(tk[k]):"";
+    /* Debug tab — feature-detected like the rest (an older hub has no
+       hostOptions.debugTab and keeps showing the tab). */
+    const dbgOn=!!ho.debugTab;
+    const debugHtml=ho.debugTab===undefined?"":`
+      <div class="hblk">
+        ${htLine("debugtab","🛠️ Debug tab")}
+        ${HINTS.debugtab?`<p class="none">The live host log, raw machine state and
+          protocol tools. Hidden unless you turn it on: day to day nobody needs
+          it. Switching it on shows it to admin logins, in every browser and on
+          the hub's own screen.</p>`:""}
+        <div class="btnrow" style="margin-top:8px">
+          <button class="btn slim ${dbgOn?"":"gold"}" onclick="debugTabToggle(this)">
+            <span class="bl">${dbgOn?"Hide the Debug tab":"Show the Debug tab"}</span>
+            <span class="ba">${dbgOn?"showing":"hidden"}</span></button>
+        </div>
+      </div>`;
     const tkHtml=!tk?"":`
       <div class="hblk">
         ${htLine("ticket","🎫 Ticket header")}
@@ -5145,7 +5173,8 @@ function renderSettings(){
             <span class="bl">${on?"Turn off":"Turn on"}</span></button>
         </div>
       </div>
-      ${tkHtml}</div>`);
+      ${tkHtml}
+      ${debugHtml}</div>`);
   }
   /* Machines — every machine the hub knows, G2S + SAS; the SAS rows carry
      the on/off switch (this is where a hidden machine gets re-enabled).
@@ -6282,6 +6311,30 @@ document.addEventListener("keydown",e=>{
 const AUTH={known:false, required:false, signedIn:false, user:null,
             role:"admin", idleMin:30, logins:null, me:null};
 const ADMIN_TABS=["settings","debug"];
+/* The Debug tab is the host log and protocol tools: useful to the few who
+   want it, noise to everyone else. It ships hidden; Settings ▸ Debug tab
+   shows it (a hub-wide switch — hostOptions.debugTab — so it holds on the
+   kiosk too, whose browser forgets everything between starts). */
+function debugTabOn(){
+  const ho=(S.status||{}).hostOptions;
+  if(!ho) return false;                  // the hub has not answered yet
+  /* an older hub has no switch: the tab shows, as it always did */
+  return ho.debugTab===undefined || ho.debugTab===true;
+}
+function tabShown(id){
+  if(!ADMIN_TABS.includes(id)) return true;
+  if(!isAdmin()) return false;
+  return id!=="debug" || debugTabOn();
+}
+function tabsApply(){
+  for(const el of document.querySelectorAll("#tabs-top .tab,#tabbar .tab"))
+    el.style.display=tabShown(el.dataset.tab)?"":"none";
+  /* Standing on a tab that is no longer shown: back to the Floor. Not until
+     the hub has answered both questions, though (who is signed in, and is
+     Debug switched on) — before that the tab only LOOKS hidden, and a
+     reload on #debug or #settings must land where it was. */
+  if(!tabShown(S.tab) && AUTH.known && S.status) goTab("floor");
+}
 function isAdmin(){return AUTH.role==="admin";}
 async function authTick(){
   try{
@@ -6302,10 +6355,7 @@ function authApply(){
     w.style.display="";
     w.textContent="👤 "+AUTH.user+(isAdmin()?"":" · normal");
   }else w.style.display="none";
-  for(const el of document.querySelectorAll("#tabs-top .tab,#tabbar .tab"))
-    if(ADMIN_TABS.includes(el.dataset.tab))
-      el.style.display=isAdmin()?"":"none";
-  if(!isAdmin()&&ADMIN_TABS.includes(S.tab)) goTab("floor");
+  tabsApply();
   $("card-login").style.display=(AUTH.known&&isAdmin())?"":"none";
   if(AUTH.known&&isAdmin()&&AUTH.logins===null) loginsFetch();
   renderLogin();

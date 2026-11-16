@@ -15,6 +15,13 @@
     ticketing follows the link. Before, such a machine (a Bluebird 2, for
     one) could say "ticketing off" while it printed and redeemed tickets
     normally, because only its G2S ticket device was looked at.
+- **The Debug tab is hidden unless you turn it on.** It is the live host
+  log and the protocol tools, which most people never need. It now ships
+  hidden, and **Settings → Host options → Debug tab** shows it again. The
+  switch is kept on the hub, so it applies in every browser and on the
+  hub's own screen, and only admin logins see the tab. After this update
+  the tab is hidden on every hub until someone switches it on. The tab
+  bar also fills its width now when a tab is hidden.
 - **No scroll bars on the hub's touchscreen.** The kiosk drew a pale
   desktop scroll bar down the side of every page. It is gone on the hub's
   own kiosk; scrolling is still a swipe. Other browsers, small windows and
