@@ -85,6 +85,8 @@ G2S_GATES = (
     "test_web_auth.py",
     "test_update_verify.py",
     "test_emoji_font.py",
+    "test_support_bundle.py",
+    "test_dhcp_start_help.py",
 )
 
 # Satellites get the whole SAS tree minus data/caches. It is a SET, not a file:
