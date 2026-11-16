@@ -186,14 +186,24 @@ class SASPoller:
         - POLL-CYCLE SYNC (spec §3.3): after startup or a 5 s comms gap, the
           machine ignores polls to its own address until it sees a poll to a
           DIFFERENT address. We send an address-0 poll (0x80, nobody answers)
-          before the first real poll and after any offline period.
+          before the first real poll and before EVERY poll for as long as
+          the machine is not answering.
+          It has to be every poll, not one: the machine needs to see it
+          AFTER it has come back, and we cannot know when that is. Until
+          2026-11-15 this sent exactly one, the moment the machine went
+          offline — i.e. to a machine that was switched off — and then
+          polled its own address forever. A machine that then finished
+          booting never answered again until the service was restarted
+          (which sends a fresh one). BENCH-PROVEN on a BB2 that day: 25
+          polls to address 1 alone, no answer; ONE poll to address 0, and
+          address 1 answered the very next poll.
         - IMPLIED ACK (spec §3.1-3.2): a general-poll response is acknowledged
           ONLY by a long poll to the same machine OR a poll to a different
           address. Repeating the same general poll is an implied NACK that
           tells the machine to RE-SEND the same exception. So between drained
           exceptions we issue an address-0 poll to ACK, not a bare re-poll.
         """
-        if not self.state.synced:
+        if not self.state.synced or not self.state.online:
             self._ack_poll()                 # sync to the polling cycle
             self.state.synced = True
 

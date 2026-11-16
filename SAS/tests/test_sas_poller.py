@@ -30,11 +30,14 @@ class ScriptedMachine:
         self.require_sync = require_sync   # ignore self-polls until synced
         self.synced = not require_sync
         self.general_polls = 0   # total general polls to THIS address
+        self.powered = True      # False = switched off: answers nothing
 
     def queue(self, *codes):
         self.fifo.extend(codes)
 
     def __call__(self, frame, wakeup):
+        if not self.powered:
+            return b""           # off: hears nothing, says nothing
         if not wakeup[0]:
             return b""           # not addressed with wake-up bit
         is_general = len(frame) == 1
@@ -188,6 +191,47 @@ class TestSASPoller:
         assert 0x12 in events
         # and an address-0 (0x80) general poll was actually sent
         assert any(f == b"\x80" for f, _ in port.sent_frames)
+
+    def test_machine_that_restarts_is_resynced_without_a_host_restart(self):
+        """2026-11-15, BB2 + Zero 2 W: after the machine was switched off and
+        on, its SAS link stayed dead until `systemctl restart cabinet-sas`.
+        The poller sent its one re-sync poll the moment the machine went
+        offline — to a machine that was off — and then polled address 1
+        alone forever, which a machine that has just booted ignores (§3.3).
+        Proven on the wire that day: 25 polls to address 1, no answer; one
+        poll to address 0, and address 1 answered the next poll."""
+        machine = ScriptedMachine(address=1, require_sync=True)
+        port = MockSASSerialPort(machine)
+        poller = SASPoller(port, address=1)
+        poller.poll_once()
+        assert poller.state.online is True
+        machine.powered = False                 # switched off...
+        for _ in range(60):                     # ...for a good while
+            poller.poll_once()
+        assert poller.state.online is False
+        machine.powered, machine.synced = True, False   # finished booting
+        poller.poll_once()
+        assert poller.state.online is True      # no host restart needed
+
+    def test_sync_poll_goes_out_with_every_poll_while_machine_is_silent(self):
+        """The machine needs the address-0 poll AFTER it comes back, and the
+        host cannot know when that is — so every poll to a silent machine is
+        led by one. A healthy link pays nothing for it."""
+        machine = ScriptedMachine(address=1, require_sync=True)
+        machine.powered = False
+        port = MockSASSerialPort(machine)
+        poller = SASPoller(port, address=1)
+        syncs = lambda: sum(1 for f, _ in port.sent_frames if f == b"\x80")
+        for _ in range(10):
+            poller.poll_once()
+        assert syncs() == 10
+        machine.powered = True
+        poller.poll_once()                      # synced and answered
+        assert poller.state.online is True
+        before = syncs()
+        for _ in range(10):
+            poller.poll_once()
+        assert syncs() == before                # none while it is answering
 
     def test_callback_exception_does_not_kill_loop(self):
         machine = ScriptedMachine(address=1)

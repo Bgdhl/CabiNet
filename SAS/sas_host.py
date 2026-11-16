@@ -920,6 +920,16 @@ class HubReporter:
 class RxWedgeWatchdog:
     """Self-heal the machine-reboot serial wedge (live-diagnosed 2026-07-10).
 
+    CORRECTION, 2026-11-15: on the Zero 2 W + BB2 rig this reading was wrong.
+    The receive side was never deaf — the machine's address chirps arrived
+    the moment the host went quiet — and reopening the port never brought
+    the link back (150+ tries). The machine was ignoring polls to its own
+    address because the poller had spent its one re-sync poll while the
+    machine was still off; a service restart "cured" it only by sending a
+    fresh one. The fix is in SASPoller.poll_once (core/sas_poller.py). This
+    watchdog is kept as a cheap backstop for a port that really is stuck;
+    do not expect it to rescue a silent machine.
+
     A BB2 power-cycle deafens the Zero's PL011 RX while TX keeps flowing:
     the machine answers every poll unheard, the tile goes offline, and the
     cabinet LEDs gaslight everyone (fingerprint: /proc/tty/driver/ttyAMA tx

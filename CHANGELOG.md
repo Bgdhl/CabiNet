@@ -15,9 +15,22 @@
   printed them switched off.
 - **SAS comes back by itself after a machine restart.** After a slot
   machine was switched off and on, its SAS link could stay dead until the
-  satellite's SAS service was restarted by hand. The satellite's automatic
-  recovery reopened the serial port without pausing, which never worked;
-  it now stops polling for six seconds first.
+  satellite's SAS service was restarted by hand, so the machine showed
+  offline with no validation ID or AFT registration. A machine that has
+  just started ignores the satellite until it sees one poll addressed to
+  a different machine. The satellite sent that poll once, at the moment
+  the machine went off, and never again. It now sends it with every poll
+  for as long as the machine is silent, so the machine is picked up within
+  a second of being ready.
+- **Restarting a machine during an update no longer undoes the update.**
+  The updater used to roll everything back, database included, if a
+  machine that had been on was not on again three and a half minutes
+  later, even though the hub and the Pi were both fine. It now checks the
+  hub and the Pis themselves, looks at the floor again just before it
+  restarts anything, and names a machine that is off or restarting in a
+  warning instead. It still rolls back when something is really broken: a
+  Pi whose service stops reporting, a SAS machine that never answers the
+  new code, or a G2S machine that talks to the hub but cannot rejoin.
 - **On-screen keyboard for a hub with no keyboard.** On the hub's
   touchscreen, tapping any text box now brings up a keyboard along the
   bottom of the screen (a number pad for number boxes). It works on the
