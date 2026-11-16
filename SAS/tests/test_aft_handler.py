@@ -421,6 +421,43 @@ class TestRegistration:
                                        sleep=NO_SLEEP)
         assert not ok and reg is None and "silence" in detail
 
+    @pytest.mark.parametrize("answer, says", [
+        (b"", "silence on register (73/01)"),
+        (b"\x81", "register (73/01) refused: the machine answered NACK "
+                  "(0x81)"),
+        (b"\x01\x00", "register (73/01) not taken: the machine answered "
+                      "busy"),
+    ])
+    def test_an_unanswered_register_says_what_came_back(self, answer, says):
+        machine = AFTMachine(registered=False)
+
+        def no_register(frame, wakeup):
+            if len(frame) > 3 and frame[1] == AFT_CMD_REGISTER \
+                    and frame[3] == REG_CODE_REGISTER:
+                return answer
+            return machine(frame, wakeup)
+
+        ok, reg, detail = aft_register(MockSASSerialPort(no_register), 1,
+                                       ASSET, KEY, POS, sleep=NO_SLEEP)
+        assert not ok and reg is None and detail == says
+
+    def test_a_damaged_answer_is_named_without_showing_the_key(self):
+        machine = AFTMachine(registered=False)
+
+        def damaged(frame, wakeup):
+            good = machine(frame, wakeup)
+            if len(frame) > 3 and frame[1] == AFT_CMD_REGISTER \
+                    and frame[3] == REG_CODE_REGISTER:
+                return good[:-1] + bytes([good[-1] ^ 0xFF])
+            return good
+
+        ok, reg, detail = aft_register(MockSASSerialPort(damaged), 1,
+                                       ASSET, KEY, POS, sleep=NO_SLEEP)
+        assert not ok and reg is None
+        assert detail == ("register (73/01) answered with 34 bytes that do "
+                          "not check out (starts 01731d)")
+        assert KEY.hex() not in detail and KEY.hex()[:12] not in detail
+
 
 class TestTransferSequence:
     def test_happy_immediate(self):

@@ -676,6 +676,15 @@ def http_layer():
         with open(os.path.join(webui, name), encoding="utf-8") as f:
             check(f"keyboard: {name} loads the on-screen keyboard",
                   '<script src="/webui/osk.js"></script>' in f.read())
+    # A sign-in page that is already open has to find out when the lock is
+    # turned off somewhere else. It asked once, on load, so the hub's own
+    # screen — which nobody can reload — sat on the form (2026-11-16).
+    with open(os.path.join(webui, "login.html"), encoding="utf-8") as f:
+        login_src = f.read()
+    check("lock off: an open sign-in page keeps asking if it is still needed",
+          "setInterval(checkState,STATE_EVERY_MS)" in login_src
+          and "s.required===false||s.signedIn" in login_src
+          and "location.replace(NEXT)" in login_src)
     # An open kiosk page reloads when the hub's uiStamp changes. The stamp
     # must move when osk.js changes too, not only home.html — the keyboard
     # and the kiosk's look live in osk.js.

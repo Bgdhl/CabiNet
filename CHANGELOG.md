@@ -1,5 +1,48 @@
 # Changelog
 
+## v0.3.6
+- **AFT registration on a machine that follows the SAS acknowledgement
+  rule to the letter.** Registering a machine takes three polls with the
+  same command: read, initialize, register. SAS has no "got it" message; a
+  machine knows its answer arrived when the next poll is a different one,
+  and it may ignore a command sent three times in a row. CabiNet sent the
+  three back to back. A WMS Bluebird 2 answers anyway. A tester's
+  Ainsworth A560 answered the first two and never the third, so
+  registration failed every time with "silence on register (73/01)" while
+  everything else on the machine worked. The SAS box now acknowledges an
+  answer before it repeats a command, everywhere it repeats one:
+  registration, the wait for an AFT lock, transfers. Found from the
+  tester's support bundle and reproduced against a test machine that keeps
+  the rule; not yet confirmed on the A560 itself.
+- **A registration that fails says what the machine sent back.** "Silence"
+  used to cover no answer, a refusal, "busy" and a damaged answer alike.
+  The SAS log and the support bundle now name which one it was.
+- **A support bundle no longer carries anything that opens the hub.** The
+  bundle script copied the whole data folder, which since the hub login
+  (v0.3.4) included the hub's API token, the hashes of the login passwords,
+  the signed-in browser sessions, and the key and hashes behind player
+  PINs. All of those are now left out; usernames, roles, players, balances
+  and everything else a diagnosis needs are still there, and the note
+  inside the bundle says what was left out. If the database cannot be
+  copied and cleaned it is left out too, where before it was sent raw. A
+  bundle made on v0.3.4 or v0.3.5 does contain them; if you sent one and
+  use the hub login, a new hub password makes that copy of the old one
+  useless.
+- **Starting the DHCP server by hand says what is actually wrong.** On an
+  installed host the `cabinet-dhcp` service already runs it. Run by hand
+  next to it, the script now says so and stops, where before it could
+  start a second DHCP server beside the first. With a network card name
+  the box does not have (the default, `eno1`, is a PC's; a Pi has `eth0`)
+  it lists the cards it does have and the command to use. It no longer
+  ends every failure with "make sure to run with sudo", and it exits with
+  an error when it fails, so the service is retried instead of quietly
+  staying down. The bench guide names the interface now.
+- **A sign-in page that is already open leaves when the lock is turned
+  off.** It checked once, when it loaded. A screen left on the sign-in
+  form, such as the hub's own touchscreen, stayed there after the lock was
+  turned off from another device, and a kiosk has no reload button. The
+  page now checks every few seconds and carries on to where it was going.
+
 ## v0.3.5
 - **Ticketing status moved from the Tickets page to Settings, and it is
   now right for a machine that tickets over SAS.** The Tickets page is for

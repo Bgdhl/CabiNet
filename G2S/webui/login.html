@@ -155,10 +155,26 @@ async function signIn(){
 }
 $("f").addEventListener("submit",function(e){e.preventDefault(); signIn();});
 
-/* Already signed in (or the lock was turned off)? Skip the form. */
-fetch("/api/auth/state",{cache:"no-store"}).then(function(r){return r.json();})
-  .then(function(s){if(s&&(s.required===false||s.signedIn)) location.replace(NEXT);})
-  .catch(function(){});
+/* Already signed in, or the lock is off? Skip the form.
+   Asked on load and then every few seconds for as long as the form is up,
+   because the lock can be turned off somewhere else while this page sits
+   open. Until 2026-11-16 it was asked once: the hub's own screen stayed on
+   this form after the lock was turned off from another device, with no way
+   to reload it. */
+var STATE_EVERY_MS=4000, leaving=false;
+function checkState(){
+  if(leaving||busy) return;
+  fetch("/api/auth/state",{cache:"no-store"}).then(function(r){return r.json();})
+    .then(function(s){
+      if(leaving||!s||!(s.required===false||s.signedIn)) return;
+      leaving=true; location.replace(NEXT);
+    }).catch(function(){});
+}
+checkState();
+setInterval(checkState,STATE_EVERY_MS);
+document.addEventListener("visibilitychange",function(){
+  if(!document.hidden) checkState();
+});
 
 $("u").focus();
 </script>

@@ -865,6 +865,22 @@ def read_asset_number(transport, address: int,
     return None
 
 
+def _unanswered(what: str, resp: bytes, address: int) -> str:
+    """Why a registration step has no usable answer, worded for the journal
+    and the support bundle. "The machine said nothing" and "the machine said
+    no" need different fixes, and until 2026-11-16 both read as silence.
+    True silence keeps that wording. At most the first three bytes of
+    anything else are shown: a 0x73 answer carries the registration key."""
+    if not resp:
+        return f"silence on {what}"
+    if len(resp) == 1 and resp[0] == (0x80 | address):
+        return f"{what} refused: the machine answered NACK (0x{resp[0]:02X})"
+    if len(resp) == 2 and resp[0] == address and resp[1] == 0x00:
+        return f"{what} not taken: the machine answered busy"
+    return (f"{what} answered with {len(resp)} bytes that do not check out "
+            f"(starts {resp[:3].hex()})")
+
+
 def aft_register(transport, address: int, asset_number: bytes,
                  registration_key: bytes, pos_id: bytes,
                  protocol: Optional[SASProtocol] = None,
@@ -876,18 +892,24 @@ def aft_register(transport, address: int, asset_number: bytes,
 
     VERIFY_ON_BENCH: whether real games demand an operator acknowledgment
     at the machine between initialize and register (REG_STATUS_PENDING) —
-    the sequence tolerates a PENDING intermediate by re-reading once."""
+    the sequence tolerates a PENDING intermediate by re-reading once.
+
+    Every poll here is command 0x73, so each answer has to be ACKed before
+    the next goes out (SAS 6.02 §3.1-3.2). The satellite's transport does
+    that (core/sas_implied_ack.py); a bare transport does not, and a strict
+    machine then leaves the register poll unanswered."""
     proto = protocol or _PROTO
     resp = transport.transact(build_aft_register_poll(
         address, REG_CODE_INITIALIZE, asset_number, registration_key, pos_id))
     if _frame_of(resp, address, AFT_CMD_REGISTER, proto) is None:
-        return False, None, "silence on registration initialize (73/00)"
+        return False, None, _unanswered(
+            "registration initialize (73/00)", resp, address)
     sleep(pace)
     resp = transport.transact(build_aft_register_poll(
         address, REG_CODE_REGISTER, asset_number, registration_key, pos_id))
     packet = _frame_of(resp, address, AFT_CMD_REGISTER, proto)
     if packet is None:
-        return False, None, "silence on register (73/01)"
+        return False, None, _unanswered("register (73/01)", resp, address)
     try:
         reg = parse_aft_register_response(packet.data)
     except ValueError as e:
