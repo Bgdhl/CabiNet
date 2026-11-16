@@ -8,6 +8,9 @@ IPs + G2S host URL (option 43). Interface and server IP are configurable:
 
     sudo python3 start-dhcp-enhanced.py                      # bench: eno1
     sudo python3 start-dhcp-enhanced.py --interface eth0     # deployed host
+
+On an installed host the cabinet-dhcp service already runs this; started by
+hand next to it, the script says so and stops (dhcp_start_help.py).
 """
 import argparse
 import os
@@ -20,6 +23,18 @@ ap.add_argument("--interface", default="eno1",
 ap.add_argument("--server-ip", default="192.168.50.2",
                 help="this host's IP on the slot network (also the G2S host)")
 args = ap.parse_args()
+
+# Before anything is written or opened: is the service already doing this,
+# and does the interface exist? Either way, say so in plain words and stop.
+# Never stops a start that systemd itself asked for (see dhcp_start_help.py).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import dhcp_start_help  # noqa: E402
+
+_stop = dhcp_start_help.preflight(args.interface, args.server_ip)
+if _stop:
+    for _line in _stop:
+        print(f"[DHCP] {_line}")
+    sys.exit(2)
 
 # Add python/web to path
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'python/web'))
@@ -86,4 +101,7 @@ if server.start():
         server.stop()
 else:
     print("[DHCP] Failed to start server")
-    print("[DHCP] Make sure to run with sudo: sudo python3 start-dhcp-enhanced.py")
+    for _line in dhcp_start_help.failed_help(args.interface,
+                                             os.geteuid() == 0):
+        print(f"[DHCP] {_line}")
+    sys.exit(1)

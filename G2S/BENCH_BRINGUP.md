@@ -46,8 +46,11 @@ sudo ufw status
 Start order (3 terminals):
 
 ```bash
-# T1 — DHCP (needs sudo for UDP 67; pins g2s host 192.168.50.2:8081 itself)
-sudo python3 start-dhcp-enhanced.py
+# T1 — DHCP (needs sudo for UDP 67; pins g2s host 192.168.50.2:8081 itself).
+# Name the network card the slot segment is plugged into: eno1 on the bench
+# PC, eth0 on a Pi. SKIP THIS on an installed host — its cabinet-dhcp service
+# is already running the same server (systemctl status cabinet-dhcp).
+sudo python3 start-dhcp-enhanced.py --interface eno1
 
 # T2 — the G2S host. NO SUDO. --harvest pulls the device inventory after the
 # join (feeds COMPATIBILITY.md); keepAlive pulses default ON every 15s so a
