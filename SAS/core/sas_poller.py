@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
 from .sas_protocol import SASProtocol, SAS_MAX_ADDRESS
+from .sas_implied_ack import transact_reread
 # The exception-code table (Montana DOJ SAS Implementation Guide v1.5.0 §3.1
 # p.9) now lives in core/sas_exceptions.py with categories + typed event
 # tokens; EXCEPTION_NAMES / exception_name are re-exported for back-compat.
@@ -466,23 +467,26 @@ class SASPoller:
         caller's drain loop will re-poll and see the next 0x51 if more remain);
         False on an empty record, a foreign/corrupt frame, or silence."""
         frame = self.protocol.build_short_poll(self.address, CMD_SEND_HANDPAY_INFO)
-        resp = self.transport.transact(frame)
+        # Asked for again when the answer arrives damaged (§3.2). The
+        # document settles what used to be an open question here: the
+        # machine marks the queue entry reported "when the gaming machine's
+        # response is acknowledged" (§7.8.1), and the address-0 poll our
+        # drain loop sends next IS that acknowledgement — so a damaged
+        # answer must be asked for again before anything else goes out.
+        resp, _heard, sent = transact_reread(self.transport, frame)
         if not resp:
             return False
         packet = self.protocol.parse_packet(resp)
         if (packet is None or packet.address != self.address
                 or packet.command != CMD_SEND_HANDPAY_INFO):
-            # short / CRC-fail / foreign frame — capture nothing, fabricate
-            # nothing. Log it LOUD with the raw bytes: both pre-deploy reviews
-            # flagged that a transient CRC error here could silently drop a
-            # handpay record IF the machine advances its queue on read (vs on
-            # ack — bench-unadjudicated, §7.8.1). We don't "recover" blind, but
-            # a warning means we SEE it on the wire and can adjudicate the
-            # advance timing instead of losing it quietly.
+            # short / CRC-fail / foreign frame on every try — capture
+            # nothing, fabricate nothing, and log the raw bytes. After a
+            # final NACK the machine keeps the entry (§3.2) and raises 0x51
+            # again within fifteen seconds (§7.8.1), so it is read then.
             logging.getLogger("sas.poller").warning(
-                "0x51 serviced but LP 0x1B answer did not parse (addr %d): %s "
-                "— handpay record not captured this read", self.address,
-                resp.hex() if resp else "(silence)")
+                "0x51 serviced but LP 0x1B answer did not parse in %d tries "
+                "(addr %d): %s — handpay record not captured this read",
+                sent, self.address, resp.hex() if resp else "(silence)")
             return False
         data = packet.data
         empty = not any(data)

@@ -1,5 +1,53 @@
 # Changelog
 
+## v0.3.8
+First batch from an audit of the SAS code against the SAS 6.02 document.
+- **A printed ticket can no longer go missing because one answer arrived
+  damaged.** A machine hands over the record of a printed ticket once, and
+  deletes it as soon as the host's next poll counts as "got it". When that
+  answer arrived garbled, the document has the host send the same poll
+  again. The SAS box sent a different one, which is the "got it", so the
+  machine threw away the only copy and the hub then refused the paper at
+  every machine as an unknown number. Now a damaged or missing answer is
+  asked for again, up to twice, with nothing sent in between. The SAS box
+  also looks at the record first without taking it, and stores that copy
+  if the real read still fails. The handpay record is read the same way.
+- **A handpay is no longer stored as a ticket.** A machine keeps handpays,
+  handpay receipts and records of redeemed tickets in the same list as
+  the tickets it prints, and says which is which. That was ignored: every
+  record became a redeemable ticket on the hub, so a handpay receipt could
+  have been paid a second time. Only tickets are stored now. Anything else
+  is logged and shown on the machine's event list as "validation record,
+  not a ticket". Seen on a Bluebird 2: a handpay receipt printed with the
+  attendant key was read as "jackpot handpay, receipt printed" and left
+  off the hub.
+- A restricted ("playable only") ticket is still stored and redeems like
+  any other. The SAS box now keeps its type with the record; the hub does
+  not flag it at the cash desk yet.
+- **The same command is never sent a fourth time in a row.** The document
+  defines three; a strict machine stops answering after that.
+- Tests for these run against a new pretend machine that keeps the
+  document's rules, since a Bluebird 2 forgives all three. Not yet tried on
+  a strict machine.
+
+## v0.3.7
+- **The ticket header reaches a machine that was not ready for it.** The
+  SAS box sent the header once each time a machine came onto the link. A
+  WMS Bluebird 2 fresh from a RAM clear answered neither ticket-data poll
+  two seconds after it came up, then stayed on the link, so that one
+  attempt was the only one: the hub showed "ticket header pending" and a
+  ticket was printed in that state. Only restarting the SAS box sent it.
+  Now a header the machine did not take is tried again after 5, 10, 20
+  and 40 seconds and then once a minute for as long as it is missing. It
+  is also sent two seconds after the machine says its setup changed: it
+  reset its meters, it has no validation ID, its validation ID was just
+  set, or an operator changed its options. Those re-send a header that
+  was already on the machine too, because SAS lets a machine go back to
+  its own ticket text when its validation setup is cancelled. A machine
+  that never takes a header gets one log line, not one a minute. Found in
+  the Bluebird's own log and reproduced against a test machine that
+  ignores the header at first; not yet repeated on a real RAM clear.
+
 ## v0.3.6
 - **AFT registration on a machine that follows the SAS acknowledgement
   rule to the letter.** Registering a machine takes three polls with the

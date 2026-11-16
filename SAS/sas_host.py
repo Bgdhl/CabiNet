@@ -62,7 +62,8 @@ from core.sas_handpay_reset import (HANDPAY_PENDING_EXCEPTION,
                                     HANDPAY_RESET_EXCEPTION)
 from core.hub_ticket_client import HubTicketAuthority, KeepAliveHTTPClient
 from core.sas_ticket_store import DEFAULT_SYSTEM_ID, TicketStore
-from core.sas_tito_host import (SASTITOHost, CMD_SET_EXTENDED_TICKET_DATA,
+from core.sas_tito_host import (SASTITOHost, TicketCaptureOutcome,
+                                CMD_SET_EXTENDED_TICKET_DATA,
                                 CMD_SET_TICKET_DATA,
                                 build_set_extended_ticket_data,
                                 build_set_ticket_data,
@@ -123,6 +124,30 @@ MACHINE_INFO_SETTLE_SEC = 2.0  # 0x3C/0x8C -> census re-read delay: an event
 #                              burst (a player flipping through a multi-game
 #                              menu) coalesces into ONE re-read after the
 #                              last event, not one census per flip.
+
+TICKET_HEADER_SETTLE_SEC = 2.0  # a machine event that says "my setup changed"
+#                              -> one more ticket-header attempt this long
+#                              after it. Events can only bring the attempt
+#                              FORWARD, so a burst is one try and a machine
+#                              that repeats an event cannot hold it off.
+TICKET_HEADER_LOST_EVENTS = (     # SASExceptionInfo.event names that mean the
+    "meters_reset",                # machine may no longer hold our ticket text.
+    "validation_id_not_configured",  # 0x7A: its meters were reset (RAM clear).
+    "config_changed")              # 0x3F: SAS 6.02 §15 — "whenever validation
+#                              configuration is cancelled for any reason, the
+#                              gaming machine should revert to its defaults
+#                              ... for all data previously sent using long
+#                              polls 7B, 7C and 7D", and it "must issue
+#                              exception 3F" then (and every fifteen seconds
+#                              until it is configured). 0x3C: an operator
+#                              changed its options.
+TICKET_HEADER_RETRY_SEC = (5.0, 10.0, 20.0, 40.0, 60.0)  # wait after the 1st,
+#                              2nd... failed header attempt in a row; the last
+#                              value repeats for as long as the machine is
+#                              online and the header is not on it. A silent
+#                              attempt holds polling up for about 0.3 s (two
+#                              50 ms first-byte timeouts and the 200 ms gap
+#                              between the two polls).
 
 # The rig's fixed 20-byte AFT registration key. A freshly RAM-cleared machine
 # is keyless, so the host must ALWAYS supply a key at 73/00 + 73/01 (the
@@ -354,6 +379,25 @@ def parse_ticket_data_reply(value):
             "expireDays": exp, "rev": rev}
 
 
+def note_ticket_capture(addr, result, recent_events) -> None:
+    """Log one 0x3D/0x3E capture, whatever it found.
+
+    A record the machine marks as a handpay or as a ticket that was
+    redeemed is NOT a ticket (SAS 6.02 Table 15.13c) and was not stored.
+    It gets its own words here and a line on the hub's event tape, so
+    nobody goes looking for a ticket that was never one."""
+    if result.outcome is TicketCaptureOutcome.NOT_A_TICKET:
+        what = result.detail.split(" — ")[0]
+        logger.info("🧾 addr {} validation record that is not a ticket: "
+                    "{} for {} cents — {}", addr, result.validation_number,
+                    result.amount_cents, result.detail)
+        recent_events.appendleft({
+            "code": "0x4D", "label": f"validation record, not a ticket: {what}",
+            "when": time.strftime("%Y-%m-%dT%H:%M:%S")})
+        return
+    logger.info("🎫 addr {} ticket issued: {}", addr, result)
+
+
 class TicketHeaderState:
     """C2 ticket-header push state — the rev-gated bridge between the
     hub's report reply and the 0x7C/0x7D wire write.
@@ -364,19 +408,45 @@ class TicketHeaderState:
     counter, the attempt gate, the verdict — is POLL-thread-only.
 
     The gate: an apply is due when the hub's rev differs from the last
-    APPLIED rev AND this (online-session, rev) pair has not been
-    attempted yet. One attempt per rev per online-session — a failure
-    never hot-loops; it retries only on the next rev bump or the next
-    machine rejoin (on_online bumps the session). applied_rev lives in
-    memory only, so a satellite restart re-applies once — a harmless
-    idempotent write of the same text."""
+    APPLIED rev AND one of these holds:
+      * this (online-session, rev) pair has not been attempted yet;
+      * the last attempt failed and its wait is over (TICKET_HEADER_RETRY_SEC:
+        5 s, 10 s, 20 s, 40 s, then every 60 s);
+      * the machine said its setup changed (on_machine_event), and
+        TICKET_HEADER_SETTLE_SEC have passed since.
+    applied_rev lives in memory only, so a satellite restart re-applies
+    once — a harmless idempotent write of the same text.
 
-    def __init__(self):
+    ⭐ WHY IT KEEPS TRYING (2026-11-16). It used to be ONE attempt per rev
+    per online-session: "a failure retries only on the next rev bump or the
+    next machine rejoin". AJ RAM-cleared his Bluebird 2 and this is its Pi's
+    log:
+
+        12:33:53.762  SAS machine ONLINE (0x31, 0x34, 0x7A meters reset)
+        12:33:56.112  ticket header NOT applied: silence on 0x7C and 0x7D
+        12:34:30.835  0x3F validation ID not configured -> seeded
+        12:36:01      0x3C operator changed configuration (three times)
+        12:40:55      cash out ticket printed
+
+    The cleared machine answered neither ticket-data poll two seconds after
+    it came up, and it never dropped off the link again, so the one attempt
+    was the only attempt. The hub showed the header as not applied for the
+    rest of the session, a ticket was printed in that state, and nothing
+    short of a satellite restart would have sent it.
+
+    A failed attempt is cheap and a missing header is not, so there is no
+    "give up" any more — only a wait that grows to a minute."""
+
+    def __init__(self, clock=time.monotonic):
         self.target = None       # validated reply dict | None
         self.applied_rev = None  # last rev the machine ACKed
         self.detail = "no ticket header received from the hub yet"
+        self.failures = 0        # failed attempts in a row (poll thread)
+        self.tries = 0           # attempts since the header was last on
+        self._clock = clock
         self._session = 0        # bumped on every machine-online edge
         self._attempted = None   # (session, rev) of the last wire attempt
+        self._again_at = None    # clock time one more attempt is due | None
 
     def on_reply(self, value) -> None:
         """Reporter thread: ingest the raw reply value (junk = no-op)."""
@@ -400,31 +470,73 @@ class TicketHeaderState:
         Nothing on the wire tells us a RAM clear happened, so we cannot
         detect it — we can only stop assuming the machine kept our text
         across an offline edge. Re-applying is a harmless idempotent write
-        of the same text, and `_attempted` still bounds it to ONE attempt
-        per (session, rev), so this costs at most one 7C/7D per rejoin."""
+        of the same text, and a header that goes on costs one 7C/7D per
+        rejoin (one that does not is tried again — see the class note)."""
         self._session += 1
         self.applied_rev = None
+        self.failures = 0
+        self.tries = 0
+        self._again_at = None
+
+    def on_machine_event(self, lost=False) -> None:
+        """Poll thread: the machine said its own setup changed, so one more
+        attempt is due TICKET_HEADER_SETTLE_SEC from now — or sooner, if
+        one was already due sooner. An event never moves an attempt LATER:
+        a burst costs one attempt, and a machine that repeats an event
+        (0x3F comes every fifteen seconds until it is configured) cannot
+        hold the attempt off. The wait after a failure starts over.
+
+        lost=True is for the events that mean the machine may no longer
+        hold our text even though it ACKed it earlier (it reset its meters,
+        it has no validation ID, an operator changed its options): the
+        header is sent again whether or not it was applied. lost=False only
+        hurries a header that is still missing."""
+        if lost:
+            self.applied_rev = None
+        self.failures = 0
+        settled = self._clock() + TICKET_HEADER_SETTLE_SEC
+        self._again_at = (settled if self._again_at is None
+                          else min(self._again_at, settled))
 
     def due(self):
         """Poll thread: the target dict if an apply attempt is due now,
         else None. Never due for the already-applied rev (same rev never
-        re-sends) or an already-attempted (session, rev)."""
+        re-sends). An already-attempted (session, rev) is due again only
+        once its wait is over."""
         t = self.target
         if t is None or t["rev"] == self.applied_rev:
             return None
-        if self._attempted == (self._session, t["rev"]):
+        if self._attempted == (self._session, t["rev"]) and (
+                self._again_at is None or self._clock() < self._again_at):
             return None
         return t
 
     def mark_attempted(self, rev: int) -> None:
-        """Poll thread, BEFORE the wire try — so even a raising apply
-        burns this (session, rev)'s one attempt instead of hot-looping."""
+        """Poll thread, BEFORE the wire try — so even an apply that raises
+        past record_result burns this attempt instead of hot-looping."""
         self._attempted = (self._session, rev)
+        self._again_at = None
+        self.tries += 1
+
+    def retry_in(self):
+        """Seconds until the next attempt of a failed header, or None."""
+        if self._again_at is None:
+            return None
+        return max(0.0, self._again_at - self._clock())
 
     def record_result(self, rev: int, ok: bool, detail: str) -> None:
-        """Poll thread: the attempt's verdict (rides the snapshot)."""
+        """Poll thread: the attempt's verdict (rides the snapshot). A
+        failure books the next attempt."""
         if ok:
             self.applied_rev = rev
+            self.failures = 0
+            self.tries = 0
+            self._again_at = None
+        else:
+            self.failures += 1
+            wait = TICKET_HEADER_RETRY_SEC[
+                min(self.failures, len(TICKET_HEADER_RETRY_SEC)) - 1]
+            self._again_at = self._clock() + wait
         self.detail = detail
 
     def snapshot(self):
@@ -555,8 +667,7 @@ def apply_ticket_header(transport, address, target, protocol=None,
         return False, ("0x7D NACK — the machine flagged the ticket data "
                        f"invalid (0x7C was silent){note}")
     return False, ("silence on both 0x7C and 0x7D — ticket header not "
-                   "applied (retries on the next rev bump or "
-                   f"rejoin){note}")
+                   f"applied yet (the satellite keeps trying){note}")
 
 
 class HubIdentityGate:
@@ -1317,6 +1428,13 @@ def main():
         if getattr(info, "event", "") in ("config_changed", "game_selected"):
             machine_info_read["at"] = (time.monotonic()
                                        + MACHINE_INFO_SETTLE_SEC)
+        # The machine saying its own setup changed is also the moment to
+        # send the ticket header again: a RAM-cleared machine raises exactly
+        # these while it is being set up, and it may not answer the
+        # ticket-data polls before (see TicketHeaderState). Not
+        # "game_selected": a player raises that every time they pick a game.
+        if getattr(info, "event", "") in TICKET_HEADER_LOST_EVENTS:
+            ticket_header.on_machine_event(lost=True)
         name = getattr(info, "name", "") or ""
         logger.info("🔔 addr {} exception 0x{:02X} {}", addr, info.code, name)
         recent_events.appendleft({
@@ -1369,6 +1487,11 @@ def main():
         logger.info("🎟️ addr {} enhanced validation-ID {}: {}", addr,
                     "SEEDED" if ok else "seed ignored",
                     getattr(result, "detail", result))
+        # A machine that had no validation ID holds no ticket text of ours
+        # (SAS 6.02 §15: it went back to its defaults when its validation
+        # configuration was cancelled). Send ours now that it has been
+        # given one. Seeds are 5 s apart at the least (seed cooldown).
+        ticket_header.on_machine_event(lost=True)
         recent_events.appendleft({
             "code": "0x4C",
             "label": f"validation-id {'seeded' if ok else 'ignored'}",
@@ -1391,8 +1514,8 @@ def main():
         store = TicketStore()   # SAS/data/sas_ticket_state.json (auto-created)
     tito_host = SASTITOHost(
         poller, store,
-        on_ticket_issued=lambda a, r: logger.info(
-            "🎫 addr {} ticket issued: {}", a, r),
+        on_ticket_issued=lambda a, r: note_ticket_capture(
+            a, r, recent_events),
         on_redemption=lambda a, r: logger.info(
             "🎫 addr {} ticket redemption: {}", a, r),
         on_system_validation=on_system_validation,
@@ -2896,10 +3019,12 @@ def main():
         # C2 ticket-header push (poll thread — the only transport toucher).
         # Gated machine-ONLINE, and only reachable while ENABLED (the park
         # loop above holds first), so a parked or dark machine defers with
-        # zero wire traffic. mark_attempted runs BEFORE the wire try, so
-        # every (online-session, rev) gets exactly ONE attempt — a failure
-        # logs once and waits for the next rev bump or rejoin (no hot
-        # loop); the verdict rides every snapshot via ticketData.detail.
+        # zero wire traffic. mark_attempted runs BEFORE the wire try. A
+        # failed attempt is tried again after a growing wait, and at once
+        # when the machine says its setup changed (TicketHeaderState); the
+        # verdict rides every snapshot via ticketData.detail. Only the
+        # first failure of a run and a changed reason are logged, so a
+        # machine that never takes a header does not fill the journal.
         if poller.state.online:
             due = ticket_header.due()
             if due is not None:
@@ -2911,10 +3036,20 @@ def main():
                 except Exception as e:                        # noqa: BLE001
                     ok, detail = False, (f"apply error: "
                                          f"{type(e).__name__}: {e}")
+                tries = ticket_header.tries
+                first = ticket_header.failures == 0
+                changed = detail != ticket_header.detail
                 ticket_header.record_result(due["rev"], ok, detail)
-                (logger.info if ok else logger.warning)(
-                    "🎟️ ticket header rev {} {}: {}", due["rev"],
-                    "APPLIED" if ok else "NOT applied", detail)
+                if ok:
+                    logger.info("🎟️ ticket header rev {} APPLIED{}: {}",
+                                due["rev"],
+                                f" on try {tries}" if tries > 1 else "",
+                                detail)
+                elif first or changed:
+                    logger.warning(
+                        "🎟️ ticket header rev {} NOT applied (try {}, next "
+                        "in {:.0f}s): {}", due["rev"], tries,
+                        ticket_header.retry_in() or 0.0, detail)
         heartbeat_if_due(now)
         return stop["flag"]
 

@@ -58,10 +58,11 @@ machine re-draws the identical authorization (TicketStore idempotency).
 
 import enum
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Optional
 
 from .sas_protocol import SASProtocol
+from .sas_implied_ack import transact_reread
 from .sas_meters import (
     SAS_POLL_FLOOR, bcd_to_int, int_to_bcd,
     build_enhanced_validation_info_poll, build_set_validation_id_poll,
@@ -97,6 +98,8 @@ __all__ = [
     "RedemptionOutcome", "TicketRedemptionResult", "redeem_inserted_ticket",
     "ValidationIdOutcome", "ValidationIdResult", "configure_validation_id",
     "read_validation_record", "SASTITOHost",
+    "VALIDATION_TYPES", "CASH_TICKET_TYPES", "PLAYABLE_ONLY_TICKET_TYPES",
+    "VALIDATION_LOOK_AHEAD", "validation_kind",
     "SYSTEM_VALIDATION_REQUEST_EXCEPTION", "CASHOUT_BUTTON_EXCEPTION",
     "VALIDATION_APPROVE", "VALIDATION_REJECT", "DEFAULT_PAYLOAD_STYLE",
     "build_validation_payload", "SystemValidationOutcome",
@@ -498,26 +501,98 @@ def configure_validation_id(transport, address: int,
 # Ticket-out: exception 0x3D -> read validation info -> record
 # --------------------------------------------------------------------------
 
+VALIDATION_LOOK_AHEAD = 0xFF   # 0x4D function code: look, do not mark as read
+
+# SAS 6.02 Table 15.13c — what a 0x4D validation record IS. The machine keeps
+# handpays, receipts and redeemed tickets in the same buffer as the tickets
+# it prints, and raises the same exception (0x3D, or 0x3E for a handpay with
+# no receipt) for all of them: "The host should use the data from long poll
+# 4D to determine the validation type" (§15).
+VALIDATION_TYPES = {
+    0x00: "cashable ticket",
+    0x01: "restricted promotional ticket",
+    0x02: "cashable ticket from an AFT transfer",
+    0x03: "restricted ticket from an AFT transfer",
+    0x04: "debit ticket from an AFT transfer",
+    0x10: "cancelled-credit handpay, receipt printed",
+    0x20: "jackpot handpay, receipt printed",
+    0x40: "cancelled-credit handpay, no receipt",
+    0x60: "jackpot handpay, no receipt",
+    0x80: "cashable ticket redeemed",
+    0x81: "restricted promotional ticket redeemed",
+    0x82: "nonrestricted promotional ticket redeemed",
+}
+CASH_TICKET_TYPES = frozenset({0x00, 0x02, 0x04})
+PLAYABLE_ONLY_TICKET_TYPES = frozenset({0x01, 0x03})
+
+
+def validation_kind(validation_type: int):
+    """('cash' | 'playable' | 'other' | 'unknown', label) for a Table
+    15.13c type code. The question it answers is "is this a ticket in a
+    player's hand?"
+
+    'cash'      a ticket worth cash (a debit ticket is the player's own
+                money, so it counts).
+    'playable'  a restricted, promotional ticket: "PLAYABLE ONLY". It IS a
+                ticket and goes back into a machine like any other, so it is
+                stored. What a system does differently is flag it at the
+                cash desk (AJ, 2026-11-16, on the SMIB system he ran before:
+                "they act the same in reality but in the cash desk part ...
+                they would be flagged as playable only"). The hub cannot
+                flag it yet; the type is kept with the stored record so it
+                can.
+    'other'     a real record that is NOT a ticket: a handpay ("the receipt
+                is not the cash out, the handpay is the cash out", §15), or
+                the record of a ticket that was redeemed. Never stored.
+    'unknown'   a code the table does not have. Kept as a ticket, as every
+                record was before 2026-11-16, because turning away a real
+                ticket strands a player's money."""
+    label = VALIDATION_TYPES.get(validation_type)
+    if label is None:
+        return "unknown", f"type {validation_type:02X}, not in Table 15.13c"
+    if validation_type in CASH_TICKET_TYPES:
+        return "cash", label
+    if validation_type in PLAYABLE_ONLY_TICKET_TYPES:
+        return "playable", label
+    return "other", label
+
+
+def _read_4d(transport, address: int, function_code: int, proto):
+    """One 0x4D read, asked for again when its answer arrives damaged
+    (§3.2, see transact_reread). Returns (record | None, heard, sent)."""
+    resp, heard, sent = transact_reread(
+        transport, build_enhanced_validation_info_poll(address, function_code))
+    packet = _classify_frame(resp, address, 0x4D, proto)
+    if packet is None:
+        return None, heard, sent
+    try:
+        return parse_enhanced_validation_info(packet.data), heard, sent
+    except ValueError:
+        return None, heard, sent
+
+
 def read_validation_record(transport, address: int,
                            function_code: int = 0x00,
                            protocol: Optional[SASProtocol] = None
                            ) -> Optional[ValidationRecord]:
-    """One 0x4D read (guide §4.6.2). function_code 0x00 = current record,
-    0x01-0x1F = buffer index, 0xFF = look-ahead. Returns None on silence or
-    a malformed frame. VERIFY_ON_BENCH: whether a func-00 read advances the
-    VGM's unread-record buffer pointer (the guide describes the buffer-full
-    halt but not the pointer semantics) — adjudicate on the bench before
-    trusting multi-record drains."""
-    proto = protocol or _PROTO
-    resp = transport.transact(
-        build_enhanced_validation_info_poll(address, function_code))
-    packet = _classify_frame(resp, address, 0x4D, proto)
-    if packet is None:
-        return None
-    try:
-        return parse_enhanced_validation_info(packet.data)
-    except ValueError:
-        return None
+    """One 0x4D read (SAS 6.02 §15.10). Returns None on silence or a
+    malformed frame, after asking again up to twice.
+
+    What the function code does to the machine's buffer, from the document
+    (this used to be marked VERIFY_ON_BENCH):
+      00     the next UNREAD record; the machine marks it read once it gets
+             an implied ACK, and stops raising 0x3D/0x3E for it;
+      FF     the same record, looked at WITHOUT marking it read;
+      01-1F  the record at that buffer position, read state unchanged.
+    All fields are zero when there is nothing to return."""
+    rec, _heard, _sent = _read_4d(transport, address, function_code,
+                                  protocol or _PROTO)
+    return rec
+
+
+def _usable(rec) -> bool:
+    return bool(rec is not None and rec.validation_number.strip("0")
+                and rec.amount_cents)
 
 
 class TicketCaptureOutcome(enum.Enum):
@@ -525,6 +600,8 @@ class TicketCaptureOutcome(enum.Enum):
     DUPLICATE = "duplicate"           # idempotent re-read; store unchanged
     NO_DATA = "no_data"               # machine answered but had no record
     TIMEOUT = "timeout"               # silence on both reads
+    NOT_A_TICKET = "not_a_ticket"     # a real record that is not a cash
+    #                                   ticket (handpay, restricted, redeemed)
 
 
 @dataclass(frozen=True)
@@ -535,6 +612,7 @@ class TicketCaptureResult:
     via: Optional[str]                # '4D' (enhanced) or '3D' (standard)
     record: Optional[dict]            # the store record, when persisted
     detail: str
+    validation_type: Optional[int] = None   # Table 15.13c code (0x4D only)
 
     @property
     def ok(self) -> bool:
@@ -550,34 +628,86 @@ def capture_printed_ticket(transport, address: int, store: TicketStore,
     """The ticket-OUT read, run when exception 0x3D (cash out ticket
     printed) — or 0x3E (hand pay validated) — comes off the FIFO:
 
-      1. 0x4D func 00 (guide §4.6.2, secure/enhanced): full record with the
-         16-digit validation number, amount in cents, ticket number;
-      2. fallback 0x3D read (guide §4.6.3, standard validation): 8-digit
-         validation number + amount (all-zero validation field = the machine
-         is enhanced/system-configured, per the guide's note — not a ticket).
+      1. 0x4D (SAS 6.02 §15.10, secure enhanced and system validation): the
+         full record with its type, the 16-digit validation number, amount
+         in cents and ticket number;
+      2. fallback 0x3D read (standard validation), ONLY for a machine that
+         never answered 0x4D at all: 8-digit validation number + amount.
+
+    ⭐ THE 0x4D READ, AND WHY IT IS TWO POLLS (2026-11-16, audit items 1, 3).
+
+    Function 00 hands over the next unread record and the machine marks it
+    read on our implied ACK. It is the only copy we will be offered: after
+    that the machine stops raising 0x3D for it. So:
+
+      a. FF first — the same record, looked at WITHOUT marking it read. It
+         is kept in memory, not stored.
+      b. 00 — the read that counts. If its answer arrives damaged it is
+         asked for again (the implied NACK), never followed by another poll,
+         which would have been the ACK that makes the machine drop it.
+      c. If the 00 read still brings nothing usable, the copy from (a) is
+         what gets stored. That covers a machine that marks the record read
+         when it SENDS it, and one that counts our look as the read.
+
+    Before this, one damaged 35-byte answer lost the ticket: the 0x3D poll
+    that followed acknowledged it, and the hub then refused the paper at
+    every machine as an unknown number.
+
+    A record is stored as a ticket only when its type says it is one
+    (validation_kind). A handpay raises the same exceptions and sits in the
+    same buffer; stored as a ticket, its receipt would have been paid a
+    second time.
 
     The winning record is persisted via TicketStore.record_issued, which is
     idempotent — a duplicate capture (retried exception, re-read) returns
     DUPLICATE and mutates nothing. Long polls double as the implied ACK for
-    the triggering exception (guide §3), so calling this from the poller's
+    the triggering exception (§3), so calling this from the poller's
     dispatch path is protocol-safe."""
     proto = protocol or _PROTO
 
-    # -- 1: enhanced record (guide-cited) ------------------------------------
-    rec = read_validation_record(transport, address, 0x00, proto)
+    # -- 1: enhanced record ----------------------------------------------------
+    peek, peek_heard, _ = _read_4d(transport, address, VALIDATION_LOOK_AHEAD,
+                                   proto)
+    sleep(pace)
+    rec, heard, sent = _read_4d(transport, address, 0x00, proto)
+    if _usable(rec):
+        # The note says what the look-ahead did whenever it was not simply
+        # the same record, so a machine's log shows whether the safety copy
+        # exists on that machine.
+        note = ""
+        if not _usable(peek):
+            note = (" · the look-ahead (FF) "
+                    + ("came back empty" if peek is not None
+                       else "got no usable answer"))
+        elif _canonical_vn(peek.validation_number) \
+                != _canonical_vn(rec.validation_number):
+            note = (" · the look-ahead (FF) showed a different record ("
+                    f"{_canonical_vn(peek.validation_number)}) and was "
+                    "not used")
+        return _persist_4d(store, rec, address, note)
+    if _usable(peek):
+        why = ("answered with an empty record" if rec is not None
+               else f"did not arrive in {sent} tries")
+        return _persist_4d(store, peek, address,
+                           f" · the 0x4D read {why}; taken from the "
+                           "look-ahead (FF) copy")
     if rec is not None:
-        vn = rec.validation_number
-        if vn and vn.strip("0") and rec.amount_cents:
-            return _persist(store, vn, rec.amount_cents, address, "4D",
-                            ticket_number=rec.ticket_number_le,
-                            issued_at=rec.when.isoformat() if rec.when
-                            else None)
         # a parsed-but-zeroed record: an empty validation buffer
         return TicketCaptureResult(
             TicketCaptureOutcome.NO_DATA, None, None, "4D", None,
             "4D answered with a zeroed record — validation buffer empty")
+    if heard or peek_heard:
+        # The machine speaks 0x4D and its answer did not arrive. No 0x3D
+        # read: that is for standard validation, and a different long poll
+        # here would have been the ACK. The machine keeps the record unread
+        # after a final NACK and raises its exception again.
+        return TicketCaptureResult(
+            TicketCaptureOutcome.TIMEOUT, None, None, "4D", None,
+            f"0x4D answered but not intact in {sent} tries — not "
+            "acknowledged, so the machine still holds the record and "
+            "raises its exception again")
 
-    # -- 2: standard-validation fallback (guide-cited) -----------------------
+    # -- 2: standard-validation fallback: 0x4D never answered at all ----------
     sleep(pace)
     resp = transport.transact(build_meter_poll(address, 0x3D))
     packet = _classify_frame(resp, address, 0x3D, proto)
@@ -585,7 +715,7 @@ def capture_printed_ticket(transport, address: int, store: TicketStore,
         return TicketCaptureResult(
             TicketCaptureOutcome.TIMEOUT, None, None, None, None,
             "silence on both 4D and 3D reads — ticket data unrecoverable "
-            "this cycle (safe to retry; capture is idempotent)")
+            "this cycle")
     try:
         info: CashoutTicketInfo = parse_cashout_ticket_info(packet.data)
     except ValueError as e:
@@ -605,12 +735,35 @@ def capture_printed_ticket(transport, address: int, store: TicketStore,
                     address, "3D")
 
 
+def _persist_4d(store, rec, address, note="") -> TicketCaptureResult:
+    """Store a 0x4D record — if its type says it is a ticket."""
+    kind, label = validation_kind(rec.validation_type)
+    if kind == "other":
+        return TicketCaptureResult(
+            TicketCaptureOutcome.NOT_A_TICKET,
+            _canonical_vn(rec.validation_number), rec.amount_cents, "4D",
+            None, f"{label} — not a ticket, not stored{note}",
+            validation_type=rec.validation_type)
+    if kind == "playable":
+        note = (f" · {label} (playable only): stored as an ordinary ticket, "
+                f"the hub cannot flag it yet{note}")
+    elif kind == "unknown":
+        note = f" · {label}; stored as a cash ticket{note}"
+    out = _persist(store, rec.validation_number, rec.amount_cents, address,
+                   "4D", ticket_number=rec.ticket_number_le,
+                   issued_at=rec.when.isoformat() if rec.when else None,
+                   extra={"validationType": rec.validation_type})
+    return replace(out, detail=out.detail + note,
+                   validation_type=rec.validation_type)
+
+
 def _persist(store, vn, amount_cents, address, via,
-             ticket_number=None, issued_at=None) -> TicketCaptureResult:
+             ticket_number=None, issued_at=None,
+             extra=None) -> TicketCaptureResult:
     vn = _canonical_vn(vn)
     out = store.record_issued(vn, amount_cents, address,
                               ticket_number=ticket_number, source=f"egm_{via}",
-                              issued_at=issued_at)
+                              issued_at=issued_at, extra=extra)
     if out["duplicate"]:
         return TicketCaptureResult(
             TicketCaptureOutcome.DUPLICATE, vn, amount_cents, via,
