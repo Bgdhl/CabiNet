@@ -84,14 +84,15 @@ WEDGE_REOPEN_SEC = 15.0      # RX silence -> port reopen (fast phase). The
 #                              is closed+reopened. This watchdog makes the
 #                              manual `systemctl restart cabinet-sas`
 #                              cure automatic within one cadence.
-WEDGE_QUIET_SEC = 3.0        # no polling between the close and the reopen.
-#                              BENCH-PROVEN 2026-11-15 (Zero 2 W + BB2): a
-#                              reopen with no pause never cured the wedge
-#                              (150+ tries); a service restart, which is the
-#                              same reopen with ~3 s of silence, always did.
-WEDGE_QUIET_LONG_SEC = 6.0   # from the 2nd dry reopen on: longer than the
-#                              5 s of host silence after which a SAS machine
-#                              declares the link down and starts over.
+WEDGE_QUIET_SEC = 6.0        # no polling between the close and the reopen.
+#                              BENCH-PROVEN 2026-11-15 (Zero 2 W + BB2), with
+#                              the hardware untouched: 150+ reopens with no
+#                              pause never cured the wedge; a service restart
+#                              with ~1.6 s of silence did not either; ~2.7 s
+#                              and 10 s both brought the machine online on
+#                              the first poll. 6 s clears the 5 s of host
+#                              silence after which a SAS machine declares the
+#                              link down and starts over.
 WEDGE_SLOW_AFTER = 20        # dry reopens (~5 min) before deciding "machine
 #                              is OFF, not wedged" and backing off the churn
 WEDGE_SLOW_SEC = 60.0        # slow-phase cadence — worst-case self-heal
@@ -955,15 +956,13 @@ class RxWedgeWatchdog:
                  reopen_sec=WEDGE_REOPEN_SEC,
                  slow_after=WEDGE_SLOW_AFTER,
                  slow_sec=WEDGE_SLOW_SEC,
-                 quiet_sec=WEDGE_QUIET_SEC,
-                 quiet_long_sec=WEDGE_QUIET_LONG_SEC):
+                 quiet_sec=WEDGE_QUIET_SEC):
         self.port = port                  # must expose .reopen()
         self.state = state                # SASPoller MachineState (.answers)
         self.reopen_sec = float(reopen_sec)
         self.slow_after = int(slow_after)
         self.slow_sec = float(slow_sec)
         self.quiet_sec = float(quiet_sec)
-        self.quiet_long_sec = float(quiet_long_sec)
         self.dry_reopens = 0              # consecutive reopens with no answer
         self.reopens_total = 0
         self._answers_seen = int(state.answers)
@@ -999,7 +998,7 @@ class RxWedgeWatchdog:
         # The reopen blocks the poll thread for the quiet spell — that IS the
         # cure (no polls reach the machine). Hub reports run on their own
         # thread and carry on.
-        quiet = self.quiet_sec if self.dry_reopens == 1 else self.quiet_long_sec
+        quiet = self.quiet_sec
         try:
             self.port.reopen(quiet=quiet)
             if loud:

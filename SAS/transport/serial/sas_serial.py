@@ -116,10 +116,10 @@ class SASSerialPort:
         /proc/tty/driver/ttyAMA tx climbing, rx frozen).
 
         The silence matters. BENCH-PROVEN 2026-11-15 on a Zero 2 W against a
-        BB2: an immediate close+open did nothing in more than 150 tries over
-        three machine reboots, while `systemctl restart cabinet-sas` — the
-        same close and open with about 3 s of no polling in between — brought
-        the machine online on its first poll, every time. So this is that
+        BB2, hardware untouched: an immediate close+open did nothing in more
+        than 150 tries; a service restart with ~1.6 s of no polling did not
+        either; ~2.7 s and 10 s both brought the machine online on its first
+        poll. So this is that
         restart, in-process. Raises on failure (device vanished); callers
         catch and retry on their own cadence."""
         try:

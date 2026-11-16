@@ -15,7 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from sas_host import (RxWedgeWatchdog, WEDGE_REOPEN_SEC, WEDGE_SLOW_AFTER,
-                      WEDGE_SLOW_SEC, WEDGE_QUIET_SEC, WEDGE_QUIET_LONG_SEC)
+                      WEDGE_SLOW_SEC, WEDGE_QUIET_SEC)
 
 
 class FakePort:
@@ -193,10 +193,9 @@ if __name__ == "__main__":
 
 
 # -- the pause between close and reopen (2026-11-15) -------------------------
-# An immediate close+open never cured the wedge on the bench; a restart (the
-# same thing with ~3 s of no polling) always did. Every reopen must carry a
-# pause, and from the second dry reopen a pause longer than SAS's 5 s
-# link-down time.
+# On the bench an immediate close+open never cured the wedge and 1.6 s of
+# silence did not either; 2.7 s and 10 s did. Every reopen must carry a pause
+# longer than SAS's 5 s link-down time.
 
 def test_every_reopen_asks_for_a_quiet_spell():
     wd, port, state = make()
@@ -205,20 +204,9 @@ def test_every_reopen_asks_for_a_quiet_spell():
     for _ in range(4):
         t += WEDGE_REOPEN_SEC
         assert wd.tick(t) is True
-    assert port.quiets == [WEDGE_QUIET_SEC] + [WEDGE_QUIET_LONG_SEC] * 3
-    assert WEDGE_QUIET_SEC >= 2.5 and WEDGE_QUIET_LONG_SEC > 5.0
-
-
-def test_quiet_starts_short_again_after_a_recovery():
-    wd, port, state = make()
-    wd.tick(0.0)
-    wd.tick(WEDGE_REOPEN_SEC)
-    wd.tick(2 * WEDGE_REOPEN_SEC)
-    state.answers += 1                       # machine answered: recovered
-    wd.tick(2 * WEDGE_REOPEN_SEC + 1)
-    wd.tick(3 * WEDGE_REOPEN_SEC + 1)
-    assert port.quiets == [WEDGE_QUIET_SEC, WEDGE_QUIET_LONG_SEC,
-                           WEDGE_QUIET_SEC]
+    assert port.quiets == [WEDGE_QUIET_SEC] * 4
+    assert WEDGE_QUIET_SEC > 5.0
+    assert WEDGE_QUIET_SEC < WEDGE_REOPEN_SEC   # never back-to-back silence
 
 
 def test_serial_reopen_is_silent_between_close_and_open(monkeypatch):
