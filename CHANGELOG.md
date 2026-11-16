@@ -1,17 +1,20 @@
 # Changelog
 
 ## v0.3.5
-- **The Tickets page shows the right ticketing state for a machine that
-  tickets over SAS.** The row of chips at the top of the page read only a
-  machine's G2S ticket device, so a machine whose tickets run over SAS
-  (a Bluebird 2, for one) could say "ticketing off" while it was printing
-  and redeeming tickets normally. A machine that tickets over SAS now
-  shows **ticketing on · SAS**, or **off** with the reason (the SAS link
-  is down, its Pi is not reporting, the machine is not hearing the Pi, or
-  SAS is off in Settings). It no longer gets a "Turn ticketing on/off"
-  button or a G2S status, because that switch does not control its
-  tickets. Machines that ticket over G2S are unchanged, and a machine
-  with only a SAS side now appears in the row too.
+- **Ticketing status moved from the Tickets page to Settings, and it is
+  now right for a machine that tickets over SAS.** The Tickets page is for
+  looking a ticket up or voiding one, so the row of machine chips and the
+  "Turn ticketing on/off" button are gone from it. Each machine's
+  ticketing state now sits with the other per-machine switches, under
+  **Settings → Machines**:
+  - a machine that tickets over G2S shows **ticketing on** or **off** and
+    keeps its "Turn ticketing off/on" button;
+  - a machine that tickets over SAS shows **ticketing on**, or **off** with
+    the reason (the SAS link is down, its Pi is not reporting, the machine
+    is not hearing the Pi, or SAS is off). It has no button, because SAS
+    ticketing follows the link. Before, such a machine (a Bluebird 2, for
+    one) could say "ticketing off" while it printed and redeemed tickets
+    normally, because only its G2S ticket device was looked at.
 - **No scroll bars on the hub's touchscreen.** The kiosk drew a pale
   desktop scroll bar down the side of every page. It is gone on the hub's
   own kiosk; scrolling is still a swipe. Other browsers, small windows and

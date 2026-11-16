@@ -693,7 +693,6 @@
              aria-label="Search tickets by validation number" oninput="tkSearch()">
     </div>
     <div class="dchips" id="tk-states" style="margin:0 0 12px"></div>
-    <div id="tk-dev" style="margin:0 0 12px"></div>
     <div class="card"><h2>Tickets <span class="hn" id="tk-n"></span></h2>
       <div class="body" id="tk-list" style="padding-top:2px"></div></div>
     <div id="tk-more" style="margin-top:12px"></div>
@@ -4376,6 +4375,10 @@ function xmBadge(origin, redeemer){
 /* Does this SAS machine ticket over SAS, and is that working right now?
    -> null when there is no sign it does (the caller falls back to the G2S
    ticket device), else {on, why}.
+   A machine tickets through ONE system — whichever its own validation
+   setting names (AJ 2026-11-16: the Bluebird 2 tickets over SAS, and after
+   a fresh image the page said "ticketing off" for it from the G2S voucher
+   device's hostEnabled flag while tickets printed and redeemed fine).
    Evidence, from the satellite's own report: the machine accepted the hub's
    ticket header this session (ticketData.appliedRev — it answered the SAS
    extended-ticket-data polls), or the satellite holds tickets from it
@@ -4387,63 +4390,22 @@ function sasTicketing(m){
   const td=m.ticketData||{};
   const n=Number((m.tickets||{}).total)||0;
   if(td.appliedRev==null && !n) return null;
-  if(m.sasEnabled===false) return {on:false, why:"SAS is off in Settings"};
+  if(m.sasEnabled===false) return {on:false, why:"SAS is off"};
   if(m.stale) return {on:false, why:"its Pi is not reporting"};
   if(!m.online) return {on:false,
     why:m.chirping?SAS_DEAF_SHORT:"SAS link is down"};
   return {on:true, why:""};
 }
-function sasTicketChip(name, tk){
-  const tip=tk.on
-    ?"This machine's tickets are validated over SAS. Ticketing follows its "
-     +"SAS link — there is nothing to switch here."
-    :"This machine's tickets are validated over SAS, and they cannot be "
-     +"right now: "+tk.why+".";
-  return `<span class="chip ${tk.on?"ok":"warn"}" title="${esc(tip)}">${esc(name)}
-      · ticketing ${tk.on?"on":"off"} · SAS${tk.on?"":" — "+esc(tk.why)}</span>`;
+/* One machine's ticketing line for Settings · Machines (dim when on, warm
+   when off — an off line is the thing worth noticing). */
+function tkLine(on, text){
+  return `<div class="kd" style="color:var(${on?"--dim":"--gold-hi"})">${esc(text)}</div>`;
 }
 function renderTickets(){
   setHTML($("tk-pend"), S.caps.vouchers===false?pendChip("The ticket browser"):"");
   setHTML($("tk-states"), TK_STATES.map(([v,l])=>
     `<button class="fchip ${S.tk.state===v?"on":""}" aria-pressed="${S.tk.state===v}"
       onclick="tkState('${v}')">${esc(l)}</button>`).join(""));
-
-  /* Per-machine ticketing state. A machine tickets through ONE system —
-     whichever its own validation setting names — so the row follows that
-     system (AJ 2026-11-16: the Bluebird 2 tickets over SAS, and after a
-     fresh image this row said "ticketing off" for it from the G2S voucher
-     device's hostEnabled flag while tickets were printing and redeeming
-     fine). A machine that tickets over SAS shows its SAS state and gets NO
-     G2S status or button: that device does not carry its tickets, so a
-     switch for it is a control that does nothing. */
-  const devRows=[], sasShown=new Set();
-  for(const e of egmList()){
-    const s=snap(e);
-    const lk=(s.sasLink!==undefined)?sasLinkFace(e,s):"";
-    const leg=lk?((((S.status||{}).sas||{})[lk])||null):null;
-    if(lk) sasShown.add(lk);             // a linked leg rides its machine's row
-    const sasTk=sasTicketing(leg);
-    if(sasTk){
-      devRows.push(sasTicketChip(machineName(s,e), sasTk));
-      continue;
-    }
-    const vd=s.voucherDevice;
-    if(!vd) continue;
-    const st=vd.status||{};
-    const on=String(st.hostEnabled)!=="false";
-    devRows.push(`<span class="chip ${on?"ok":"warn"}">${esc(machineName(s,e))}
-      · ticketing ${on?"on":"off"}</span>
-      <button class="btn slim ${on?"danger":""}" data-egm="${esc(e)}" data-en="${on?"0":"1"}"
-        onclick="tkToggle(this)"><span class="bl">${on?"Turn ticketing off":"Turn ticketing on"}</span></button>`);
-  }
-  /* SAS-only machines (no G2S side at all) that ticket over SAS */
-  for(const [k,m] of sasList()){
-    if(sasShown.has(k)) continue;
-    const sasTk=sasTicketing(m);
-    if(sasTk) devRows.push(sasTicketChip(getNick(k)||(m||{}).smibId||k, sasTk));
-  }
-  setHTML($("tk-dev"), devRows.length
-    ?`<div class="chips" style="align-items:center">${devRows.join("")}</div>`:"");
 
   /* partial numbers filter the loaded pages client-side; a full-length
      number already went to the hosts' exact-match vid= lookups
@@ -5186,14 +5148,39 @@ function renderSettings(){
       ${tkHtml}</div>`);
   }
   /* Machines — every machine the hub knows, G2S + SAS; the SAS rows carry
-     the on/off switch (this is where a hidden machine gets re-enabled). */
+     the on/off switch (this is where a hidden machine gets re-enabled).
+     TICKETING lives here too (AJ 2026-11-16): each machine's ticketing
+     state, and the switch for a machine that tickets over G2S. It used to
+     head the Tickets page, but someone opens that to look a ticket up or
+     void one, not to see or set what a machine is doing — that is a
+     per-machine switch, and these are the per-machine switches.
+     A machine tickets through one system: when its linked SAS side carries
+     the tickets, the G2S row only says so and offers no switch, because the
+     G2S ticket device does not control anything there. */
   const rows=[];
   for(const e of egmList()){
     const s=snap(e);
+    const lk=(s.sasLink!==undefined)?sasLinkFace(e,s):"";
+    const leg=lk?((((S.status||{}).sas||{})[lk])||null):null;
+    const vd=s.voucherDevice;
+    let tk="", tkBtn="";
+    if(sasTicketing(leg)){
+      tk=tkLine(true,"tickets run over SAS — see "
+        +(getNick(lk)||leg.smibId||lk)+" below");
+    }else if(vd){
+      const on=String((vd.status||{}).hostEnabled)!=="false";
+      tk=tkLine(on, on?"ticketing on":"ticketing off");
+      tkBtn=`<button class="btn slim ${on?"danger":"gold"}" data-egm="${esc(e)}"
+          data-en="${on?"0":"1"}" onclick="tkToggle(this)">
+        <span class="bl">${on?"Turn ticketing off":"Turn ticketing on"}</span>
+        <span class="ba">${on?"pause tickets on this machine"
+                             :"tickets on this machine again"}</span></button>`;
+    }
     rows.push(`<div class="acct">
       <div class="an"><div class="nm">${esc(machineName(s,e))}</div>
-        <div class="kd">${esc(e)}</div></div>
+        <div class="kd">${esc(e)}</div>${tk}</div>
       ${chip("G2S","gold")}
+      ${tkBtn}
     </div>`);
   }
   /* Ticket-header lag note: a SAS satellite reports the rev it last APPLIED
@@ -5207,10 +5194,13 @@ function renderSettings(){
     const td=m.ticketData;
     const tkPend=tkRev!=null&&td&&typeof td==="object"
       &&!(typeof td.appliedRev==="number"&&td.appliedRev>=tkRev);
+    const sasTk=sasTicketing(m);      // null = no sign it tickets over SAS
     rows.push(`<div class="acct">
       <div class="an"><div class="nm">${esc(getNick(k)||m.smibId||k)}</div>
         <div class="kd">${esc(k)}</div>
         ${en?"":`<div class="kd" style="color:var(--dim)">SAS off — hidden from the floor</div>`}
+        ${sasTk?tkLine(sasTk.on, sasTk.on?"ticketing on"
+                                         :"ticketing off — "+sasTk.why):""}
         ${tkPend?`<div class="kd" style="color:var(--dim)">ticket header pending</div>`:""}</div>
       ${chip("SAS","gold")}
       <button class="btn slim ${en?"danger":"gold"}" onclick="sasEnabledToggle('${jsq(k)}',this)">
