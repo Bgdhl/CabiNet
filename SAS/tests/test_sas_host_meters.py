@@ -169,6 +169,30 @@ class TestSweepFlattenSnapshot:
         assert meters == EXPECTED_REPORT_METERS
         assert all(len(k) <= 16 for k in meters)
 
+    def test_report_says_when_the_machine_is_not_hearing_us(self, tmp_path):
+        """A machine sending its loop-break chirp is on, with SAS enabled,
+        and deaf to this Pi — the hub is told so (`chirping`) rather than
+        just "offline". One stray chirp is not enough: the first poll after
+        we have been quiet ourselves can collide with one."""
+        import sas_host
+        port = MockSASSerialPort(lambda f, w: b"")          # machine off
+        poller = SASPoller(port, address=ADDR)
+        reporter = HubReporter(
+            "http://hub.test", "smib-test", "(mock)", ADDR, poller,
+            {"last_meters": {}}, collections.deque(maxlen=20),
+            TicketStore(str(tmp_path / "tickets.json")))
+        poller.poll_once()
+        assert reporter.snapshot()["chirping"] is False     # plain silence
+        port.machine = lambda f, w: bytes([ADDR])           # on, but deaf
+        poller.poll_once()
+        assert reporter.snapshot()["chirping"] is False     # one is not enough
+        for _ in range(sas_host.CHIRP_MIN_RUN):
+            poller.poll_once()
+        snap = reporter.snapshot()
+        assert snap["chirping"] is True and snap["online"] is False
+        poller.state.last_chirp -= sas_host.CHIRP_FRESH_SEC + 1   # went quiet
+        assert reporter.snapshot()["chirping"] is False
+
     def test_unchanged_resweep_reports_free(self):
         machine, stats, clock, poller = make_rig()
         poller.poll_once()

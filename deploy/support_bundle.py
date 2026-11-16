@@ -75,6 +75,18 @@ DB_MAX_BYTES = 100 * 1024 * 1024   # skip a database bigger than this
 
 # localhost API calls must never detour through an http_proxy env var
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+# Optional hub login: on the hub itself, send the local-tool secret so the
+# bundle is still complete with the lock on (G2S/web_auth.py). Absent or
+# unreadable = no header, and a locked hub answers what it may.
+try:
+    with open(os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "G2S", "data", "hub_api_token"),
+            encoding="ascii") as _f:
+        _tok = _f.read().strip()
+    if _tok:
+        _OPENER.addheaders.append(("X-CabiNet-Token", _tok))
+except (OSError, UnicodeError):
+    pass
 
 
 def run_rc(cmd, timeout=20):

@@ -38,6 +38,13 @@ is what the hub runs for it (and you can run it by hand). It copies the hub's
 own SAS/ and Companion/ trees to that one Pi and restarts its service ONLY if a
 file's content differs, so the quiet split above cannot outlive a power-on.
 
+Nor does a machine that is switched off, or restarted, WHILE the update runs.
+The check afterwards judges what the update touched — the hub and the Pis —
+and rolls back on evidence that something broke, not on a machine being away:
+see verify(). (It used to roll the whole update back, database and all, when
+a machine that had been on was not on again 210 s later. A Bluebird 2 takes
+ten minutes to boot.)
+
 WHAT IT WILL NOT DO
 -------------------
   * It never touches `data/` — hub.db, voucher state, config inventory,
@@ -75,6 +82,8 @@ G2S_GATES = (
     "test_aft_push.py",
     "test_machine_linking.py",
     "test_satellite_catchup.py",
+    "test_web_auth.py",
+    "test_update_verify.py",
 )
 
 # Satellites get the whole SAS tree minus data/caches. It is a SET, not a file:
@@ -84,6 +93,13 @@ SAT_EXCLUDES = ("data/", "__pycache__/", "*.pyc", "logs/", "spec/", "tmp_stage_/
 # How long to let the floor come back before calling a restart failed. A real
 # AVP/BB2 rejoin has been measured at ~50 s; this is deliberately generous.
 REJOIN_TIMEOUT = 210
+REJOIN_GRACE = 90             # extra wait for a machine that is mid-join when
+#                               REJOIN_TIMEOUT runs out (it is talking to the
+#                               hub but not onLine yet)
+G2S_ALIVE_SEC = 35            # a joined G2S machine acks a keepAlive every 10 s;
+#                               one not heard from for this long is already
+#                               gone, whatever commsState still says (the hub
+#                               takes about a minute to demote it)
 
 
 # Everything under G2S/data/ is YOURS: wallets, tickets, transfers, the machine
@@ -477,12 +493,36 @@ def _adopt_inner(root, remote, assume_yes, snap, before):
     return snap
 
 
+def hub_token():
+    """The hub's local-tool secret (G2S/web_auth.py), or '' — sent as
+    X-CabiNet-Token so this script still sees the whole floor when the
+    optional hub login is turned on. Only whoever the hub runs as can read
+    the file."""
+    try:
+        with open(os.path.join(repo_root(), "G2S", "data",
+                               "hub_api_token"), encoding="ascii") as f:
+            return f.read().strip()
+    except (OSError, UnicodeError):
+        return ""
+
+
 def hub_status(hub_url, timeout=8):
     try:
-        with urllib.request.urlopen(hub_url + "/api/status", timeout=timeout) as r:
-            return json.load(r)
+        req = urllib.request.Request(hub_url + "/api/status")
+        tok = hub_token()
+        if tok:
+            req.add_header("X-CabiNet-Token", tok)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            st = json.load(r)
     except Exception as e:
         return {"__error__": str(e)}
+    if isinstance(st, dict) and st.get("loginRequired"):
+        # The signed-out display view: no satellite addresses, no readers.
+        # Acting on it would look like an empty floor — refuse instead.
+        return {"__error__": "the hub's login lock is on and this account "
+                "cannot read G2S/data/hub_api_token — run this as the "
+                "account the hub service runs as"}
+    return st
 
 
 def venv_python(root):
@@ -515,7 +555,17 @@ def find_satellites(status):
             continue
         seen.add(peer)
         out.append({"smibId": (ent or {}).get("smibId") or key.split("/")[0],
+                    # online = the SLOT MACHINE is answering its SAS polls.
+                    # reporting = the PI is talking to the hub. They are not
+                    # the same thing: a machine that is switched off sits
+                    # behind a perfectly healthy Pi (see verify()).
                     "peer": peer, "online": bool((ent or {}).get("online")),
+                    "reporting": not (ent or {}).get("stale"),
+                    "reportAgeSec": (ent or {}).get("reportAgeSec"),
+                    # heard = this satellite process has had at least one
+                    # answer from its machine since it started
+                    "heard": bool((ent or {}).get("online")) or
+                             (ent or {}).get("lastSeenAgoSec") is not None,
                     # the satellite REPORTS the account it runs as — never
                     # guess it. None on older satellites; sat_user() falls back.
                     "user": (ent or {}).get("sshUser") or None})
@@ -1368,6 +1418,9 @@ def restart_fleet(sats, comps, key, dry, touched=None):
         sat_clock(s["peer"], key, user=sat_user(s))
         sat_ssh(s["peer"], key, "sudo systemctl restart cabinet-sas",
                 user=sat_user(s))
+        # verify() wants a report from the NEW process, not the old one's
+        # last report still sitting fresh in the hub
+        s["restartedAt"] = time.time()
     for c in comps:
         say("   companion %s" % c["companionId"])
         if touched is not None:
@@ -1392,34 +1445,251 @@ def restart_fleet(sats, comps, key, dry, touched=None):
     run(["sudo", "systemctl", "restart", "cabinet-g2s"], timeout=120)
 
 
-def verify(hub_url, sats, machines, comps, dry):
+def _g2s_last_heard(status, egm):
+    """Hub-clock time this G2S machine was last heard from (a message or a
+    keepAlive ack), 0.0 if never."""
+    ent = status.get(egm) or {}
+    best = 0.0
+    for k in ("lastSeen", "lastKeepAlive"):
+        try:
+            best = max(best, float(ent.get(k) or 0.0))
+        except (TypeError, ValueError):
+            pass
+    return best
+
+
+def _hub_now(status):
+    """The hub's own clock if the status carries it (the updater may be
+    pointed at a hub on another box), else ours."""
+    try:
+        return float((status.get("tournament") or {}).get("serverNow")
+                     or time.time())
+    except (TypeError, ValueError):
+        return time.time()
+
+
+def rebaseline(hub_url, sats, machines, comps):
+    """Re-read the floor at the last moment before anything is restarted.
+
+    preflight() looked minutes ago, before the gates ran. A machine that was
+    switched off since then — or a Pi that went with it — is not something
+    the update did, and must not be waited for afterwards (2026-11-15: a BB2
+    was powered down 50 s before the satellite restart, and the whole update
+    was rolled back for it). Only ever NARROWS what verify() expects. Updates
+    the sats/comps dicts in place and returns the machines still joined."""
+    st = hub_status(hub_url)
+    if "__error__" in st:
+        return machines             # keep what preflight saw
+    now_s = {x["smibId"]: x for x in find_satellites(st)}
+    for s in sats:
+        cur = now_s.get(s["smibId"])
+        was = s.get("online")
+        if cur is None:
+            s["online"] = s["reporting"] = False
+        else:
+            s["reporting"] = bool(s.get("reporting", True)
+                                  and cur["reporting"])
+            s["online"] = bool(was and cur["online"] and s["reporting"])
+        if was and not s["online"]:
+            say("   (the machine on satellite %s stopped answering before "
+                "the restart — not waiting for it)" % s["smibId"])
+    now_c = {x["companionId"]: x for x in find_companions(st)}
+    for c in comps:
+        cur = now_c.get(c["companionId"])
+        c["fresh"] = bool(c.get("fresh") and cur and cur.get("fresh"))
+    joined, hub_now, keep = set(online_machines(st)), _hub_now(st), []
+    for m in machines:
+        heard = _g2s_last_heard(st, m)
+        if m in joined and (not heard or hub_now - heard <= G2S_ALIVE_SEC):
+            keep.append(m)
+        else:
+            say("   (%s went quiet before the restart — not waiting for it)"
+                % m)
+    return keep
+
+
+def pi_service_state(peer, key, unit, user=None):
+    """Is this Pi switched on? -> the unit's `systemctl is-active` word if it
+    answers ssh, None if it cannot be reached at all. No key = cannot tell,
+    which is reported as reachable so the caller stays strict."""
+    if not key:
+        return "unknown"
+    try:
+        rc, out = sat_ssh(peer, key, "systemctl is-active %s" % unit,
+                          check=False, timeout=20, user=user)
+    except Exception:               # TimeoutExpired: no answer
+        return None
+    if rc == 255:                   # ssh itself could not connect
+        return None
+    return ((out or "").strip().splitlines() or ["unknown"])[-1].strip()
+
+
+def verify(hub_url, sats, machines, comps, dry, key=None):
+    """Did the update leave the floor working?
+
+    Judged by what the update TOUCHED — the hub, the satellite Pis and the
+    reader Pis — and by evidence that it broke something, never by whether a
+    slot machine happens to be switched on. A machine being powered off does
+    not power off its Pi (2026-11-15: a BB2 was restarted during an update,
+    which takes it ten minutes, and this function rolled the whole update
+    back and restored the database although the hub and the Pi were both on
+    the new code and talking to each other).
+
+    Passes at once when everything that was up is up again. When the wait
+    runs out:
+
+      FAILS — roll back                      PASSES — with a warning
+      -----------------------------------    -------------------------------
+      the hub is not answering               a Pi that cannot be reached at
+      a Pi answers ssh but its service         all (switched off)
+        is not reporting to the hub          a SAS machine that answered the
+      a SAS machine that answered right        new code and THEN went quiet
+        up to the restart and has not        a G2S machine that has said
+        answered the new code ONCE             nothing since the restart
+      a G2S machine that is talking to
+        the hub and still cannot rejoin
+      two or more G2S machines were
+        joined and ALL went quiet
+
+    Why SAS and G2S differ on silence: over SAS the Pi does the asking, and a
+    machine that is on has to answer — so one that answered seconds ago and
+    is deaf to the new code is the update's doing (the QUIET failure in the
+    module docstring looks exactly like this). Over G2S the machine does the
+    asking, so one that says nothing is simply not there."""
     step("Verifying the floor came back")
     if dry:
         say("   (dry run — nothing to verify)")
         return True
     deadline = time.time() + REJOIN_TIMEOUT
-    want_m, want_s = set(machines), {s["smibId"] for s in sats if s["online"]}
+    want_m = set(machines)
+    # satellite Pis that were reporting, and the ones whose machine answered
+    want_p = {s["smibId"]: s for s in sats if s.get("reporting", s["online"])}
+    want_s = {s["smibId"] for s in sats
+              if s["online"] and s["smibId"] in want_p}
     # readers that were reporting before the update must report again after
-    want_c = {c["companionId"] for c in comps if c.get("fresh")}
-    last = ""
-    while time.time() < deadline:
+    want_c = {c["companionId"]: c for c in comps if c.get("fresh")}
+    v = {"last": "", "st": None, "first": None, "m": set(), "p": set(),
+         "s": set(), "c": set(), "heard": set()}
+
+    def read():
+        """One look at the hub. -> True when everything is back."""
         st = hub_status(hub_url)
-        if "__error__" not in st:
-            back_m = set(online_machines(st))
-            back_s = {x["smibId"] for x in find_satellites(st) if x["online"]}
-            back_c = {x["companionId"] for x in find_companions(st)
-                      if x.get("fresh")}
-            last = ("machines %d/%d back, satellites %d/%d online, "
-                    "readers %d/%d reporting"
-                    % (len(back_m & want_m), len(want_m),
-                       len(back_s & want_s), len(want_s),
-                       len(back_c & want_c), len(want_c)))
-            if want_m <= back_m and want_s <= back_s and want_c <= back_c:
-                say("   ✅ %s" % last)
-                return True
+        if "__error__" in st:
+            return False
+        v["st"] = st
+        if v["first"] is None:
+            v["first"] = {m: _g2s_last_heard(st, m) for m in want_m}
+        now = time.time()
+        v["m"] = set(online_machines(st)) & want_m
+        v["p"], v["s"] = set(), set()
+        for x in find_satellites(st):
+            s = want_p.get(x["smibId"])
+            if s is None or not x["reporting"]:
+                continue
+            # a satellite we restarted must be heard from SINCE the restart —
+            # the old process's last report is still fresh for a few seconds
+            since, age = s.get("restartedAt"), x.get("reportAgeSec")
+            if since and age is not None and age > now - since:
+                continue
+            v["p"].add(x["smibId"])
+            if x["smibId"] in want_s:
+                if x["online"]:
+                    v["s"].add(x["smibId"])
+                if x["heard"]:
+                    v["heard"].add(x["smibId"])
+        v["c"] = {x["companionId"] for x in find_companions(st)
+                  if x.get("fresh")} & set(want_c)
+        v["last"] = ("machines %d/%d back, satellites %d/%d online, "
+                     "readers %d/%d reporting"
+                     % (len(v["m"]), len(want_m), len(v["s"]), len(want_s),
+                        len(v["c"]), len(want_c)))
+        return (v["m"] == want_m and v["s"] == want_s
+                and v["p"] == set(want_p) and v["c"] == set(want_c))
+
+    def talking():
+        """G2S machines still out that the hub has heard from during the
+        wait — they are switched on and trying."""
+        if v["st"] is None or v["first"] is None:
+            return set()
+        return {m for m in want_m - v["m"]
+                if _g2s_last_heard(v["st"], m) > v["first"].get(m, 0.0)}
+
+    while time.time() < deadline:
+        if read():
+            say("   ✅ %s" % v["last"])
+            return True
         time.sleep(6)
-    say("   ❌ timed out after %ds — %s" % (REJOIN_TIMEOUT, last or "hub silent"))
-    return False
+    # A machine in the middle of joining when the clock ran out gets a
+    # little longer before it is called a failure.
+    grace = time.time() + REJOIN_GRACE
+    while talking() and time.time() < grace:
+        time.sleep(6)
+        if read():
+            say("   ✅ %s" % v["last"])
+            return True
+
+    if v["st"] is None:
+        say("   ❌ timed out after %ds — hub silent" % REJOIN_TIMEOUT)
+        return False
+
+    broken, away = [], []
+    for sid, s in sorted(want_p.items()):
+        if sid in v["p"]:
+            continue
+        state = pi_service_state(s["peer"], key, "cabinet-sas",
+                                 user=sat_user(s))
+        if state is None:
+            away.append("satellite %s (%s) cannot be reached — switched off?"
+                        % (sid, s["peer"]))
+        else:
+            broken.append("satellite %s (%s) is switched on but its SAS "
+                          "service is not reporting to the hub (service: %s)"
+                          % (sid, s["peer"], state))
+    for cid, c in sorted(want_c.items()):
+        if cid in v["c"]:
+            continue
+        state = pi_service_state(c["peer"], key, "cabinet-companion",
+                                 user=sat_user(c))
+        if state is None:
+            away.append("card reader %s (%s) cannot be reached — switched "
+                        "off?" % (c.get("name") or cid, c["peer"]))
+        else:
+            broken.append("card reader %s (%s) is switched on but is not "
+                          "reporting to the hub (service: %s)"
+                          % (c.get("name") or cid, c["peer"], state))
+    # SAS machines behind a Pi that IS back
+    for sid in sorted((want_s & v["p"]) - v["s"]):
+        where = "satellite %s (%s)" % (sid, want_p[sid]["peer"])
+        if sid in v["heard"]:
+            away.append("the machine on %s answered after the update and "
+                        "then stopped — switched off?" % where)
+        else:
+            broken.append("the machine on %s was answering right up to the "
+                          "restart and has not answered once since" % where)
+    chatty = talking()
+    for m in sorted(want_m - v["m"]):
+        if m in chatty:
+            broken.append("%s is talking to the hub but could not rejoin" % m)
+        else:
+            away.append("%s has said nothing to the hub since the restart — "
+                        "switched off, or still starting up?" % m)
+    if len(want_m) >= 2 and not v["m"] and not chatty:
+        broken.append("all %d G2S machines that were joined went quiet at "
+                      "once" % len(want_m))
+
+    if broken:
+        say("   ❌ timed out after %ds — %s" % (REJOIN_TIMEOUT, v["last"]))
+        for b in broken:
+            say("      • %s" % b)
+        return False
+    say("   ✅ the hub%s running and reporting (%s)"
+        % (", satellites and readers are" if (want_p or want_c) else " is",
+           v["last"]))
+    say("   ⚠️  not back yet, and not an update problem:")
+    for a in away:
+        say("      • %s" % a)
+    say("      Each one rejoins by itself when it is back on.")
+    return True
 
 
 def repair_upstream(root):
@@ -1611,7 +1881,7 @@ def rollback(root, old, sats, comps, key, hub_url, machines, snapshot=None,
         if restarted:
             restart_fleet(sats, comps, key, dry=False)
             hub_stopped = False
-            ok = verify(hub_url, sats, machines, comps, dry=False)
+            ok = verify(hub_url, sats, machines, comps, dry=False, key=key)
             back = ok
             say("\n   rollback %s. You are back on %s."
                 % ("succeeded" if ok else "restarted, but the floor did not "
@@ -1634,7 +1904,7 @@ def rollback(root, old, sats, comps, key, hub_url, machines, snapshot=None,
                             check=False, user=sat_user(c))
                 except Exception:   # hung reader must not abort a rollback
                     pass
-            ok = verify(hub_url, sats, machines, comps, dry=False)
+            ok = verify(hub_url, sats, machines, comps, dry=False, key=key)
             back = ok
             say("\n   rollback %s. You are back on %s."
                 % ("succeeded" if ok else "restarted the satellites, but the "
@@ -2159,9 +2429,13 @@ def main():
                                       touched=touched)
         pushed_comps = push_companions(root, comps, a.ssh_key, dry=False,
                                        touched=touched)
+        # the gates took minutes — look again, so a machine switched off
+        # in the meantime is not blamed on the update
+        machines = rebaseline(a.hub_url, sats, machines, comps)
         restart_fleet(pushed_sats, pushed_comps, a.ssh_key, dry=False,
                       touched=touched)
-        if not verify(a.hub_url, sats, machines, comps, dry=False):
+        if not verify(a.hub_url, sats, machines, comps, dry=False,
+                      key=a.ssh_key):
             raise Fail("the floor did not come back")
         # The host has now opened hub.db, so any migration has already run.
         # Prove the database survived it before calling this a success.

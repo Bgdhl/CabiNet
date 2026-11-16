@@ -115,7 +115,7 @@ def main():
     with hs.lock:
         ver = hs._conn.execute(
             "SELECT value FROM schema_meta WHERE key='version'").fetchone()
-    check("schema migrated to v14", int(ver["value"]) == SCHEMA_VERSION == 14,
+    check("schema migrated to v16", int(ver["value"]) == SCHEMA_VERSION == 16,
           ver["value"])
     # asset READ from the machine (1000 = e8 03 00 00 LE), registered
     hs.aft_upsert_observed("smib-bb2/1", "smib-bb2", 1, asset_number=1000,

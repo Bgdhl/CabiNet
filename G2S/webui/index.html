@@ -242,6 +242,8 @@
     #engine{display:none}
   }
 </style>
+<!-- on-screen keyboard for a hub with no physical one (touch kiosk) -->
+<script src="/webui/osk.js"></script>
 </head>
 <body>
 <header id="topbar">
@@ -283,6 +285,16 @@
 
 <script>
 "use strict";
+/* hub login: a signed-out call answers 401 {login:true} — go sign in. */
+(function(){
+  var f0=window.fetch.bind(window), gone=false;
+  window.fetch=function(i,o){return f0(i,o).then(function(r){
+    if(r.status===401&&!gone) r.clone().json().then(function(j){
+      if(j&&j.login===true){gone=true;
+        location.replace("/login?next="+encodeURIComponent(location.pathname+location.search));}
+    }).catch(function(){});
+    return r;});};
+})();
 const POLL_MS = 2000;
 
 /* Every action POST /api/command understands, straight from the host's

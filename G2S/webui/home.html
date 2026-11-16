@@ -185,6 +185,21 @@
     background:var(--inset);border:1px solid var(--line);color:var(--ivory);
     border-radius:9px;font:14px var(--mono);padding:10px 12px;min-height:44px}
   textarea{resize:vertical;line-height:1.5}
+  input[type=password]{background:var(--inset);border:1px solid var(--line);
+    color:var(--ivory);border-radius:9px;font:14px var(--mono);
+    padding:10px 12px;min-height:44px}
+  /* ---- hub login (optional lock) ---------------------------------------- */
+  #who{appearance:none;cursor:pointer;background:none;border:1px solid var(--line);
+    border-radius:999px;padding:5px 12px;font:600 12px var(--sans);
+    color:var(--dim);white-space:nowrap}
+  #who:hover{border-color:var(--gold);color:var(--gold-hi)}
+  body.role-normal .adminonly{display:none!important}
+  .lgrow{display:flex;align-items:center;gap:10px;padding:9px 0;
+    border-bottom:1px solid var(--line2);flex-wrap:wrap}
+  .lgrow .nm{font:600 14px var(--mono);flex:1;min-width:120px}
+  .lgrow .nm small{display:block;font:11px var(--sans);color:var(--faint)}
+  .lgform{display:grid;gap:8px;margin:8px 0 12px}
+  .lgform input,.lgform select{width:100%}
   input::placeholder,textarea::placeholder{color:var(--faint);font-family:var(--sans)}
   /* unknown-fob callout — a tap the hub couldn't match; click to register */
   .fobnew{appearance:none;width:100%;text-align:left;cursor:pointer;
@@ -412,6 +427,11 @@
     text-overflow:ellipsis;vertical-align:1px;
     background:linear-gradient(180deg,#2e2211,#271c0e)}
   .xm .ar{color:var(--felt);font-weight:700}
+  .tkreuse{display:flex;gap:10px;align-items:flex-start;margin:0 0 10px;padding:10px 12px;
+    background:var(--inset);border:1px solid var(--line);border-radius:12px;cursor:pointer}
+  .tkreuse input{width:20px;height:20px;margin:2px 0 0;flex:none;accent-color:var(--gold-hi)}
+  .tkreuse b{display:block;font-weight:600}
+  .tkreuse small{display:block;opacity:.7;font-size:12px;line-height:1.35;margin-top:2px}
   .vidbox{background:var(--inset);border:1px solid var(--line);border-radius:12px;
     padding:14px 12px;margin:0 auto;width:min(340px,86vw);text-align:center}
   .vidbox .vid{font:700 clamp(19px,5.2vw,26px) var(--mono);color:var(--gold-hi);
@@ -484,6 +504,8 @@
     display:flex;flex-direction:column;gap:8px;align-items:center;width:max-content;
     max-width:92vw;pointer-events:none}
   html.bottomnav #toasts{bottom:76px}
+  /* on-screen keyboard up (osk.js): messages sit above it, not under it */
+  html.osk-open #toasts{bottom:calc(var(--osk-h,260px) + 10px);z-index:1001}
   .toast{background:rgba(38,27,17,.96);border:1px solid var(--line);
     border-left:3px solid var(--felt);border-radius:10px;padding:11px 18px;
     font:13px var(--sans);box-shadow:0 8px 22px #000b;max-width:92vw}
@@ -511,6 +533,8 @@
     .brand .sub{display:none}
   }
 </style>
+<!-- on-screen keyboard for a hub with no physical one (touch kiosk) -->
+<script src="/webui/osk.js"></script>
 </head>
 <body>
 <header id="hdr">
@@ -518,6 +542,7 @@
   <nav id="tabs-top" aria-label="Pages"></nav>
   <span class="spacer"></span>
   <span id="poll"><span class="dot"></span><span id="poll-t">connecting…</span></span>
+  <button id="who" style="display:none" onclick="whoOpen()" aria-label="Your login"></button>
 </header>
 <div class="rule" aria-hidden="true"></div>
 
@@ -672,6 +697,11 @@
            operator's call, not ours. -->
       <div class="card"><h2>Updates <span class="hn" id="st-upd-n"></span></h2>
         <div class="body" id="st-updates"></div></div>
+      <!-- Hub login: the optional lock on these pages (web_auth.py). Hidden
+           until the hub answers /api/auth/state — an older hub has none. -->
+      <div class="card wide" id="card-login" style="display:none">
+        <h2>Hub login <span class="hn" id="st-login-n"></span></h2>
+        <div class="body" id="st-login"></div></div>
       <div class="card wide"><h2>Card readers</h2>
         <div class="body" id="st-readers"></div></div>
       <p class="none" style="grid-column:1/-1;margin:0">Cards and fobs live in
@@ -733,6 +763,28 @@
    SILENTLY — the Cage simply shows the voucher-only view, no chip.
    ====================================================================== */
 const POLL_MS = 2000;
+
+/* ---- hub login: signed out? go sign in --------------------------------------
+   With the hub's optional lock on, an API call from a browser whose session
+   ended (signed out elsewhere, timed out) answers 401 {login:true}. Every
+   fetch on this page passes through here, so whichever poll notices first
+   sends the tab to /login and brings it back to the same place after. */
+const fetch0=window.fetch.bind(window);
+let AUTH_GONE=false;
+window.fetch=async function(input, init){
+  const r=await fetch0(input, init);
+  if(r.status===401 && !AUTH_GONE){
+    let j={}; try{j=await r.clone().json();}catch(e){}
+    if(j&&j.login===true) goLogin();
+  }
+  return r;
+};
+function goLogin(){
+  if(AUTH_GONE) return;
+  AUTH_GONE=true;
+  location.replace("/login?next="+encodeURIComponent(
+    location.pathname+location.search+location.hash));
+}
 
 const TABS = [
   ["floor",    "🎰", "Floor"],
@@ -826,6 +878,15 @@ function parseDollars(v){
   if(!isFinite(n)||n<=0) return 0;
   return Math.round(n*100)*1000;
 }
+/* A SAS machine that is switched on but not hearing its satellite Pi sends
+   its own address over and over (the SAS "loop break" chirp); the satellite
+   reports that as chirping. It points at ONE half of the link — the wire
+   from the Pi's transmit pin to the machine — which plain "offline" never
+   could. */
+const SAS_DEAF_SHORT="machine is on but not hearing the Pi";
+const SAS_DEAF_LONG="The machine is switched on with SAS enabled, but the "
+  +"Pi's polls are not reaching it. Check the transmit side of the link: "
+  +"the wire from the Pi's TX pin, through the level shifter, to the machine.";
 function chip(txt, cls, title){
   /* optional title = hover detail (e.g. the raw G2S error code behind a
      machine-worded refusal); omitted everywhere else, so callers are
@@ -1254,6 +1315,11 @@ async function tickStatus(){
       const j=await r.json();
       if(mySeq!==statusSeq) return; // a newer poll superseded this one — drop the stale reply
       statusEtag=etKey;
+      /* hub login: the lock is on and this tab is signed out (timed out,
+         or signed out elsewhere). /api/status still answers — with the
+         cut-down view the wall board gets — so say so and go sign in
+         rather than paint a half-empty floor. */
+      if(j&&j.loginRequired===true){goLogin(); return;}
       S.status=j;
       S.statusErr=false;
       uiStampCheck(j.uiStamp);
@@ -1406,7 +1472,7 @@ async function fetchTickets(append){
     if(append) S.tk.list=S.tk.list.concat(rows);
     else {S.tk.list=rows; S.tk.offset=0;}
     if(S.tab==="tickets") renderTickets();
-    if(S.modal && S.modal.kind==="ticket") renderTicketModal(S.modal.id);
+    if(S.modal && S.modal.kind==="ticket" && !ARM) renderTicketModal(S.modal.id);
   }catch(e){}
 }
 async function fetchTito(append){
@@ -1582,7 +1648,8 @@ function sasTile(key,m){
     ?fmtAmt(nCred*denom*1000):null;
   const lamp=m.stale?"STALE":(m.online?"LIVE":"OFFLINE");
   const sub=m.stale?`silent — last report ${Math.round(m.reportAgeSec||0)}s ago`
-                   :(m.online?"on the floor":"waiting for the machine");
+                   :(m.online?"on the floor"
+                     :(m.chirping?SAS_DEAF_SHORT:"waiting for the machine"));
   /* enable/disable machine — two-step on the way off, instant back on
      (mirrors the G2S cabinet toggle). SAS never reports an authoritative
      enabled/disabled state, so the face is the hub-remembered
@@ -2061,6 +2128,8 @@ function floorTile(s){
     const legOn=!!(leg&&leg.online&&!leg.stale);
     st.push(chip("🔗 SAS "+(leg?(getNick(linked)||leg.smibId||linked):linked),
       leg?(legOn?"ok":"bad"):"warn"));
+    if(leg&&!legOn&&!leg.stale&&leg.chirping)
+      st.push(chip("SAS: "+SAS_DEAF_SHORT,"bad",SAS_DEAF_LONG));
   }
 
   /* jackpot banners — one per pending handpay, reset-to-credits headline.
@@ -4322,7 +4391,7 @@ function voucherRow(v){
       <span class="st ${esc(v.state)}"></span>
       <span class="ta">${esc(fmtAmt(v.amountMillicents))}</span>
       <span class="ti"><span class="id">${esc(fmtVid(v.validationId))}</span>
-        <span class="mt">${esc(machineName(snap(v.egmId),v.egmId))} · ${esc(stateLabel(v.state))}</span>
+        <span class="mt">${esc(machineName(snap(v.egmId),v.egmId))} · ${esc(stateLabel(v.state))}${tkReuseTag(v)}</span>
         ${cross?xmBadge(v.egmId,v.redeemedBy):""}</span>
       <span class="tst">${esc(v.issuedAt?ago(v.issuedAt):"")}</span>
     </button>`;
@@ -4341,10 +4410,72 @@ function hubRow(t){
       <span class="ta">${esc(fmtAmt(t.amountMc))}</span>
       <span class="ti"><span class="id">${esc(fmtVid(t.canonical))}</span>
         <span class="mt">${esc(titoName(t.origin))} · ${esc(stateLabel(t.state))}${
-          pendAt?" · redeeming at "+esc(titoName(t.pending.machine)):""}</span>
+          pendAt?" · redeeming at "+esc(titoName(t.pending.machine)):""}${tkReuseTag(t)}</span>
         ${cross?xmBadge(t.origin,t.redeemedBy):""}</span>
       <span class="tst">${esc(when?ago(when):"")}</span>
     </button>`;
+}
+/* ---- operator ticket controls (GitHub #10) -------------------------------
+   Two controls on every ticket: "Set back to Issued" (use the same paper
+   again once) and a "Reusable ticket" checkbox (it goes back to Issued by
+   itself after every redemption). Both are feature-detected on the record
+   carrying a `reusable` key — an older hub simply shows neither. */
+function tkReuseTag(t){
+  if(!t||!t.reusable) return "";
+  return " · reusable"+(t.uses?" ×"+esc(String(t.uses)):"");
+}
+function tkControls(t, kind, reissuable, attrs){
+  // kind: "hub" (tito ledger) | "g2s" (voucher store); attrs = data-* string
+  if(!t||!("reusable" in t)) return "";
+  if(!isAdmin()) return "";      // hub login: reissue/reusable are admin-only
+  return `
+    <label class="tkreuse"><input type="checkbox" ${t.reusable?"checked":""} ${attrs}
+        onchange="tkReuse(this,'${kind}')">
+      <span><b>Reusable ticket</b>
+        <small>Goes back to Issued every time it is redeemed, and never expires.
+        Use it for tickets you hand out again and again.</small></span></label>
+    ${reissuable?`<button class="btn" style="width:100%;text-align:center;margin:0 0 10px" ${attrs}
+      onclick="tkReissue(this,'${kind}')">
+      <span class="bl">Set back to Issued</span>
+      <span class="ba">the same paper can be redeemed again</span></button>`:""}`;
+}
+async function tkOp(kind, op, d, reusable){
+  /* ONE door for both ledgers: POST /api/tito/<reissue|reusable>. The hub
+     routes a G2S voucher's 18-digit id to the voucher store and anything
+     else to the tito ledger — and it works with the ticket's machine
+     switched off. Returns {ok, j} or {ok:false, msg}. */
+  try{
+    const body={smibId:"webui", address:0};
+    if(kind==="hub") body.vn16=d.vn; else body.canonical=d.vid;
+    if(op==="reusable") body.reusable=reusable;
+    const r=await fetch("/api/tito/"+op,{method:"POST",
+      headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
+    const j=await r.json().catch(()=>null);
+    if(r.status===404&&!j) return {ok:false, msg:"Awaiting host update"};
+    return j&&j.ok?{ok:true, j}:{ok:false, msg:String((j&&j.error)||("HTTP "+r.status)).slice(0,160)};
+  }catch(e){return {ok:false, msg:"Host unreachable — nothing was changed"};}
+}
+function tkAfter(kind, id){
+  if(kind==="hub"){ if(S.modal&&S.modal.kind==="htk") renderHubTicketModal(id); }
+  else if(S.modal&&S.modal.kind==="ticket") renderTicketModal(id);
+  S.tk.at=0; S.tk.offset=0; fetchTito(false); fetchTickets(false);
+}
+async function tkReissue(btn, kind){
+  if(!armCheck(btn,"set this ticket back to Issued")) return;
+  const d=btn.dataset, id=kind==="hub"?d.cid:d.vid;
+  const r=await tkOp(kind,"reissue",d);
+  TKV={id, ok:r.ok, msg:r.ok?"Set back to Issued ✓"+(r.j&&r.j.prior
+      ?" — was "+stateLabel(r.j.prior):""):"Not changed · "+r.msg};
+  flash(btn, r.ok);
+  tkAfter(kind, id);
+}
+async function tkReuse(box, kind){
+  const d=box.dataset, id=kind==="hub"?d.cid:d.vid, want=box.checked;
+  const r=await tkOp(kind,"reusable",d,want);
+  if(!r.ok) box.checked=!want;       // the server said no — show the truth
+  TKV={id, ok:r.ok, msg:r.ok?(want?"Reusable ✓ — it goes back to Issued after each use"
+      :"Single-use ✓ — the next redemption consumes it"):"Not changed · "+r.msg};
+  tkAfter(kind, id);
 }
 function fmtVid(v){
   const s=String(v||"");
@@ -4375,6 +4506,8 @@ function renderTicketModal(vid){
     ["redeemed",v.redeemedAt?clock(v.redeemedAt)+" · "+ago(v.redeemedAt):"—"],
     ["voided",v.voidedAt?clock(v.voidedAt):"—"],
     ["transaction",v.transactionId||"—"]];
+  if(v.uses) rows.push(["times redeemed",String(v.uses)]);
+  const vAttrs=`data-egm="${esc(v.egmId||"")}" data-vid="${esc(vid)}"`;
   setHTML($("m-body"),`
     <div style="text-align:center;margin:0 0 12px">
       <div style="font:700 36px var(--display);color:var(--gold-hi)">${esc(fmtAmt(v.amountMillicents))}</div>
@@ -4387,10 +4520,13 @@ function renderTicketModal(vid){
       onclick="vidCopy('${esc(vid)}')"><span class="bl">Copy number</span></button>
     <div class="kv" style="margin:14px 0">${rows.map(([k,val])=>
       `<div class="k">${esc(k)}</div><div class="v">${esc(val)}</div>`).join("")}</div>
+    ${tkControls(v,"g2s",["redeemed","void","expired"].includes(v.state),vAttrs)}
     ${v.state==="issued"?`<button class="btn danger" style="width:100%;text-align:center"
       data-egm="${esc(v.egmId||"")}" data-vid="${esc(vid)}" onclick="tkVoid(this)">
       <span class="bl">Void this ticket</span>
-      <span class="ba">redemption will refuse it</span></button>`:""}`);
+      <span class="ba">redemption will refuse it</span></button>`:""}
+    ${TKV.id===vid&&TKV.msg?`<p class="none" style="margin:10px 0 0${
+      TKV.ok?"":";color:var(--ruby);font-style:normal"}">${esc(TKV.msg)}</p>`:""}`);
 }
 async function vidCopy(vid){
   /* the printed barcode is what phones scan — here the 18 digits themselves
@@ -4437,7 +4573,9 @@ function renderHubTicketModal(cid){
     rows.push(["redeem pending",titoName(t.pending.machine)
       +(t.pending.at?" · "+clock(t.pending.at):"")]);
   if(t.vn16) rows.push(["system id (vn16)",fmtVid(t.vn16)]);
+  if(t.uses) rows.push(["times redeemed",String(t.uses)]);
   const voidable=t.state==="issued"||t.state==="redeemPending";
+  const hAttrs=`data-vn="${esc(t.vn16||t.canonical)}" data-cid="${esc(t.canonical)}"`;
   setHTML($("m-body"),`
     <div style="text-align:center;margin:0 0 12px">
       <div style="font:700 36px var(--display);color:var(--gold-hi)">${esc(fmtAmt(t.amountMc))}</div>
@@ -4451,6 +4589,7 @@ function renderHubTicketModal(cid){
       onclick="vidCopy('${jsq(t.canonical)}')"><span class="bl">Copy number</span></button>
     <div class="kv" style="margin:14px 0">${rows.map(([k,val])=>
       `<div class="k">${esc(k)}</div><div class="v">${esc(val)}</div>`).join("")}</div>
+    ${tkControls(t,"hub",["redeemed","void","expired","minted"].includes(t.state),hAttrs)}
     ${voidable?`<button class="btn danger" style="width:100%;text-align:center"
       data-vn="${esc(t.vn16||t.canonical)}" data-cid="${esc(t.canonical)}" onclick="tkVoidHub(this)">
       <span class="bl">Void this ticket</span>
@@ -6049,9 +6188,256 @@ document.addEventListener("keydown",e=>{
   else if(GM.egm) closeGames();   // Esc backs out of a machine's game library
 });
 
+/* ======================================================================
+   HUB LOGIN — the optional lock (web_auth.py). /api/auth/state says whether
+   it is on and who this browser is. Lock off: role is "admin" for everyone,
+   exactly as before. An older hub 404s the endpoint: nothing here shows.
+   The HUB enforces every rule; hiding a tab or a button from a normal login
+   is only so they are not offered things that would be refused.
+   ====================================================================== */
+const AUTH={known:false, required:false, signedIn:false, user:null,
+            role:"admin", idleMin:30, logins:null, me:null};
+const ADMIN_TABS=["settings","debug"];
+function isAdmin(){return AUTH.role==="admin";}
+async function authTick(){
+  try{
+    const r=await fetch("/api/auth/state",{cache:"no-store"});
+    if(!r.ok) return;
+    const j=await r.json();
+    if(j.required&&!j.signedIn){goLogin(); return;}
+    AUTH.known=true; AUTH.required=!!j.required; AUTH.signedIn=!!j.signedIn;
+    AUTH.user=j.user||null; AUTH.role=j.role||"normal";
+    if(typeof j.idleMin==="number") AUTH.idleMin=j.idleMin;
+    authApply();
+  }catch(e){}
+}
+function authApply(){
+  document.body.classList.toggle("role-normal", !isAdmin());
+  const w=$("who");
+  if(AUTH.signedIn&&AUTH.user){
+    w.style.display="";
+    w.textContent="👤 "+AUTH.user+(isAdmin()?"":" · normal");
+  }else w.style.display="none";
+  for(const el of document.querySelectorAll("#tabs-top .tab,#tabbar .tab"))
+    if(ADMIN_TABS.includes(el.dataset.tab))
+      el.style.display=isAdmin()?"":"none";
+  if(!isAdmin()&&ADMIN_TABS.includes(S.tab)) goTab("floor");
+  $("card-login").style.display=(AUTH.known&&isAdmin())?"":"none";
+  if(AUTH.known&&isAdmin()&&AUTH.logins===null) loginsFetch();
+  renderLogin();
+}
+/* Using the page keeps you signed in; just leaving it open does not. The
+   hub ignores background polls when it counts idle time, so a tap or a key
+   says "someone is here" — at most once a minute. */
+let authTouchAt=Date.now();
+function authTouch(){
+  if(!AUTH.required||!AUTH.signedIn||Date.now()-authTouchAt<60000) return;
+  authTouchAt=Date.now();
+  fetch("/api/auth/touch",{method:"POST",
+    headers:{"Content-Type":"application/json"},body:"{}"}).catch(()=>{});
+}
+document.addEventListener("pointerdown",authTouch,true);
+document.addEventListener("keydown",authTouch,true);
+
+async function authPost(verb, body){
+  try{
+    const r=await fetch("/api/auth/"+verb,{method:"POST",
+      headers:{"Content-Type":"application/json"},body:JSON.stringify(body||{})});
+    const j=await r.json().catch(()=>({}));
+    if(j.ok===true) return j;
+    return {ok:false,error:String(j.error||("HTTP "+r.status))};
+  }catch(e){return {ok:false,error:"Hub unreachable"};}
+}
+async function loginsFetch(){
+  try{
+    const r=await fetch("/api/auth/logins",{cache:"no-store"});
+    if(!r.ok) return;
+    const j=await r.json();
+    AUTH.logins=j.logins||[]; AUTH.me=j.me||null;
+    AUTH.required=!!j.required;
+    if(typeof j.idleMin==="number") AUTH.idleMin=j.idleMin;
+    renderLogin();
+  }catch(e){}
+}
+function renderLogin(){
+  const box=$("st-login"); if(!box||!AUTH.known||!isAdmin()) return;
+  if(ARM && box.contains(ARM.btn)) return;
+  if(box.contains(document.activeElement)&&
+     /^(INPUT|SELECT)$/.test(document.activeElement.tagName)) return;
+  const L=AUTH.logins||[];
+  const admins=L.filter(l=>l.role==="admin").length;
+  setHTML($("st-login-n"), AUTH.required?"ON":"off");
+  const rows=L.map(l=>`
+    <div class="lgrow"><span class="nm">${esc(l.username)}
+        <small>${l.role==="admin"?"Admin — everything":"Normal — runs the floor"}${
+          l.lastLoginAt?" · last signed in "+esc(ago(l.lastLoginAt)):" · never signed in"}</small></span>
+      <button class="btn slim" onclick="loginEdit('${jsq(l.username)}')">
+        <span class="bl">Change</span></button>
+      <button class="btn slim danger" onclick="loginDelete(this,'${jsq(l.username)}')">
+        <span class="bl">Delete</span></button></div>`).join("");
+  setHTML(box,`
+    <p class="none" style="margin:0 0 10px">${AUTH.required
+      ?"These pages need a sign-in. Machines, satellites, the screens on the machines and the wall board carry on without one."
+      :"Off — anyone who can reach this hub on the network can use these pages, as always. Turn the lock on to require a sign-in."}</p>
+    ${rows||'<p class="none" style="margin:0 0 10px">No logins yet. Add an admin login first.</p>'}
+    <div class="btnrow" style="margin-top:12px">
+      <button class="btn slim gold" onclick="loginEdit('')">
+        <span class="bl">Add a login</span></button>
+      ${AUTH.required
+        ?`<button class="btn slim danger" onclick="lockOff(this)">
+            <span class="bl">Turn the lock off</span></button>`
+        :`<button class="btn slim${admins?" gold":""}" onclick="lockOnOpen()" ${admins?"":"disabled"}>
+            <span class="bl">Turn the lock on</span></button>`}
+    </div>
+    <div class="lgrow" style="border:0;margin-top:6px">
+      <span class="nm" style="font-family:var(--sans)">Sign out after no use for
+        <small>Looking at the page does not count as use — tapping or typing does.</small></span>
+      <select id="lg-idle" onchange="idleSet(this)" aria-label="Sign out after">
+        ${[[15,"15 minutes"],[30,"30 minutes"],[60,"1 hour"],[240,"4 hours"],
+           [720,"12 hours"],[0,"Never"]].concat(
+            [15,30,60,240,720,0].includes(AUTH.idleMin)?[]:[[AUTH.idleMin,AUTH.idleMin+" minutes"]])
+          .map(o=>`<option value="${o[0]}" ${o[0]===AUTH.idleMin?"selected":""}>${o[1]}</option>`).join("")}
+      </select></div>
+    <p class="none" style="margin:8px 0 0">Locked out? On the hub itself run
+      <code>python3 G2S/tools/hub_login.py</code> — it can reset a password or turn the lock off.
+      The lock keeps people out of these pages; it does not encrypt the connection, and it
+      does not stop a device on the slot network from talking to the hub the way a machine does.</p>`);
+}
+/* Enter in one of the login forms presses that form's main button — the
+   on-screen keyboard covers the button on the hub's small touchscreen. */
+function lgEnter(e){
+  if(e.key!=="Enter"||e.target.tagName!=="INPUT") return;
+  const b=$("m-body").querySelector("button[data-enter]");
+  if(b&&!b.disabled){e.preventDefault(); b.click();}
+}
+function loginEdit(name){
+  const cur=(AUTH.logins||[]).find(l=>l.username===name)||null;
+  S.modal={kind:"login", id:name};
+  $("m-title").textContent=cur?("Login — "+name):"Add a login";
+  setHTML($("m-body"),`
+    <div class="lgform" onkeydown="lgEnter(event)">
+      ${cur?"":`<input type="text" id="lg-user" maxlength="32" autocapitalize="none"
+        autocomplete="off" spellcheck="false" placeholder="username (lowercase)" aria-label="Username">`}
+      <select id="lg-role" aria-label="Kind of login">
+        <option value="normal" ${cur&&cur.role==="normal"?"selected":""}>Normal — see everything, run the floor day to day</option>
+        <option value="admin" ${!cur||cur.role==="admin"?"selected":""}>Admin — everything, including settings and logins</option>
+      </select>
+      <input type="password" id="lg-pw" maxlength="128" autocomplete="new-password"
+        placeholder="${cur?"new password (blank = keep)":"password (8 or more characters)"}" aria-label="Password">
+      <input type="password" id="lg-pw2" maxlength="128" autocomplete="new-password"
+        placeholder="password again" aria-label="Password again">
+    </div>
+    <p class="none" style="margin:0 0 10px">A normal login can clear handpays, void tickets,
+      lock and unlock machines and load credits. Settings, logins, players and cards,
+      updates, forgetting machines and reusable tickets need an admin.${
+      cur?" A new password signs that login out everywhere.":""}</p>
+    <div class="btnrow"><button class="btn slim gold" data-enter onclick="loginSave(this,'${jsq(name)}')">
+      <span class="bl">${cur?"Save":"Add login"}</span></button></div>`);
+  $("modal").classList.add("on");
+}
+async function loginSave(btn, name){
+  const user=name||(($("lg-user")||{}).value||"").trim().toLowerCase();
+  const pw=$("lg-pw").value, pw2=$("lg-pw2").value;
+  if(!user){toast("Enter a username",false); return;}
+  if(pw!==pw2){toast("The two passwords do not match",false); return;}
+  if(!name&&!pw){toast("Enter a password",false); return;}
+  const body={action:"set", username:user, role:$("lg-role").value};
+  if(pw) body.password=pw;
+  btn.disabled=true;
+  const j=await authPost("logins", body);
+  btn.disabled=false;
+  if(!j.ok){toast("Login not saved · "+j.error.slice(0,120),false); return;}
+  toast(name?"Login saved ✓":"Login added ✓",true);
+  closeModal(); await loginsFetch(); authTick();
+}
+async function loginDelete(btn, name){
+  if(!armCheck(btn,"delete login "+name)) return;
+  const j=await authPost("logins",{action:"delete",username:name});
+  if(!j.ok) toast("Not deleted · "+j.error.slice(0,120),false);
+  else toast("Login deleted ✓",true);
+  await loginsFetch(); authTick();
+}
+function lockOnOpen(){
+  S.modal={kind:"lockon"};
+  $("m-title").textContent="Turn the lock on";
+  setHTML($("m-body"),`
+    <p class="none" style="margin:0 0 10px">Sign in with an admin login to turn the lock on.
+      This proves the login works before anything is locked, and keeps this browser signed in.
+      Every other browser — and the hub's own touchscreen — will be asked to sign in.</p>
+    <div class="lgform" onkeydown="lgEnter(event)">
+      <input type="text" id="lk-user" maxlength="32" autocapitalize="none" autocomplete="username"
+        spellcheck="false" placeholder="admin username" aria-label="Admin username">
+      <input type="password" id="lk-pw" maxlength="128" autocomplete="current-password"
+        placeholder="password" aria-label="Password">
+    </div>
+    <div class="btnrow"><button class="btn slim gold" data-enter onclick="lockOn(this)">
+      <span class="bl">Turn the lock on</span></button></div>`);
+  $("modal").classList.add("on");
+}
+async function lockOn(btn){
+  btn.disabled=true;
+  const j=await authPost("config",{required:true,
+    username:$("lk-user").value.trim().toLowerCase(), password:$("lk-pw").value});
+  btn.disabled=false;
+  if(!j.ok){toast("Lock not turned on · "+j.error.slice(0,140),false); return;}
+  toast("The lock is on ✓",true);
+  closeModal(); AUTH.logins=null; await authTick();
+}
+async function lockOff(btn){
+  if(!armCheck(btn,"anyone on the network can use these pages")) return;
+  const j=await authPost("config",{required:false});
+  if(!j.ok) toast("Lock not turned off · "+j.error.slice(0,120),false);
+  else toast("The lock is off",true);
+  AUTH.logins=null; await authTick();
+}
+async function idleSet(sel){
+  const j=await authPost("config",{idleMin:Number(sel.value)});
+  if(!j.ok) toast("Not saved · "+j.error.slice(0,120),false);
+  else{AUTH.idleMin=Number(sel.value); toast("Saved ✓",true);}
+  sel.blur(); renderLogin();
+}
+/* the 👤 chip: who you are, change your password, sign out */
+function whoOpen(){
+  S.modal={kind:"who"};
+  $("m-title").textContent="Signed in as "+(AUTH.user||"");
+  setHTML($("m-body"),`
+    <p class="none" style="margin:0 0 10px">${isAdmin()
+      ?"Admin login — everything."
+      :"Normal login — you can see everything and run the floor day to day. Settings and setup need an admin."}</p>
+    <div class="lgform" onkeydown="lgEnter(event)">
+      <input type="password" id="pw-cur" maxlength="128" autocomplete="current-password"
+        placeholder="current password" aria-label="Current password">
+      <input type="password" id="pw-new" maxlength="128" autocomplete="new-password"
+        placeholder="new password (8 or more characters)" aria-label="New password">
+      <input type="password" id="pw-new2" maxlength="128" autocomplete="new-password"
+        placeholder="new password again" aria-label="New password again">
+    </div>
+    <div class="btnrow">
+      <button class="btn slim" data-enter onclick="pwChange(this)"><span class="bl">Change password</span></button>
+      <button class="btn slim gold" onclick="signOut()"><span class="bl">Sign out</span></button>
+    </div>`);
+  $("modal").classList.add("on");
+}
+async function pwChange(btn){
+  const a=$("pw-new").value;
+  if(a!==$("pw-new2").value){toast("The two new passwords do not match",false); return;}
+  btn.disabled=true;
+  const j=await authPost("password",{current:$("pw-cur").value, "new":a});
+  btn.disabled=false;
+  if(!j.ok){toast("Password not changed · "+j.error.slice(0,120),false); return;}
+  toast("Password changed ✓ — other browsers using this login were signed out",true);
+  closeModal();
+}
+async function signOut(){
+  await authPost("logout",{});
+  location.replace("/login?next="+encodeURIComponent(location.pathname+location.search));
+}
+
 /* ---- boot ---------------------------------------------------------------- */
 applyLayout();
 buildTabs();
+authTick();
+setInterval(authTick, 60000);
 {
   // stale bookmarks (e.g. the retired #games tab) fall through to #floor
   const h=(location.hash||"").replace("#","");

@@ -116,6 +116,14 @@ class MachineState:
     # address ORed with 0x80 (spec Table 7.4b ACK/NACK byte). Counted, never
     # dispatched as an exception — see the guard in _general_poll.
     nacks: int = 0
+    # Loop-break chirps (SAS 6.02 §4.2): a machine that has heard NO address
+    # byte for five seconds transmits its own address, unprompted, every
+    # 200 ms. It is not an answer — it means our polls are not reaching the
+    # machine. chirp_run counts the ones seen since the machine last
+    # answered; see _is_chirp.
+    chirps: int = 0
+    chirp_run: int = 0
+    last_chirp: float = 0.0
     meters: Dict[str, object] = field(default_factory=dict)
     # Long-poll results delivered via a GENERAL poll (guide §3 p.8 — e.g. the
     # 0x21 ROM signature, §4.3), keyed by command byte.
@@ -186,14 +194,24 @@ class SASPoller:
         - POLL-CYCLE SYNC (spec §3.3): after startup or a 5 s comms gap, the
           machine ignores polls to its own address until it sees a poll to a
           DIFFERENT address. We send an address-0 poll (0x80, nobody answers)
-          before the first real poll and after any offline period.
+          before the first real poll and before EVERY poll for as long as
+          the machine is not answering.
+          It has to be every poll, not one: the machine needs to see it
+          AFTER it has come back, and we cannot know when that is. Until
+          2026-11-15 this sent exactly one, the moment the machine went
+          offline — i.e. to a machine that was switched off — and then
+          polled its own address forever. A machine that then finished
+          booting never answered again until the service was restarted
+          (which sends a fresh one). BENCH-PROVEN on a BB2 that day: 25
+          polls to address 1 alone, no answer; ONE poll to address 0, and
+          address 1 answered the very next poll.
         - IMPLIED ACK (spec §3.1-3.2): a general-poll response is acknowledged
           ONLY by a long poll to the same machine OR a poll to a different
           address. Repeating the same general poll is an implied NACK that
           tells the machine to RE-SEND the same exception. So between drained
           exceptions we issue an address-0 poll to ACK, not a bare re-poll.
         """
-        if not self.state.synced:
+        if not self.state.synced or not self.state.online:
             self._ack_poll()                 # sync to the polling cycle
             self.state.synced = True
 
@@ -233,6 +251,9 @@ class SASPoller:
         self.state.polls += 1
         if not resp:
             self._register_miss()
+            return None
+        if self._is_chirp(resp):
+            self._register_chirp()
             return None
         self._register_answer()
         if len(resp) > 1:
@@ -290,6 +311,9 @@ class SASPoller:
             self.state.polls += 1
             if not resp:
                 self._register_miss()
+                return
+            if self._is_chirp(resp):
+                self._register_chirp()
                 return
             self._register_answer()
             if len(resp) > 1:
@@ -468,9 +492,48 @@ class SASPoller:
             self._safe(self.on_handpay_info, self.address, info)
         return not empty
 
+    def _is_chirp(self, resp: bytes) -> bool:
+        """Is this the machine's loop-break chirp rather than an answer?
+
+        SAS 6.02 §4.2: a machine that has not received any address byte for
+        five seconds transmits its OWN ADDRESS every 200 ms until it hears
+        one. So while we are polling, a chirp says one thing only: the
+        machine is switched on with SAS enabled at this address, and nothing
+        we send is reaching it (the Pi -> machine half of the link).
+
+        Until 2026-11-15 a chirp landing in a read window was taken for an
+        answer: the machine was shown ONLINE and "exception 0x01" was
+        dispatched, or several of them failed CRC as a bogus long-poll
+        result. Counted as an answer it can also never go offline, which is
+        the worst possible report for a link that is half dead.
+
+        One byte equal to our address is a chirp unless that value is also a
+        documented exception code (it cannot be told apart at addresses
+        0x11 and up, so there it stays an exception, as before). Two or more
+        bytes that are ALL our address are always a chirp: no exception is
+        longer than one byte and no long-poll result looks like that."""
+        if not resp or any(b != self.address for b in resp):
+            return False
+        return len(resp) > 1 or self.address not in EXCEPTIONS
+
+    def _register_chirp(self) -> None:
+        st = self.state
+        now = self.clock()
+        st.chirps += 1
+        st.chirp_run += 1
+        if st.chirp_run == 1:
+            logging.getLogger("sas.poller").warning(
+                "addr %d is CHIRPING its own address (SAS loop break): the "
+                "machine is on, but it is not hearing our polls — check the "
+                "transmit side of the link (Pi TX -> machine RX)",
+                self.address)
+        st.last_chirp = now
+        self._register_miss()               # it did not answer the poll
+
     def _register_answer(self) -> None:
         self.state.answers += 1
         self.state.misses = 0
+        self.state.chirp_run = 0
         self.state.last_seen = self.clock()
         if not self.state.online:
             self.state.online = True

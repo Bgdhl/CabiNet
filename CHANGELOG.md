@@ -1,5 +1,81 @@
 # Changelog
 
+## v0.3.4
+- **Use a ticket again.** Open any ticket on the Tickets page and press
+  **Set back to Issued**: the same paper can be redeemed once more. It
+  works on redeemed, voided and expired tickets, and on a ticket stuck at
+  "minted" because the hub never heard it print. It is refused while a
+  machine is in the middle of redeeming that ticket.
+- **Reusable tickets.** Tick **Reusable ticket** on a ticket and it goes
+  back to Issued by itself every time it is redeemed, so you can keep a
+  stack of round-number tickets to hand out. A reusable ticket never
+  expires, the list shows how many times it has been used, and unticking
+  the box makes the next redemption use it up. Both controls work for
+  tickets printed over SAS and over G2S, and with the machine that
+  printed them switched off.
+- **SAS comes back by itself after a machine restart.** After a slot
+  machine was switched off and on, its SAS link could stay dead until the
+  satellite's SAS service was restarted by hand, so the machine showed
+  offline with no validation ID or AFT registration. A machine that has
+  just started ignores the satellite until it sees one poll addressed to
+  a different machine. The satellite sent that poll once, at the moment
+  the machine went off, and never again. It now sends it with every poll
+  for as long as the machine is silent, so the machine is picked up within
+  a second of being ready.
+- **The Floor says when a machine cannot hear its Pi.** A machine that is
+  switched on but receiving nothing from the satellite sends a "nobody is
+  talking to me" signal. The hub used to read that as the machine being
+  online. It now shows **machine is on but not hearing the Pi**, which
+  points at one half of the link: the wire from the Pi's transmit pin,
+  through the level shifter, to the machine.
+- **Removed the serial "watchdog".** It reopened the satellite's serial
+  port whenever a machine was silent, on the belief that the Pi had stopped
+  receiving. That was never the cause (see the item above), it never
+  brought a link back, and it reopened the port every 15 to 60 seconds for
+  as long as a machine was switched off. Turning SAS back on in Settings
+  now also re-syncs the machine straight away.
+- **Restarting a machine during an update no longer undoes the update.**
+  The updater used to roll everything back, database included, if a
+  machine that had been on was not on again three and a half minutes
+  later, even though the hub and the Pi were both fine. It now checks the
+  hub and the Pis themselves, looks at the floor again just before it
+  restarts anything, and names a machine that is off or restarting in a
+  warning instead. It still rolls back when something is really broken: a
+  Pi whose service stops reporting, a SAS machine that never answers the
+  new code, or a G2S machine that talks to the hub but cannot rejoin.
+- **On-screen keyboard for a hub with no keyboard.** On the hub's
+  touchscreen, tapping any text box now brings up a keyboard along the
+  bottom of the screen (a number pad for number boxes). It works on the
+  hub page, the sign-in page, the Test Panel and the console, so names,
+  players, settings and logins can all be typed on the hub itself. Phones
+  and tablets keep using their own keyboard. Add `?osk=1` or `?osk=0` to
+  the hub's address once to force it on or off in that browser.
+- **Optional sign-in for the hub pages.** Settings has a new **Hub
+  login** card. Add a login, turn the lock on, and the hub pages ask for
+  a username and password. It is off until you turn it on, and nothing
+  changes if you never do.
+  - **Two kinds of login.** An **admin** can do everything. A **normal**
+    login can see everything and run the floor day to day: clear
+    handpays, void tickets, lock and unlock machines, load credits.
+    Settings, logins, players and cards, naming, forgetting machines,
+    updates, the Test Panel, and the two ticket controls above need an
+    admin.
+  - **Machines keep working without a login.** Slot machines, satellite
+    and card-reader Pis, the screens on the machines and the wall board
+    never sign in. A signed-out browser can read only what the wall board
+    shows.
+  - **Signs out when unused.** A login is signed out after 30 minutes
+    with no taps or typing (you can change this, or turn it off). The
+    hub's own touchscreen asks for a sign-in too.
+  - **Locked out?** On the hub, run `python3 G2S/tools/hub_login.py`. It
+    can reset a password, add an admin or turn the lock off, and needs no
+    sign-in.
+  - **What it does not do.** The hub still speaks plain HTTP, so a
+    password crosses your network unencrypted, and a device on the slot
+    network can still talk to the hub the way a machine does. The lock
+    keeps people out of the hub pages; keep strangers off the slot
+    network as before.
+
 ## v0.3.3
 - **Updating no longer needs every machine switched on.** The updater
   used to stop with "could not read WorkingDirectory" if any satellite Pi

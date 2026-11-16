@@ -35,6 +35,294 @@ def fresh():
     return HubStore(os.path.join(d, "hub.db")), d
 
 
+def operator_controls():
+    """GitHub #10: set a ticket back to issued, and the reusable flag — on
+    the hub ledger, on the G2S voucher store, and through the union."""
+    from g2s_host import VoucherStore
+    hs, d = fresh()
+    M1, M2 = "sas:smib-a:1", "sas:smib-b:1"
+
+    def issued(amount=500_000, origin="sas:smib-a"):
+        m = hs.tito_mint(origin, 1, amount)
+        hs.tito_record_issued(m["validationNumber"], amount, origin, 1)
+        return m["canonical"]
+
+    def redeem(c, machine=M1, txn=None):
+        txn = txn or f"t-{c}-{machine}-{redeem.n}"
+        redeem.n += 1
+        a = hs.tito_authorize(machine, txn, c)
+        if not a["authorized"]:
+            return a, None
+        return a, hs.tito_close(machine, txn, c, True)
+    redeem.n = 0
+
+    def row(c):
+        return hs.tito_list(vid=c)["tickets"][0]
+
+    print("— operator: set a ticket back to issued (hub ledger)")
+    c = issued()
+    check("a fresh ticket lists as single-use with no uses",
+          row(c)["reusable"] is False and row(c)["uses"] == 0)
+    a, st = redeem(c)
+    check("redeems once", a["authorized"] and st == "redeemed")
+    a, _ = redeem(c)
+    check("then refuses as already redeemed",
+          not a["authorized"] and "already redeemed" in a["reason"], a)
+    r = hs.tito_reissue(c)
+    check("reissue: redeemed -> issued",
+          r == {"ok": True, "prior": "redeemed", "state": "issued"}, r)
+    check("the row shows issued, with the one use kept on record",
+          row(c)["state"] == "issued" and row(c)["uses"] == 1
+          and row(c)["operatorAt"])
+    a, st = redeem(c, M2)
+    check("the same paper redeems again, for the issued amount",
+          a["authorized"] and a["amountMc"] == 500_000 and st == "redeemed",
+          (a, st))
+    check("and is consumed again (a reissue is one more use, not forever)",
+          row(c)["state"] == "redeemed" and row(c)["uses"] == 2)
+
+    hs.tito_reissue(c)
+    a = hs.tito_authorize(M1, "hold-1", c)
+    r = hs.tito_reissue(c)
+    check("reissue is REFUSED while a redemption is in progress",
+          r["ok"] is False and r["prior"] == "redeemPending"
+          and "in progress" in r["error"] and row(c)["state"]
+          == "redeemPending", r)
+    check("that redemption still closes normally afterwards",
+          hs.tito_close(M1, "hold-1", c, True) == "redeemed")
+
+    v = issued(8_000)
+    hs.tito_void(v)
+    check("reissue brings back a voided ticket",
+          hs.tito_reissue(v)["prior"] == "void"
+          and redeem(v)[0]["authorized"])
+    m = hs.tito_mint("sas:smib-a", 1, 9_785_000)
+    r = hs.tito_reissue(m["canonical"])
+    check("reissue rescues a 'minted' ticket whose print the hub never "
+          "heard (the issue #5 leftovers)",
+          r["ok"] and r["prior"] == "minted"
+          and redeem(m["canonical"])[0]["amountMc"] == 9_785_000, r)
+    check("an unknown number is None, not an error",
+          hs.tito_reissue("0199999999999999") is None
+          and hs.tito_set_reusable("0199999999999999", True) is None)
+
+    print("— operator: reusable ticket (hub ledger)")
+    c = issued(1_000_000)
+    r = hs.tito_set_reusable(c, True)
+    check("marked reusable", r == {"ok": True, "reusable": True,
+                                   "state": "issued"}, r)
+    for i in range(1, 4):
+        a, st = redeem(c, M1 if i % 2 else M2)
+        check(f"use {i}: pays the full amount and the close says redeemed",
+              a["authorized"] and a["amountMc"] == 1_000_000
+              and st == "redeemed", (a, st))
+        check(f"use {i}: straight back to issued, count {i}",
+              row(c)["state"] == "issued" and row(c)["uses"] == i
+              and row(c)["redeemedBy"], row(c))
+    a1 = hs.tito_authorize(M1, "x1", c)
+    a2 = hs.tito_authorize(M2, "x2", c)
+    check("still one redemption at a time — a second machine is refused "
+          "while the first holds it",
+          a1["authorized"] and not a2["authorized"]
+          and "already in process" in a2["reason"], a2)
+    check("a rejected close leaves it issued and does not count as a use",
+          hs.tito_close(M1, "x1", c, False) == "issued"
+          and row(c)["uses"] == 3)
+    r = hs.tito_set_reusable(c, False)
+    a, st = redeem(c)
+    check("unticking makes the next redemption consume it",
+          r["reusable"] is False and st == "redeemed"
+          and row(c)["state"] == "redeemed", row(c))
+    r = hs.tito_set_reusable(c, True)
+    check("ticking reusable on a REDEEMED ticket also sets it back to "
+          "issued", r["state"] == "issued" and row(c)["state"] == "issued")
+    v = issued(8_000)
+    hs.tito_void(v)
+    check("ticking reusable does not un-void a ticket",
+          hs.tito_set_reusable(v, True)["state"] == "void"
+          and not redeem(v)[0]["authorized"])
+
+    print("— operator: reusable and reissued tickets never expire")
+    hs.set_host_setting("ticket_expire_days", "1")
+    e1, e2, e3 = issued(2_000), issued(3_000), issued(4_000)
+    old = "2020-01-01T00:00:00"
+    with hs.lock:
+        hs._conn.execute("UPDATE tito_tickets SET issued_at=? WHERE "
+                         "canonical IN (?,?,?)", (old, e1, e2, e3))
+        hs._conn.commit()
+    check("an old ticket shows expired", row(e1)["state"] == "expired")
+    hs.tito_set_reusable(e1, True)
+    hs.tito_reissue(e2)
+    hs.tito_mint("sas:smib-a", 1, 77_000)      # a mint runs the reaper
+    left = {t["canonical"] for t in hs.tito_list(limit=500)["tickets"]}
+    check("the reaper deletes the untouched expired ticket", e3 not in left)
+    check("but keeps the reusable one and the reissued one, as issued",
+          e1 in left and e2 in left and row(e1)["state"] == "issued"
+          and row(e2)["state"] == "issued")
+    hs.set_host_setting("ticket_expire_days", "0")
+
+    print("— operator: a satellite's ledger sync cannot undo it")
+    c = issued(600_000)
+    vn = row(c)["vn16"]
+    redeem(c)
+    hs.tito_reissue(c)
+    stale = [{"vn": vn, "amountMc": 600_000, "state": "redeemed",
+              "redeemedAt": "2026-01-01T00:00:00", "redeemedBy": "1"}]
+    res = hs.tito_sync_merge("sas:smib-a", 0, stale)
+    check("the satellite's old 'redeemed' does not re-consume a reissued "
+          "ticket", row(c)["state"] == "issued" and res["updated"] == 0
+          and res["conflicts"] == 0, (row(c)["state"], res))
+    u = issued(700_000)
+    res = hs.tito_sync_merge("sas:smib-a", 0, [dict(
+        stale[0], vn=row(u)["vn16"], amountMc=700_000)])
+    check("an untouched ticket still takes the satellite's redeemed "
+          "(never-downgrade merge unchanged)",
+          row(u)["state"] == "redeemed" and res["updated"] == 1, res)
+
+    print("— operator: a fresh print on a reused number is a new ticket")
+    c = issued(500_000)
+    vn = row(c)["vn16"]
+    hs.tito_set_reusable(c, True)
+    hs.tito_set_reusable(c, False)
+    redeem(c)
+    hs.tito_set_reusable(c, True)
+    hs.tito_void(c)
+    out = hs.tito_record_issued(vn, 123_000, "sas:smib-a", 1)
+    check("collision re-issue clears the reusable flag and the use count",
+          out.get("collision") == "reissued" and row(c)["reusable"] is False
+          and row(c)["uses"] == 0 and row(c)["operatorAt"] is None, row(c))
+
+    print("— operator: ephemeral store refuses both")
+    hs.ephemeral = True
+    for name, fn in (("reissue", lambda: hs.tito_reissue(c)),
+                     ("set_reusable",
+                      lambda: hs.tito_set_reusable(c, True))):
+        try:
+            fn()
+            check(f"ephemeral {name} refused", False)
+        except RuntimeError:
+            check(f"ephemeral {name} refused", True)
+    hs.ephemeral = False
+
+    print("— operator: a v14 database migrates with every ticket intact")
+    d14 = tempfile.mkdtemp()
+    p14 = os.path.join(d14, "hub.db")
+    h14 = HubStore(p14)
+    k = h14.tito_mint("sas:smib-a", 1, 250_000)
+    h14.tito_record_issued(k["validationNumber"], 250_000, "sas:smib-a", 1)
+    h14.close()
+    conn = sqlite3.connect(p14)
+    for col in ("reusable", "uses", "operator_at"):
+        conn.execute(f"ALTER TABLE tito_tickets DROP COLUMN {col}")
+    conn.execute("UPDATE schema_meta SET value='14' WHERE key='version'")
+    conn.commit()
+    conn.close()
+    h14 = HubStore(p14)
+    t14 = h14.tito_list(vid=k["canonical"])["tickets"][0]
+    check("v14 -> v15: the ticket survives, single-use, zero uses",
+          t14["state"] == "issued" and t14["reusable"] is False
+          and t14["uses"] == 0 and t14["amountMc"] == 250_000, t14)
+    check("and the new controls work on it",
+          h14.tito_set_reusable(k["canonical"], True)["ok"])
+    h14.close()
+    h14 = HubStore(p14)
+    check("reopening a migrated database is a no-op (rerun-safe)",
+          h14.tito_list(vid=k["canonical"])["tickets"][0]["reusable"])
+    h14.close()
+
+    print("— operator: G2S voucher store")
+    vs = VoucherStore(os.path.join(d, "voucher_state.json"))
+    EGM = "IGT_AVP"
+
+    def voucher(amt="500000"):
+        _, items = vs.new_validation_list(EGM, 1)
+        vid = items[0][0]
+        voucher.n += 1
+        vs.record_voucher(EGM, {"kind": "issue", "validationId": vid,
+                                "transactionId": f"i{voucher.n}",
+                                "voucherAmt": amt,
+                                "creditType": "G2S_cashable"})
+        return vid
+    voucher.n = 0
+
+    def vredeem(vid, txn):
+        a = vs.authorize_redemption(EGM, txn, vid)
+        if a["exc"]:
+            return a, None
+        return a, vs.close_redemption(EGM, txn, vid, "G2S_redeemed")
+
+    def vrec(vid):
+        return vs.api_vouchers(vid=vid)["vouchers"][0]
+
+    g = voucher()
+    check("a fresh voucher lists as single-use",
+          vrec(g)["reusable"] is False and vrec(g)["uses"] == 0)
+    vredeem(g, "r1")
+    check("redeemed once, then refused",
+          vredeem(g, "r2")[0]["exc"] == 2)
+    r = vs.reissue_id(g)
+    a, st = vredeem(g, "r3")
+    check("reissue: redeemed -> issued, and it redeems again",
+          r == {"ok": True, "prior": "redeemed", "state": "issued"}
+          and a["exc"] == 0 and a["amt"] == "500000" and st == "redeemed",
+          (r, a, st))
+    vs.reissue_id(g)
+    vs.authorize_redemption(EGM, "hold", g)
+    check("reissue is refused while a redemption is in progress",
+          vs.reissue_id(g)["ok"] is False
+          and vrec(g)["state"] == "redeemPending")
+    vs.close_redemption(EGM, "hold", g, "G2S_rejected")
+    _, items = vs.new_validation_list(EGM, 1)
+    check("an id no ticket was printed against cannot be reissued",
+          vs.reissue_id(items[0][0])["ok"] is False)
+    check("an unknown id is None",
+          vs.reissue_id("9" * 18) is None
+          and vs.set_reusable("9" * 18, True) is None)
+
+    g = voucher("1000000")
+    vs.set_reusable(g, True)
+    for i in range(1, 4):
+        a, st = vredeem(g, f"u{i}")
+        check(f"reusable voucher use {i}: paid, back to issued",
+              a["exc"] == 0 and st == "redeemed"
+              and vrec(g)["state"] == "issued" and vrec(g)["uses"] == i,
+              (a, st, vrec(g)))
+    vs.merge_egm_log(EGM, [{"voucherAction": "G2S_redeem",
+                            "transactionId": "old-9", "validationId": g,
+                            "egmAction": "G2S_redeemed",
+                            "voucherAmt": "1000000", "logSequence": "9"}])
+    check("a redemption replayed from the EGM's log does not consume it",
+          vrec(g)["state"] == "issued")
+    vs.set_reusable(g, False)
+    vredeem(g, "u9")
+    check("unticked: the next redemption consumes it",
+          vrec(g)["state"] == "redeemed")
+    check("ticking reusable on a redeemed voucher sets it back to issued",
+          vs.set_reusable(g, True)["state"] == "issued")
+    vs2 = VoucherStore(os.path.join(d, "voucher_state.json"))
+    check("the flag and count survive a restart",
+          vs2.api_vouchers(vid=g)["vouchers"][0]["reusable"] is True
+          and vs2.api_vouchers(vid=g)["vouchers"][0]["uses"] == 4)
+
+    print("— operator: through the union authority")
+    ta = TitoAuthority(vs, hs)
+    c = issued(300_000)
+    hs.tito_set_reusable(c, True)
+    for i in (1, 2):
+        dec = ta.authorize(M1, f"ta{i}", c)
+        st = ta.close(M1, f"ta{i}", c, "G2S_redeemed")
+        check(f"hub-ledger reusable ticket through the union, use {i}",
+              dec["exc"] == 0 and dec["amt"] == "300000"
+              and st == "redeemed" and row(c)["state"] == "issued",
+              (dec, st))
+    dec = ta.authorize("IGT_AVP", "tb1", g)
+    st = ta.close("IGT_AVP", "tb1", g, "G2S_redeemed")
+    check("G2S reusable voucher through the union",
+          dec["exc"] == 0 and st == "redeemed"
+          and vs.api_vouchers(vid=g)["vouchers"][0]["state"] == "issued")
+    hs.close()
+
+
 def main():
     hs, d = fresh()
 
@@ -412,7 +700,8 @@ def main():
           r["total"] == 4 and len(r["tickets"]) == 4, r["total"])
     want_keys = {"canonical", "vn16", "state", "amountMc", "origin",
                  "address", "ticketNumber", "mintedAt", "issuedAt",
-                 "redeemedAt", "redeemedBy", "pending"}
+                 "redeemedAt", "redeemedBy", "pending",
+                 "reusable", "uses", "operatorAt"}
     check("row keys match the contract exactly",
           all(set(t) == want_keys for t in r["tickets"]),
           [sorted(t) for t in r["tickets"][:1]])
@@ -592,6 +881,8 @@ def main():
     check("in-grace expired ticket still REDEEMS (grace = money honored)",
           dec.get("authorized") is True, dec)
     hs.close()
+
+    operator_controls()
 
     print("=" * 50)
     print(f"RESULT: {_p} passed, {_f} failed")
