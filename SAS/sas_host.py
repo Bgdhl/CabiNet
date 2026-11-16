@@ -47,6 +47,7 @@ from core.sas_protocol import (SASProtocol, SASCommandBuilder,
                                MULTIDENOM_AWARE_POLLS,
                                MULTIDENOM_BASE_MIN_DATA, DENOM_CODE_CENTS)
 from core.sas_poller import MeterSpec, SASPoller
+from core.sas_implied_ack import ImpliedAckTransport
 from core.sas_machine_info import (parse_enabled_game_numbers,
                                    parse_machine_id,
                                    parse_current_player_denom,
@@ -1262,7 +1263,12 @@ def main():
                        "machine may ignore polls this fast", args.interval)
 
     protocol = SASProtocol()
-    port = open_port(args.port, args.mock, args.address, protocol)
+    # Every poll this host sends goes through the implied-ACK guard: a long
+    # poll the machine already answered is ACKed before the same command is
+    # sent again (SAS 6.02 §3.1-3.2; an A560 goes silent on the third
+    # un-ACKed 0x73 — see core/sas_implied_ack.py).
+    port = ImpliedAckTransport(
+        open_port(args.port, args.mock, args.address, protocol))
 
     # ---- state-edge callbacks: log transitions, never per-poll noise ------
     stats = {"events": 0, "meter_changes": 0, "last_meters": {}}
