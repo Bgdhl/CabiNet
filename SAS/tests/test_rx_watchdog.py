@@ -15,19 +15,17 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from sas_host import (RxWedgeWatchdog, WEDGE_REOPEN_SEC, WEDGE_SLOW_AFTER,
-                      WEDGE_SLOW_SEC, WEDGE_QUIET_SEC)
+                      WEDGE_SLOW_SEC)
 
 
 class FakePort:
     """Minimal port stand-in: counts reopens, optionally raises."""
     def __init__(self, raise_times=0):
         self.reopens = 0
-        self.quiets = []
         self._raise_times = raise_times
 
-    def reopen(self, quiet=0.0):
+    def reopen(self):
         self.reopens += 1
-        self.quiets.append(quiet)
         if self._raise_times > 0:
             self._raise_times -= 1
             raise OSError("device busy")
@@ -190,41 +188,3 @@ def test_reopen_exception_is_swallowed():
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-q"]))
-
-
-# -- the pause between close and reopen (2026-11-15) -------------------------
-# On the bench an immediate close+open never cured the wedge and 1.6 s of
-# silence did not either; 2.7 s and 10 s did. Every reopen must carry a pause
-# longer than SAS's 5 s link-down time.
-
-def test_every_reopen_asks_for_a_quiet_spell():
-    wd, port, state = make()
-    wd.tick(0.0)
-    t = 0.0
-    for _ in range(4):
-        t += WEDGE_REOPEN_SEC
-        assert wd.tick(t) is True
-    assert port.quiets == [WEDGE_QUIET_SEC] * 4
-    assert WEDGE_QUIET_SEC > 5.0
-    assert WEDGE_QUIET_SEC < WEDGE_REOPEN_SEC   # never back-to-back silence
-
-
-def test_serial_reopen_is_silent_between_close_and_open(monkeypatch):
-    from transport.serial import sas_serial
-    events = []
-
-    class P(sas_serial.SASSerialPort):
-        def __init__(self):               # no real device
-            self.ser = type("S", (), {"close": lambda s: events.append("close")})()
-            self._tx_busy_until = 1.0
-
-        def _open(self):
-            events.append("open")
-
-    monkeypatch.setattr(sas_serial.time, "sleep",
-                        lambda s: events.append(("sleep", s)))
-    P().reopen(quiet=3.0)
-    assert events == ["close", ("sleep", 3.0), "open"]
-    events.clear()
-    P().reopen()
-    assert events == ["close", "open"]

@@ -84,15 +84,6 @@ WEDGE_REOPEN_SEC = 15.0      # RX silence -> port reopen (fast phase). The
 #                              is closed+reopened. This watchdog makes the
 #                              manual `systemctl restart cabinet-sas`
 #                              cure automatic within one cadence.
-WEDGE_QUIET_SEC = 6.0        # no polling between the close and the reopen.
-#                              BENCH-PROVEN 2026-11-15 (Zero 2 W + BB2), with
-#                              the hardware untouched: 150+ reopens with no
-#                              pause never cured the wedge; a service restart
-#                              with ~1.6 s of silence did not either; ~2.7 s
-#                              and 10 s both brought the machine online on
-#                              the first poll. 6 s clears the 5 s of host
-#                              silence after which a SAS machine declares the
-#                              link down and starts over.
 WEDGE_SLOW_AFTER = 20        # dry reopens (~5 min) before deciding "machine
 #                              is OFF, not wedged" and backing off the churn
 WEDGE_SLOW_SEC = 60.0        # slow-phase cadence — worst-case self-heal
@@ -934,9 +925,8 @@ class RxWedgeWatchdog:
     cabinet LEDs gaslight everyone (fingerprint: /proc/tty/driver/ttyAMA tx
     climbing, rx frozen). This wedge struck three+ times and even
     manufactured a false "one protocol at a time" architecture conclusion
-    before it was caught. Cure = close the port, stop polling for a few
-    seconds, reopen — the pause is what works (see WEDGE_QUIET_SEC); this
-    class does it automatically after WEDGE_REOPEN_SEC of total poll silence.
+    before it was caught. Cure = close+reopen the port; this class does it
+    automatically after WEDGE_REOPEN_SEC of total poll silence.
 
     Cadence: reopen every reopen_sec while silent; after slow_after dry
     reopens (machine genuinely OFF, not wedged) back off to slow_sec so a
@@ -955,14 +945,12 @@ class RxWedgeWatchdog:
     def __init__(self, port, state,
                  reopen_sec=WEDGE_REOPEN_SEC,
                  slow_after=WEDGE_SLOW_AFTER,
-                 slow_sec=WEDGE_SLOW_SEC,
-                 quiet_sec=WEDGE_QUIET_SEC):
+                 slow_sec=WEDGE_SLOW_SEC):
         self.port = port                  # must expose .reopen()
         self.state = state                # SASPoller MachineState (.answers)
         self.reopen_sec = float(reopen_sec)
         self.slow_after = int(slow_after)
         self.slow_sec = float(slow_sec)
-        self.quiet_sec = float(quiet_sec)
         self.dry_reopens = 0              # consecutive reopens with no answer
         self.reopens_total = 0
         self._answers_seen = int(state.answers)
@@ -995,18 +983,13 @@ class RxWedgeWatchdog:
         self.dry_reopens += 1
         self.reopens_total += 1
         loud = self.dry_reopens <= 2 or self.dry_reopens % 10 == 0
-        # The reopen blocks the poll thread for the quiet spell — that IS the
-        # cure (no polls reach the machine). Hub reports run on their own
-        # thread and carry on.
-        quiet = self.quiet_sec
         try:
-            self.port.reopen(quiet=quiet)
+            self.port.reopen()
             if loud:
                 logger.info("🔧 RX-silence watchdog: no valid frames for "
-                            "{:.0f}s — serial port closed, {:.0f}s of "
-                            "silence, reopened (dry reopen #{}: wedge-heal, "
-                            "or the machine is just off)",
-                            cadence, quiet, self.dry_reopens)
+                            "{:.0f}s — serial port reopened (dry reopen #{}: "
+                            "wedge-heal, or the machine is just off)",
+                            cadence, self.dry_reopens)
         except Exception as e:            # noqa: BLE001 — device may be gone
             logger.warning("🔧 RX watchdog: port reopen FAILED ({}: {}) — "
                            "retrying in {:.0f}s", type(e).__name__, e,

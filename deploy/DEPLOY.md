@@ -539,9 +539,21 @@ What it does, in order:
    checkout. **If a gate fails, nothing is pushed, nothing restarts, and your
    data is not even touched** — the tree is simply put back.
 5. pushes the SAS tree to every satellite (never `data/`), restarts them, then the hub
-6. waits for the machines and SAS links that were up to come back
+6. waits for the hub, the Pis and the machines that were up to come back
 7. any failure *after* that point → restores the previous commit **and** the
    data snapshot
+
+**Switching a machine off during an update does not undo the update.** Step 6
+judges the hub and the Pis, which are what the update changed. A machine that
+is off or restarting is named in a warning and rejoins by itself later. The
+update is rolled back only when something is actually broken:
+
+- the hub does not answer;
+- a Pi is switched on but its service is not reporting to the hub;
+- a machine on SAS answered right up to the restart and has not answered the
+  new code once;
+- a G2S machine is talking to the hub but cannot rejoin, or two or more G2S
+  machines all went quiet together.
 
 Useful flags: `--dry-run`, `--yes` (no prompt), `--gates-only` (run the gates
 against your working tree and exit — no fetch, no pull, no adopt, no restart),
