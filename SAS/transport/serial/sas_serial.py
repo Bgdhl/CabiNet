@@ -109,6 +109,20 @@ class SASSerialPort:
         except (ValueError, NotImplementedError, AttributeError, OSError):
             pass  # PL011 and some drivers don't support/need it
 
+    def reopen(self) -> None:
+        """Close and reopen the device — what `systemctl restart cabinet-sas`
+        does to the port, in-process. Used by the silence watchdog
+        (sas_host.RxWedgeWatchdog) for a link that has gone dead while the
+        machine is switched on. Raises on failure (device vanished); callers
+        catch and retry on their own cadence."""
+        try:
+            if self.ser is not None:
+                self.ser.close()
+        except Exception:  # noqa: BLE001 — a wedged fd may refuse to close
+            pass
+        self._tx_busy_until = 0.0
+        self._open()
+
     # One 11-bit SAS character (start + 8 data + wake-up + stop) on the wire.
     _CHAR_SECONDS = 11.0 / SAS_BAUD
 

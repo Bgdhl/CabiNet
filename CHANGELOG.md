@@ -12,6 +12,14 @@
   button or a G2S status, because that switch does not control its
   tickets. Machines that ticket over G2S are unchanged, and a machine
   with only a SAS side now appears in the row too.
+- **The serial watchdog is back.** v0.3.4 removed it, on the belief that
+  it had never brought a SAS link back. Within the hour a link went dead a
+  second after credits were loaded to a machine, and stayed dead for nine
+  minutes until the satellite's SAS service was restarted. Reopening the
+  serial port is what that restart does, and it is what the watchdog does,
+  so it is restored: a link that dies while the machine is on is reopened
+  after 15 seconds of silence. Why the link dies there is not understood
+  yet. The v0.3.4 fix for a machine that has just started is unchanged.
 - **No scroll bars on the hub's touchscreen.** The kiosk drew a pale
   desktop scroll bar down the side of every page. It is gone on the hub's
   own kiosk; scrolling is still a swipe. Other browsers, small windows and
@@ -29,8 +37,8 @@
 - **Icons show on a screen that has no emoji font.** The pages use emoji
   as icons, and a Raspberry Pi has no emoji font, so on the hub's own
   touchscreen (and on a wall board run from a Pi) every icon was an empty
-  box. The hub now carries a small emoji font of its own and the pages
-  fall back to it when the device has none. It comes with this update:
+  box. The hub now carries a small emoji font of its own, and a page uses
+  it when it finds the device has none. It comes with this update:
   nothing to install, and it works with no internet. Phones and computers
   keep using their own emoji.
 - **An open kiosk page picks up a change to the on-screen keyboard.** It

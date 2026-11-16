@@ -17,23 +17,28 @@
 <style>
   /* Emoji for a device that has no emoji font of its own (the hub's
      touchscreen, a wall TV): a small subset of Noto Color Emoji that the hub
-     serves itself — see G2S/tools/build_emoji_font.py. It is last in every
-     font stack (--emoji), after the device's own emoji fonts, and it only
-     joins the stacks once it has LOADED: html.emoji-ready, set by the script
-     under this style block. */
+     serves itself — see G2S/tools/build_emoji_font.py.
+     It goes FIRST in the font stacks, and only on a device that needs it
+     (html.emoji-own, set by the script under this style block once the font
+     has loaded). First, because Chromium on the hub's kiosk does not
+     reliably reach a web font listed AFTER system fonts: the tab bar stayed
+     empty boxes while the same emoji drew elsewhere (2026-11-16). The
+     unicode-range keeps it away from letters, digits and arrows. */
   @font-face{font-family:"CabiNet Emoji";font-display:swap;
     src:url("/webui/emoji.woff2") format("woff2");
     unicode-range:U+200D,U+20E3,U+FE0F,U+2300-23FF,U+2600-27BF,U+2B00-2BFF,
       U+1F000-1FFFF}
-  :root.emoji-ready{--emoji:"Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji","CabiNet Emoji"}
+  :root.emoji-own{
+    --mono:"CabiNet Emoji",ui-monospace,"Cascadia Mono",Consolas,"DejaVu Sans Mono",Menlo,monospace;
+    --sans:"CabiNet Emoji",-apple-system,"Segoe UI",Roboto,"DejaVu Sans",Arial,sans-serif;
+  }
   :root{
     --bg:#0f0c07; --panel:#171208; --panel2:#201a0e; --inset:#0b0906;
     --line:#332a18; --line2:#241d10;
     --txt:#f0e7d2; --dim:#a09070; --faint:#6f6248;
     --amber:#ffb92e; --ok:#46d97f; --bad:#ff5f56; --info:#59b7ff;
-    --emoji:"Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji";
-    --mono:ui-monospace,"Cascadia Mono",Consolas,"DejaVu Sans Mono",Menlo,monospace,var(--emoji);
-    --sans:-apple-system,"Segoe UI",Roboto,"DejaVu Sans",Arial,sans-serif,var(--emoji);
+    --mono:ui-monospace,"Cascadia Mono",Consolas,"DejaVu Sans Mono",Menlo,monospace;
+    --sans:-apple-system,"Segoe UI",Roboto,"DejaVu Sans",Arial,sans-serif;
   }
   *{box-sizing:border-box}
   html,body{margin:0}
@@ -255,15 +260,26 @@
   }
 </style>
 <script>
-/* The hub's emoji font joins the font stacks (html.emoji-ready) only once it
-   has LOADED. Leaving the browser to swap it in by itself left icons that
-   were already drawn as empty boxes: on the hub's kiosk (Chromium 149) the
-   tab bar kept its boxes while buttons drawn a moment later were fine
-   (2026-11-16). Changing the stack after the load re-draws everything. */
+/* Does this device draw emoji by itself? Paint one in black and look for any
+   colour. A phone or a desktop does, and keeps its own. A Pi does not: load
+   the hub's font and, once it HAS loaded, put it first in the font stacks
+   (html.emoji-own) — see the note on @font-face above. */
 (function(){
+  function own(){
+    try{
+      var c=document.createElement("canvas"); c.width=c.height=24;
+      var x=c.getContext("2d"); x.textBaseline="top"; x.font="18px sans-serif";
+      x.fillStyle="#000"; x.fillText("\u{1F3B0}",1,1);
+      var d=x.getImageData(0,0,24,24).data;
+      for(var i=0;i<d.length;i+=4)
+        if(d[i+3]>64&&(d[i]>48||d[i+1]>48||d[i+2]>48)) return true;
+    }catch(e){}
+    return false;
+  }
+  if(own()) return;
   try{
     document.fonts.load('16px "CabiNet Emoji"',"\u{1F3B0}").then(function(f){
-      if(f&&f.length) document.documentElement.classList.add("emoji-ready");
+      if(f&&f.length) document.documentElement.classList.add("emoji-own");
     },function(){});
   }catch(e){}
 })();

@@ -90,33 +90,37 @@ def main():
     check("tests and dev tools are not scanned (their ticks go to a "
           "terminal)", not skipped, skipped[:3])
 
-    print("— the pages use it, last in line, and only once it has loaded")
-    base = '"Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji"'
+    print("— the pages use it: first in line, only where it is needed")
+    import re
     for name in ("home", "login", "index", "console", "board"):
         html = (webui / f"{name}.html").read_text("utf-8")
         check(f"{name}.html declares the font from the hub's own file",
               '@font-face{font-family:"CabiNet Emoji"' in html
               and 'url("/webui/emoji.woff2")' in html)
-        stacks = [l for l in html.splitlines()
-                  if l.strip().startswith(("--sans", "--display", "--mono"))]
-        if name == "console":
-            stacks = [l for l in html.splitlines() if "sans-serif" in l]
-        check(f"{name}.html: every font stack ends with the emoji fallbacks",
-              stacks and all(l.rstrip().endswith(",var(--emoji);")
-                             for l in stacks), stacks)
-        # The font must not be in a stack until it has loaded: text drawn
-        # before it arrived stayed as empty boxes on the hub's kiosk
-        # (Chromium 149), so the pages add it with a class after the load.
-        check(f"{name}.html: the hub's font is NOT in the stack to begin "
-              "with", html.count("--emoji:" + base + ";") +
-              html.count("--emoji:" + base + "}") == 1
-              and html.count('"CabiNet Emoji"') == 3)
-        check(f"{name}.html: ...it joins on html.emoji-ready",
-              ':root.emoji-ready{--emoji:' + base + ',"CabiNet Emoji"}'
-              in html)
-        check(f"{name}.html: ...which is set once the font has loaded",
-              """document.fonts.load('16px "CabiNet Emoji"'""" in html
-              and 'classList.add("emoji-ready")' in html)
+        own_at = html.find(":root.emoji-own{")
+        own_block = html[own_at:html.find("}", own_at)] if own_at >= 0 else ""
+        own = dict(re.findall(r'(--(?:display|sans|mono))\s*:([^;]*);',
+                              own_block))
+        rest = html[:own_at] + html[own_at + len(own_block):]
+        base = dict(re.findall(
+            r'(--(?:display|sans|mono))\s*:([^;}]*)[;}]', rest))
+        check(f"{name}.html: the plain font stacks do NOT name the hub's "
+              "font (a device with its own emoji keeps them)",
+              base and all("CabiNet" not in v for v in base.values()), base)
+        # First, not last: on the hub's kiosk a web font listed AFTER system
+        # fonts was not reliably reached — the tab bar stayed empty boxes.
+        check(f"{name}.html: html.emoji-own puts it FIRST in every stack, "
+              "and changes nothing else about them",
+              own and set(own) == set(base) and all(
+                  own[k].strip() == '"CabiNet Emoji",' + base[k].strip()
+                  for k in base), (own, base))
+        check(f"{name}.html: the class is set only on a device with no "
+              "emoji of its own, and only once the font has loaded",
+              "getImageData" in html and "if(own()) return;" in html
+              and """document.fonts.load('16px "CabiNet Emoji"'""" in html
+              and 'classList.add("emoji-own")' in html)
+        check(f"{name}.html: the body text uses a stack the class can "
+              "change", "var(--sans)" in html)
 
     print("— the hub can hand it to any browser")
     check("served as a font", g2s_host.WEBUI_CONTENT_TYPES.get(".woff2")
