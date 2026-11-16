@@ -12,13 +12,20 @@
   button or a G2S status, because that switch does not control its
   tickets. Machines that ticket over G2S are unchanged, and a machine
   with only a SAS side now appears in the row too.
-- **The hub's touchscreen no longer shows a mouse pointer or scroll
-  bars.** The kiosk drew an arrow in the middle of the screen (the Pi's
-  HDMI ports count as pointing devices, so it thought there was a mouse)
-  and a pale desktop scroll bar down the side of every page. Both are
-  hidden on the hub's own kiosk. Scrolling is still a swipe, and if you
-  plug in a real mouse the pointer comes back as soon as it moves. Other
-  browsers, small windows and phones are not affected.
+- **No scroll bars on the hub's touchscreen.** The kiosk drew a pale
+  desktop scroll bar down the side of every page. It is gone on the hub's
+  own kiosk; scrolling is still a swipe. Other browsers, small windows and
+  phones are not affected.
+- **No mouse arrow on the hub's touchscreen — one command on an existing
+  kiosk.** The kiosk parked an arrow in the middle of the screen. It was
+  never a mouse: the Pi's HDMI ports count as pointing devices. Removing it
+  takes a system rule that only root can install, which an update cannot
+  do, so:
+  - a kiosk set up from now on (`sudo ./deploy/kiosk_setup.sh`) has it;
+  - on a kiosk you already have, run **`sudo ./deploy/kiosk_pointer.sh`**
+    on the hub once. The screen restarts and, if the hub login is on, asks
+    you to sign in again. The updater reminds you of the command until it
+    is done. `--undo` puts the arrow back. A real mouse still works.
 - **Icons show on a screen that has no emoji font.** The pages use emoji
   as icons, and a Raspberry Pi has no emoji font, so on the hub's own
   touchscreen (and on a wall board run from a Pi) every icon was an empty

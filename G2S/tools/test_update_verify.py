@@ -30,6 +30,7 @@ Exits 0 if all checks pass.
 """
 
 import copy
+import os
 import importlib.util
 import sys
 from pathlib import Path
@@ -337,6 +338,37 @@ def main():
     r = Rig(floor([sas("smib-a", PI_A)]), lambda t: None)
     check("a dry run verifies nothing", up.verify(
         "http://hub", r.sats, r.machines, r.comps, dry=True) is True)
+
+    print("— what an update cannot fix, it names")
+    unit, rule = up.KIOSK_UNITS[0], up.KIOSK_POINTER_RULE
+    del SAID[:]
+    said = up.kiosk_notes("/home/x/CabiNet", exists=lambda p: p == unit)
+    text = "\n".join(SAID)
+    check("a kiosk without the pointer rule: the one command is named",
+          said is True
+          and "sudo /home/x/CabiNet/deploy/kiosk_pointer.sh" in text, text)
+    del SAID[:]
+    check("the older unit name counts as a kiosk too",
+          up.kiosk_notes("/r", exists=lambda p: p == up.KIOSK_UNITS[1])
+          is True)
+    del SAID[:]
+    check("a kiosk that already has the rule: nothing is said",
+          up.kiosk_notes("/r", exists=lambda p: p in (unit, rule)) is False
+          and SAID == [], SAID)
+    check("a hub with no kiosk: nothing is said",
+          up.kiosk_notes("/r", exists=lambda p: False) is False
+          and SAID == [], SAID)
+    repo = G2S.parent / "deploy"
+    check("the rule and its installer ship with the hub",
+          (repo / "99-cabinet-kiosk-pointer.rules").is_file()
+          and os.access(repo / "kiosk_pointer.sh", os.X_OK))
+    check("the rule is the one the updater looks for",
+          os.path.basename(rule) == "99-cabinet-kiosk-pointer.rules"
+          and "LIBINPUT_IGNORE_DEVICE" in
+          (repo / "99-cabinet-kiosk-pointer.rules").read_text())
+    check("kiosk_setup.sh installs it on a new kiosk",
+          "99-cabinet-kiosk-pointer.rules" in
+          (repo / "kiosk_setup.sh").read_text())
 
     print(f"\nRESULT: {PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0

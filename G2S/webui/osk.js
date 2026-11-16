@@ -21,11 +21,16 @@
    the kiosk can reach already loads. On the hub's own touchscreen
    (?kiosk=1, carried from page to page) there is no mouse and scrolling is
    a swipe, so:
-     - the mouse pointer is hidden. It was never the user's: the Pi's HDMI
-       ports register as pointer devices, so the kiosk compositor draws an
-       arrow in the middle of the screen and leaves it there. If a real
-       mouse is plugged in and moved, the pointer comes straight back.
      - scroll bars are hidden (a pale desktop bar down a dark touch page).
+     - the page asks for no mouse pointer (cursor: none), and gives it back
+       the moment a real mouse moves.
+   The second one is NOT what removes the arrow parked in the middle of the
+   hub's kiosk. That arrow is the compositor's: the Pi's HDMI ports count as
+   pointing devices, so it draws a cursor, and the browser never receives a
+   pointer event, so it never gets to apply cursor:none. A udev rule fixes
+   that (deploy/99-cabinet-kiosk-pointer.rules, installed by kiosk_setup.sh
+   or kiosk_pointer.sh). cursor:none is for a kiosk where the browser does
+   own the pointer.
    Neither applies to a small browser window or a phone — only ?kiosk=1. */
 (function(){
 "use strict";

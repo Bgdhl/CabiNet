@@ -90,7 +90,8 @@ def main():
     check("tests and dev tools are not scanned (their ticks go to a "
           "terminal)", not skipped, skipped[:3])
 
-    print("— the pages use it, last in line")
+    print("— the pages use it, last in line, and only once it has loaded")
+    base = '"Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji"'
     for name in ("home", "login", "index", "console", "board"):
         html = (webui / f"{name}.html").read_text("utf-8")
         check(f"{name}.html declares the font from the hub's own file",
@@ -100,11 +101,22 @@ def main():
                   if l.strip().startswith(("--sans", "--display", "--mono"))]
         if name == "console":
             stacks = [l for l in html.splitlines() if "sans-serif" in l]
-        check(f"{name}.html: every font stack ends with it, after the "
-              "device's own emoji fonts",
-              stacks and all(
-                  l.rstrip().endswith('"Noto Color Emoji","CabiNet Emoji";')
-                  for l in stacks), stacks)
+        check(f"{name}.html: every font stack ends with the emoji fallbacks",
+              stacks and all(l.rstrip().endswith(",var(--emoji);")
+                             for l in stacks), stacks)
+        # The font must not be in a stack until it has loaded: text drawn
+        # before it arrived stayed as empty boxes on the hub's kiosk
+        # (Chromium 149), so the pages add it with a class after the load.
+        check(f"{name}.html: the hub's font is NOT in the stack to begin "
+              "with", html.count("--emoji:" + base + ";") +
+              html.count("--emoji:" + base + "}") == 1
+              and html.count('"CabiNet Emoji"') == 3)
+        check(f"{name}.html: ...it joins on html.emoji-ready",
+              ':root.emoji-ready{--emoji:' + base + ',"CabiNet Emoji"}'
+              in html)
+        check(f"{name}.html: ...which is set once the font has loaded",
+              """document.fonts.load('16px "CabiNet Emoji"'""" in html
+              and 'classList.add("emoji-ready")' in html)
 
     print("— the hub can hand it to any browser")
     check("served as a font", g2s_host.WEBUI_CONTENT_TYPES.get(".woff2")

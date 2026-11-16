@@ -7,13 +7,16 @@
 <style>
   /* Emoji for a device that has no emoji font of its own (the hub's
      touchscreen, a wall TV): a small subset of Noto Color Emoji that the hub
-     serves itself — see G2S/tools/build_emoji_font.py. Last in every font
-     stack below, after the device's own emoji fonts, and only fetched when
-     a page actually has to draw one from it. */
+     serves itself — see G2S/tools/build_emoji_font.py. It is last in every
+     font stack (--emoji), after the device's own emoji fonts, and it only
+     joins the stacks once it has LOADED: html.emoji-ready, set by the script
+     under this style block. */
   @font-face{font-family:"CabiNet Emoji";font-display:swap;
     src:url("/webui/emoji.woff2") format("woff2");
     unicode-range:U+200D,U+20E3,U+FE0F,U+2300-23FF,U+2600-27BF,U+2B00-2BFF,
       U+1F000-1FFFF}
+  :root{--emoji:"Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji"}
+  :root.emoji-ready{--emoji:"Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji","CabiNet Emoji"}
   :root{
     --bg:#0b0e14; --panel:#141a26; --panel2:#1b2333; --line:#26304a;
     --txt:#e6ecf5; --dim:#8a97b0; --accent:#ffce54; --good:#39d98a;
@@ -22,7 +25,7 @@
   *{box-sizing:border-box}
   html,body{margin:0;height:100%}
   body{background:var(--bg);color:var(--txt);
-    font:15px/1.4 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif,"Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji","CabiNet Emoji";
+    font:15px/1.4 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif,var(--emoji);
     -webkit-font-smoothing:antialiased}
   header{display:flex;align-items:center;gap:14px;padding:12px 18px;
     background:linear-gradient(90deg,#161d2c,#10141d);border-bottom:1px solid var(--line);
@@ -122,6 +125,20 @@
   @media (max-width:600px){main{padding:10px;gap:10px}
     .win .acts{margin-left:0;width:100%}}
 </style>
+<script>
+/* The hub's emoji font joins the font stacks (html.emoji-ready) only once it
+   has LOADED. Leaving the browser to swap it in by itself left icons that
+   were already drawn as empty boxes: on the hub's kiosk (Chromium 149) the
+   tab bar kept its boxes while buttons drawn a moment later were fine
+   (2026-11-16). Changing the stack after the load re-draws everything. */
+(function(){
+  try{
+    document.fonts.load('16px "CabiNet Emoji"',"\u{1F3B0}").then(function(f){
+      if(f&&f.length) document.documentElement.classList.add("emoji-ready");
+    },function(){});
+  }catch(e){}
+})();
+</script>
 <!-- on-screen keyboard for a hub with no physical one (touch kiosk) -->
 <script src="/webui/osk.js"></script>
 </head>
