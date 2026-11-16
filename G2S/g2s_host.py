@@ -21948,6 +21948,26 @@ class G2SHost:
 # HTTP layer
 # ----------------------------------------------------------------------------
 
+def home_ui_stamp():
+    """The Home page's build watermark (/api/status uiStamp): the newest
+    mtime of home.html AND the script it loads, osk.js. An open kiosk page
+    reloads itself when this changes, and /api/command refuses a page whose
+    stamp is behind — so both read it from here, or they disagree.
+
+    osk.js has to count: it carries the on-screen keyboard and the kiosk's
+    look, and until 2026-11-16 a deploy that changed only that file left
+    the kiosk running the old script until someone restarted the kiosk
+    service. Raises OSError if home.html is missing (callers already treat
+    that as "no stamp"); a tree with no osk.js just uses home.html."""
+    base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webui")
+    stamp = int(os.path.getmtime(os.path.join(base, "home.html")))
+    try:
+        stamp = max(stamp, int(os.path.getmtime(os.path.join(base, "osk.js"))))
+    except OSError:
+        pass
+    return stamp
+
+
 # G2S-36 Test Panel: content types for the webui/ static tree, keyed by
 # extension (stdlib-only — no mimetypes surprises across Pi OS images).
 # Anything unknown ships as octet-stream rather than guessing.
@@ -22674,9 +22694,7 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                     # this changes, so a webui deploy shows up without restarting
                     # the kiosk service. One stat per poll — negligible.
                     try:
-                        snap["uiStamp"] = int(os.path.getmtime(os.path.join(
-                            os.path.dirname(os.path.abspath(__file__)),
-                            "webui", "home.html")))
+                        snap["uiStamp"] = home_ui_stamp()
                     except OSError:
                         pass
                     # smib.html's OWN mtime: the BB2 panel is a kiosk too (no keyboard
@@ -23035,9 +23053,7 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
         ui_stamp = req.get("uiStamp")
         if ui_stamp is not None:
             try:
-                cur_stamp = int(os.path.getmtime(os.path.join(
-                    os.path.dirname(os.path.abspath(__file__)),
-                    "webui", "home.html")))
+                cur_stamp = home_ui_stamp()
             except OSError:
                 cur_stamp = None
             try:

@@ -15,16 +15,38 @@
 
    Self-contained: no CDN (the slot VLAN is offline), no dependencies.
    Pages can read html.osk (keyboard available) and html.osk-open (showing;
-   --osk-h is its height). data-osk-go="Sign in" on an input relabels enter. */
+   --osk-h is its height). data-osk-go="Sign in" on an input relabels enter.
+
+   THE KIOSK'S LOOK lives here too, because this is the one file every page
+   the kiosk can reach already loads. On the hub's own touchscreen
+   (?kiosk=1, carried from page to page) there is no mouse and scrolling is
+   a swipe, so:
+     - the mouse pointer is hidden. It was never the user's: the Pi's HDMI
+       ports register as pointer devices, so the kiosk compositor draws an
+       arrow in the middle of the screen and leaves it there. If a real
+       mouse is plugged in and moved, the pointer comes straight back.
+     - scroll bars are hidden (a pale desktop bar down a dark touch page).
+   Neither applies to a small browser window or a phone — only ?kiosk=1. */
 (function(){
 "use strict";
 var KEY="cabinet_osk";
 
+/* Is this the hub's own kiosk? Only on an explicit ?kiosk=1 — here, in the
+   sign-in page's next=, or remembered from an earlier page in this tab. */
+var KIOSK=false;
+function kioskNow(k){
+  if(k==="1") return true;
+  if(k==="0") return false;
+  try{return sessionStorage.getItem(KEY)==="1";}catch(e){return false;}
+}
 function decide(){
   var qs=new URLSearchParams(location.search), st=null, k, m;
   var o=qs.get("osk");
   if(o==="1"||o==="0"){
     try{localStorage.setItem(KEY,o);}catch(e){}
+    k=qs.get("kiosk");
+    if(k==="1"||k==="0"){ try{sessionStorage.setItem(KEY,k);}catch(e){} }
+    KIOSK=kioskNow(k);
     return o==="1";
   }
   k=qs.get("kiosk");
@@ -33,6 +55,7 @@ function decide(){
     if(m) k=m[1];
   }
   if(k==="1"||k==="0"){ try{sessionStorage.setItem(KEY,k);}catch(e){} }
+  KIOSK=kioskNow(k);
   try{st=localStorage.getItem(KEY);}catch(e){}
   if(st==="1"||st==="0") return st==="1";
   if(k==="1") return true;
@@ -43,9 +66,30 @@ function decide(){
     !/Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent||"");
 }
 var ON=decide();
-window.CabiOSK={enabled:ON};
+window.CabiOSK={enabled:ON, kiosk:KIOSK};
+if(KIOSK) kioskLook();
 if(!ON) return;
 document.documentElement.classList.add("osk");
+
+function kioskLook(){
+  var root=document.documentElement, st=document.createElement("style");
+  st.textContent=
+   "html.kiosk-nocursor,html.kiosk-nocursor *{cursor:none!important}"+
+   "html.kiosk-nobars,html.kiosk-nobars *{scrollbar-width:none!important}"+
+   "html.kiosk-nobars::-webkit-scrollbar,"+
+   "html.kiosk-nobars *::-webkit-scrollbar"+
+   "{display:none!important;width:0!important;height:0!important}";
+  (document.head||root).appendChild(st);
+  root.classList.add("kiosk-nocursor","kiosk-nobars");
+  /* A real mouse: bring the pointer back the moment it moves. A tap is not
+     a mouse (pointerType "touch"), and the arrow the compositor parks on
+     the screen reports no movement. */
+  document.addEventListener("pointermove",function back(e){
+    if(e.pointerType!=="mouse"||(!e.movementX&&!e.movementY)) return;
+    root.classList.remove("kiosk-nocursor");
+    document.removeEventListener("pointermove",back,true);
+  },true);
+}
 
 var TEXT_TYPES={text:1,search:1,password:1,tel:1,url:1,email:1,number:1};
 function ok(el){

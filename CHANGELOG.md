@@ -12,6 +12,16 @@
   button or a G2S status, because that switch does not control its
   tickets. Machines that ticket over G2S are unchanged, and a machine
   with only a SAS side now appears in the row too.
+- **The hub's touchscreen no longer shows a mouse pointer or scroll
+  bars.** The kiosk drew an arrow in the middle of the screen (the Pi's
+  HDMI ports count as pointing devices, so it thought there was a mouse)
+  and a pale desktop scroll bar down the side of every page. Both are
+  hidden on the hub's own kiosk. Scrolling is still a swipe, and if you
+  plug in a real mouse the pointer comes back as soon as it moves. Other
+  browsers, small windows and phones are not affected.
+- **An open kiosk page picks up a change to the on-screen keyboard.** It
+  already reloaded itself when the hub page changed; it now does the same
+  when only the keyboard file changes.
 
 ## v0.3.4
 - **Use a ticket again.** Open any ticket on the Tickets page and press
