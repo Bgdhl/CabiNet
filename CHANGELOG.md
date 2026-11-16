@@ -37,6 +37,11 @@
   ends every failure with "make sure to run with sudo", and it exits with
   an error when it fails, so the service is retried instead of quietly
   staying down. The bench guide names the interface now.
+- **A sign-in page that is already open leaves when the lock is turned
+  off.** It checked once, when it loaded. A screen left on the sign-in
+  form, such as the hub's own touchscreen, stayed there after the lock was
+  turned off from another device, and a kiosk has no reload button. The
+  page now checks every few seconds and carries on to where it was going.
 
 ## v0.3.5
 - **Ticketing status moved from the Tickets page to Settings, and it is
