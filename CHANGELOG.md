@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.3.5
+- **The Tickets page shows the right ticketing state for a machine that
+  tickets over SAS.** The row of chips at the top of the page read only a
+  machine's G2S ticket device, so a machine whose tickets run over SAS
+  (a Bluebird 2, for one) could say "ticketing off" while it was printing
+  and redeeming tickets normally. A machine that tickets over SAS now
+  shows **ticketing on · SAS**, or **off** with the reason (the SAS link
+  is down, its Pi is not reporting, the machine is not hearing the Pi, or
+  SAS is off in Settings). It no longer gets a "Turn ticketing on/off"
+  button or a G2S status, because that switch does not control its
+  tickets. Machines that ticket over G2S are unchanged, and a machine
+  with only a SAS side now appears in the row too.
+
 ## v0.3.4
 - **Use a ticket again.** Open any ticket on the Tickets page and press
   **Set back to Issued**: the same paper can be redeemed once more. It
