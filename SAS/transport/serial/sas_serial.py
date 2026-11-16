@@ -109,23 +109,6 @@ class SASSerialPort:
         except (ValueError, NotImplementedError, AttributeError, OSError):
             pass  # PL011 and some drivers don't support/need it
 
-    def reopen(self) -> None:
-        """Close and reopen the device — the machine-reboot RX-wedge cure
-        (live-diagnosed 2026-07-10): a machine power-cycle can deafen the
-        PL011's RX side while TX keeps flowing, so the link looks dead from
-        the host while the machine answers unheard (fingerprint:
-        /proc/tty/driver/ttyAMA tx climbing, rx frozen). A fresh open()
-        restores RX — this is the manual `systemctl restart cabinet-sas`
-        fix, in-process. Raises on failure (device vanished); callers
-        catch and retry on their own cadence."""
-        try:
-            if self.ser is not None:
-                self.ser.close()
-        except Exception:  # noqa: BLE001 — a wedged fd may refuse to close
-            pass
-        self._tx_busy_until = 0.0
-        self._open()
-
     # One 11-bit SAS character (start + 8 data + wake-up + stop) on the wire.
     _CHAR_SECONDS = 11.0 / SAS_BAUD
 

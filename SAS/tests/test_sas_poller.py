@@ -233,6 +233,78 @@ class TestSASPoller:
             poller.poll_once()
         assert syncs() == before                # none while it is answering
 
+    # -- the loop-break chirp (SAS 6.02 §4.2) -------------------------------
+    # A machine that hears no address byte for 5 s transmits its own address
+    # every 200 ms. While we are polling, that means our polls are not
+    # reaching it. It is not an answer, and it must never read as ONLINE.
+
+    @staticmethod
+    def _deaf(address=1, burst=1):
+        """A machine that cannot hear us: every read window holds chirps."""
+        return lambda frame, wakeup: bytes([address]) * burst
+
+    def test_chirp_is_not_an_answer(self):
+        port = MockSASSerialPort(self._deaf())
+        events, online = [], []
+        poller = SASPoller(port, address=1,
+                           on_event=lambda a, c, n: events.append(c),
+                           on_online=lambda a: online.append(a))
+        for _ in range(20):
+            assert poller.poll_once() is None      # same as silence
+        assert poller.state.online is False
+        assert online == [] and events == []       # no phantom "exception 0x01"
+        assert poller.state.answers == 0
+        assert poller.state.chirps == 20 and poller.state.chirp_run == 20
+
+    def test_a_burst_of_chirps_is_not_a_long_poll_result(self):
+        """Several chirps buffered together used to be parsed as a long-poll
+        result and fail CRC ("expected 0101")."""
+        port = MockSASSerialPort(self._deaf(burst=3))
+        poller = SASPoller(port, address=1)
+        poller.poll_once()
+        assert poller.state.online is False
+        assert poller.state.chirps == 1 and poller.state.poll_results == {}
+
+    def test_machine_that_stops_hearing_us_goes_offline(self):
+        """The transmit wire comes off mid-session: answers turn to chirps.
+        Counted as answers they would hold the machine ONLINE forever."""
+        machine = ScriptedMachine(address=1)
+        hears = {"us": True}
+        port = MockSASSerialPort(
+            lambda f, w: machine(f, w) if hears["us"] else b"\x01")
+        offline = []
+        poller = SASPoller(port, address=1,
+                           on_offline=lambda a: offline.append(a))
+        poller.poll_once()
+        assert poller.state.online is True
+        hears["us"] = False
+        for _ in range(5):
+            poller.poll_once()
+        assert poller.state.online is False and offline == [1]
+        assert poller.state.chirp_run == 5
+        hears["us"] = True                          # wire back on
+        poller.poll_once()
+        assert poller.state.online is True
+        assert poller.state.chirp_run == 0          # a real answer ends the run
+        assert poller.state.chirps == 5             # the total is kept
+
+    def test_own_address_byte_that_is_a_real_exception_stays_an_exception(self):
+        """At address 0x11 a lone 0x11 is "slot door opened", and cannot be
+        told from a chirp — it stays an exception, as before. Two of them
+        together can only be chirps."""
+        machine = ScriptedMachine(address=0x11)
+        machine.queue(0x11)
+        port = MockSASSerialPort(machine)
+        events = []
+        poller = SASPoller(port, address=0x11,
+                           on_event=lambda a, c, n: events.append(c))
+        poller.poll_once()
+        assert events == [0x11] and poller.state.chirps == 0
+        port2 = MockSASSerialPort(self._deaf(address=0x11, burst=2))
+        poller2 = SASPoller(port2, address=0x11)
+        poller2.poll_once()
+        assert poller2.state.chirps == 1 and poller2.state.online is False
+
     def test_callback_exception_does_not_kill_loop(self):
         machine = ScriptedMachine(address=1)
         machine.queue(0x12)

@@ -2981,6 +2981,23 @@ def main():
           and e1.get("machineInfo", {}).get("totalGames") == 12
           and e1.get("denomSuggest", {}).get("state") == "confirm",
           (rep, e1.get("machineInfo")))
+    # chirping: "the machine is on but not hearing this Pi" (v0.3.4) — a
+    # strict bool on an unauthenticated wire; an old satellite sends nothing
+    d8.sas_report({"smibId": "smib-ch", "address": "1", "online": False,
+                   "chirping": True}, "10.0.0.8")
+    check("a satellite's chirping flag reaches the status",
+          d8.sas_machines["smib-ch/1"].get("chirping") is True)
+    d8.sas_report({"smibId": "smib-ch", "address": "1", "online": False,
+                   "chirping": "yes"}, "10.0.0.8")
+    check("...and anything but a real bool is dropped",
+          "chirping" not in d8.sas_machines["smib-ch/1"],
+          d8.sas_machines["smib-ch/1"].get("chirping"))
+    d8.sas_report({"smibId": "smib-ch", "address": "1", "online": True},
+                  "10.0.0.8")
+    check("...and an old satellite that never sends it shows nothing",
+          "chirping" not in d8.sas_machines["smib-ch/1"])
+    with d8.sas_lock:
+        d8.sas_machines.pop("smib-ch/1", None)
     d8.sas_report({"smibId": "smib-mi", "address": "1", "online": True,
                    "machineInfo": None}, "10.0.0.9")
     e2 = d8.sas_machines["smib-mi/1"]

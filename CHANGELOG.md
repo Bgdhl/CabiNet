@@ -22,6 +22,18 @@
   the machine went off, and never again. It now sends it with every poll
   for as long as the machine is silent, so the machine is picked up within
   a second of being ready.
+- **The Floor says when a machine cannot hear its Pi.** A machine that is
+  switched on but receiving nothing from the satellite sends a "nobody is
+  talking to me" signal. The hub used to read that as the machine being
+  online. It now shows **machine is on but not hearing the Pi**, which
+  points at one half of the link: the wire from the Pi's transmit pin,
+  through the level shifter, to the machine.
+- **Removed the serial "watchdog".** It reopened the satellite's serial
+  port whenever a machine was silent, on the belief that the Pi had stopped
+  receiving. That was never the cause (see the item above), it never
+  brought a link back, and it reopened the port every 15 to 60 seconds for
+  as long as a machine was switched off. Turning SAS back on in Settings
+  now also re-syncs the machine straight away.
 - **Restarting a machine during an update no longer undoes the update.**
   The updater used to roll everything back, database included, if a
   machine that had been on was not on again three and a half minutes

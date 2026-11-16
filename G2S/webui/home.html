@@ -878,6 +878,15 @@ function parseDollars(v){
   if(!isFinite(n)||n<=0) return 0;
   return Math.round(n*100)*1000;
 }
+/* A SAS machine that is switched on but not hearing its satellite Pi sends
+   its own address over and over (the SAS "loop break" chirp); the satellite
+   reports that as chirping. It points at ONE half of the link — the wire
+   from the Pi's transmit pin to the machine — which plain "offline" never
+   could. */
+const SAS_DEAF_SHORT="machine is on but not hearing the Pi";
+const SAS_DEAF_LONG="The machine is switched on with SAS enabled, but the "
+  +"Pi's polls are not reaching it. Check the transmit side of the link: "
+  +"the wire from the Pi's TX pin, through the level shifter, to the machine.";
 function chip(txt, cls, title){
   /* optional title = hover detail (e.g. the raw G2S error code behind a
      machine-worded refusal); omitted everywhere else, so callers are
@@ -1639,7 +1648,8 @@ function sasTile(key,m){
     ?fmtAmt(nCred*denom*1000):null;
   const lamp=m.stale?"STALE":(m.online?"LIVE":"OFFLINE");
   const sub=m.stale?`silent — last report ${Math.round(m.reportAgeSec||0)}s ago`
-                   :(m.online?"on the floor":"waiting for the machine");
+                   :(m.online?"on the floor"
+                     :(m.chirping?SAS_DEAF_SHORT:"waiting for the machine"));
   /* enable/disable machine — two-step on the way off, instant back on
      (mirrors the G2S cabinet toggle). SAS never reports an authoritative
      enabled/disabled state, so the face is the hub-remembered
@@ -2118,6 +2128,8 @@ function floorTile(s){
     const legOn=!!(leg&&leg.online&&!leg.stale);
     st.push(chip("🔗 SAS "+(leg?(getNick(linked)||leg.smibId||linked):linked),
       leg?(legOn?"ok":"bad"):"warn"));
+    if(leg&&!legOn&&!leg.stale&&leg.chirping)
+      st.push(chip("SAS: "+SAS_DEAF_SHORT,"bad",SAS_DEAF_LONG));
   }
 
   /* jackpot banners — one per pending handpay, reset-to-credits headline.

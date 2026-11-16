@@ -433,6 +433,19 @@ class TestSasEnabledPark:
         assert len(wires) >= 6
         assert wires[2] == wires[-1]
 
+    def test_resume_from_park_leads_with_the_sync_poll(self):
+        """We send nothing while parked, and a machine that hears no address
+        byte for 5 s will not answer its own address again until it sees a
+        poll to another one (SAS 6.02 §3.3). So the FIRST frame after a park
+        must be the address-0 poll — not five missed polls to find out."""
+        run = _run_settings_channel()
+        wires = [wire for ph, rep, wire in run["reports"]
+                 if ph == "park" and rep["sasEnabled"] is False]
+        frozen = wires[-1]                      # frames sent when it resumed
+        frames = run["port"].sent_frames
+        assert len(frames) > frozen             # it did resume
+        assert frames[frozen][0] == b"\x80"
+
     def test_parked_commands_refused_with_the_c3_record(self):
         """Both a handpay_reset and a legacy_bonus drained while parked
         draw the exact sas_disabled record — and nothing raises (the

@@ -5914,6 +5914,11 @@ class G2SHost:
         # expected, and oversize strings)
         for k in list(entry):
             entry[k] = _s(entry[k], 128)
+        # chirping: the machine is on with SAS enabled but is not hearing
+        # the satellite (it is sending its SAS loop-break chirp). A strict
+        # bool — absent on older satellites, which then show plain offline.
+        if isinstance(payload.get("chirping"), bool):
+            entry["chirping"] = payload["chirping"]
         # meters: dict of short scalars, capped at 64 keys
         m = payload.get("meters")
         if isinstance(m, dict):
