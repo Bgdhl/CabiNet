@@ -62,7 +62,8 @@ from core.sas_handpay_reset import (HANDPAY_PENDING_EXCEPTION,
                                     HANDPAY_RESET_EXCEPTION)
 from core.hub_ticket_client import HubTicketAuthority, KeepAliveHTTPClient
 from core.sas_ticket_store import DEFAULT_SYSTEM_ID, TicketStore
-from core.sas_tito_host import (SASTITOHost, CMD_SET_EXTENDED_TICKET_DATA,
+from core.sas_tito_host import (SASTITOHost, TicketCaptureOutcome,
+                                CMD_SET_EXTENDED_TICKET_DATA,
                                 CMD_SET_TICKET_DATA,
                                 build_set_extended_ticket_data,
                                 build_set_ticket_data,
@@ -376,6 +377,25 @@ def parse_ticket_data_reply(value):
     return {"propName": prop.strip()[:64], "line1": line1.strip()[:64],
             "line2": line2.strip()[:64], "titleCash": title,
             "expireDays": exp, "rev": rev}
+
+
+def note_ticket_capture(addr, result, recent_events) -> None:
+    """Log one 0x3D/0x3E capture, whatever it found.
+
+    A record the machine marks as a handpay, a restricted ticket or a
+    ticket-in is NOT a ticket (SAS 6.02 Table 15.13c) and was not stored.
+    It gets its own words here and a line on the hub's event tape, so
+    nobody goes looking for a ticket that was never one."""
+    if result.outcome is TicketCaptureOutcome.NOT_A_TICKET:
+        what = result.detail.split(" — ")[0]
+        logger.info("🧾 addr {} validation record that is not a ticket: "
+                    "{} for {} cents — {}", addr, result.validation_number,
+                    result.amount_cents, result.detail)
+        recent_events.appendleft({
+            "code": "0x4D", "label": f"validation record, not a ticket: {what}",
+            "when": time.strftime("%Y-%m-%dT%H:%M:%S")})
+        return
+    logger.info("🎫 addr {} ticket issued: {}", addr, result)
 
 
 class TicketHeaderState:
@@ -1494,8 +1514,8 @@ def main():
         store = TicketStore()   # SAS/data/sas_ticket_state.json (auto-created)
     tito_host = SASTITOHost(
         poller, store,
-        on_ticket_issued=lambda a, r: logger.info(
-            "🎫 addr {} ticket issued: {}", a, r),
+        on_ticket_issued=lambda a, r: note_ticket_capture(
+            a, r, recent_events),
         on_redemption=lambda a, r: logger.info(
             "🎫 addr {} ticket redemption: {}", a, r),
         on_system_validation=on_system_validation,

@@ -70,6 +70,43 @@ def answer_intact(resp: bytes, address: int, command: int) -> bool:
     return sas_crc(resp[:-2]) == int.from_bytes(resp[-2:], "little")
 
 
+NACK_SENDS = 3    # §3.2: the poll, the implied NACK, and the final NACK
+
+
+def transact_reread(transport, frame: bytes, sends: int = NACK_SENDS):
+    """Send a long poll and, while its answer does not arrive correctly,
+    send the IDENTICAL poll again at once. Returns (resp, heard, sent):
+    the answer taken (the last one when none was intact), whether any byte
+    at all came back on any send, and how many times the poll went out.
+
+    Why (2026-11-16, the SAS 6.02 audit, item 1). §3.2: "If the host does
+    not receive the gaming machine's response correctly, it repeats the
+    general or long poll" — that repeat is the implied NACK, and it need
+    not wait for the polling rate. Our callers did not repeat. They sent a
+    DIFFERENT poll next, which Table 3.1 defines as the implied ACK, so a
+    machine that had answered with a record it deletes on ACK (the 0x4D
+    ticket record, §15.10; the 0x1B handpay record, §7.8.1) threw away the
+    one copy of something we never received.
+
+    "Correctly" is answer_intact — the same test ImpliedAckTransport uses
+    to decide an answer needs an ACK — so the two halves of §3 can never
+    disagree: an answer is either acknowledged or asked for again. A
+    well-formed answer the caller cannot USE (a length it does not know) is
+    not asked for again; it would be the same the second time.
+
+    After the third send the document has the machine keep what it was
+    trying to deliver, so a caller that gets nothing usable simply stops;
+    the machine raises its exception again."""
+    key = long_poll_key(frame)
+    resp, heard = b"", False
+    for sent in range(1, max(1, sends) + 1):
+        resp = transport.transact(frame)
+        heard = heard or bool(resp)
+        if key is None or answer_intact(resp, *key):
+            break
+    return resp, heard, sent
+
+
 class ImpliedAckTransport:
     """A SAS transport that never repeats an answered long poll un-ACKed.
 
@@ -82,6 +119,11 @@ class ImpliedAckTransport:
         # the long poll whose intact answer is still waiting for its ACK
         self._answered = None
         self.acks_sent = 0
+        # the long poll sent last, and how many times in a row it has gone
+        # out with no intact answer and nothing else in between
+        self._run_key = None
+        self._run = 0
+        self.resyncs_sent = 0
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
@@ -97,11 +139,30 @@ class ImpliedAckTransport:
     def _before(self, frame: bytes):
         """ACK first when `frame` repeats the long poll just answered.
         Whatever goes out next settles the question either way, so the
-        marker is always cleared."""
+        marker is always cleared.
+
+        The same address-0 poll also goes out before a FOURTH identical
+        long poll in a row. Three is all §3.2 defines — the poll, the NACK,
+        the final NACK — and a machine counts by command byte, so a caller
+        that gives up on one read and starts another with the same command
+        (0x4D look-ahead, then the 0x4D read) would otherwise be talking to
+        a machine that has stopped answering that command. After a final
+        NACK the machine keeps what it was trying to deliver, so this
+        acknowledges nothing; it restarts the count (§3.3)."""
         key = long_poll_key(frame)
         if key is not None and key == self._answered:
             self._send_only(ACK_POLL)
             self.acks_sent += 1
+            self._run = 0
+        elif key is not None and key == self._run_key \
+                and self._run >= NACK_SENDS:
+            self._send_only(ACK_POLL)
+            self.resyncs_sent += 1
+            self._run = 0
+        if key is not None and key == self._run_key:
+            self._run += 1
+        else:
+            self._run_key, self._run = key, (0 if key is None else 1)
         self._answered = None
         return key
 

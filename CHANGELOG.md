@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.3.8
+First batch from an audit of the SAS code against the SAS 6.02 document.
+- **A printed ticket can no longer go missing because one answer arrived
+  damaged.** A machine hands over the record of a printed ticket once, and
+  deletes it as soon as the host's next poll counts as "got it". When that
+  answer arrived garbled, the document has the host send the same poll
+  again. The SAS box sent a different one, which is the "got it", so the
+  machine threw away the only copy and the hub then refused the paper at
+  every machine as an unknown number. Now a damaged or missing answer is
+  asked for again, up to twice, with nothing sent in between. The SAS box
+  also looks at the record first without taking it, and stores that copy
+  if the real read still fails. The handpay record is read the same way.
+- **A handpay is no longer stored as a ticket.** A machine keeps handpays,
+  handpay receipts, restricted tickets and redeemed tickets in the same
+  list as the tickets it prints, and says which is which. That was
+  ignored: every record became a redeemable ticket on the hub, so a
+  handpay receipt could have been paid a second time. Only cash tickets
+  are stored now. Anything else is logged and shown on the machine's event
+  list as "validation record, not a ticket".
+- **The same command is never sent a fourth time in a row.** The document
+  defines three; a strict machine stops answering after that.
+- Tests for these run against a new pretend machine that keeps the
+  document's rules, since a Bluebird 2 forgives all three. Not yet tried on
+  a strict machine.
+
 ## v0.3.7
 - **The ticket header reaches a machine that was not ready for it.** The
   SAS box sent the header once each time a machine came onto the link. A
