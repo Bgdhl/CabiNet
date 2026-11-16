@@ -19,6 +19,13 @@
   hidden on the hub's own kiosk. Scrolling is still a swipe, and if you
   plug in a real mouse the pointer comes back as soon as it moves. Other
   browsers, small windows and phones are not affected.
+- **Icons show on a screen that has no emoji font.** The pages use emoji
+  as icons, and a Raspberry Pi has no emoji font, so on the hub's own
+  touchscreen (and on a wall board run from a Pi) every icon was an empty
+  box. The hub now carries a small emoji font of its own and the pages
+  fall back to it when the device has none. It comes with this update:
+  nothing to install, and it works with no internet. Phones and computers
+  keep using their own emoji.
 - **An open kiosk page picks up a change to the on-screen keyboard.** It
   already reloaded itself when the hub page changed; it now does the same
   when only the keyboard file changes.

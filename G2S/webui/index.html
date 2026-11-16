@@ -15,13 +15,22 @@
   desktop browsers alike.
 -->
 <style>
+  /* Emoji for a device that has no emoji font of its own (the hub's
+     touchscreen, a wall TV): a small subset of Noto Color Emoji that the hub
+     serves itself — see G2S/tools/build_emoji_font.py. Last in every font
+     stack below, after the device's own emoji fonts, and only fetched when
+     a page actually has to draw one from it. */
+  @font-face{font-family:"CabiNet Emoji";font-display:swap;
+    src:url("/webui/emoji.woff2") format("woff2");
+    unicode-range:U+200D,U+20E3,U+FE0F,U+2300-23FF,U+2600-27BF,U+2B00-2BFF,
+      U+1F000-1FFFF}
   :root{
     --bg:#0f0c07; --panel:#171208; --panel2:#201a0e; --inset:#0b0906;
     --line:#332a18; --line2:#241d10;
     --txt:#f0e7d2; --dim:#a09070; --faint:#6f6248;
     --amber:#ffb92e; --ok:#46d97f; --bad:#ff5f56; --info:#59b7ff;
-    --mono:ui-monospace,"Cascadia Mono",Consolas,"DejaVu Sans Mono",Menlo,monospace;
-    --sans:-apple-system,"Segoe UI",Roboto,"DejaVu Sans",Arial,sans-serif;
+    --mono:ui-monospace,"Cascadia Mono",Consolas,"DejaVu Sans Mono",Menlo,monospace,"Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji","CabiNet Emoji";
+    --sans:-apple-system,"Segoe UI",Roboto,"DejaVu Sans",Arial,sans-serif,"Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji","CabiNet Emoji";
   }
   *{box-sizing:border-box}
   html,body{margin:0}

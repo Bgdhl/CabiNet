@@ -5,6 +5,15 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>CabiNet · Gameroom Board</title>
 <style>
+  /* Emoji for a device that has no emoji font of its own (the hub's
+     touchscreen, a wall TV): a small subset of Noto Color Emoji that the hub
+     serves itself — see G2S/tools/build_emoji_font.py. Last in every font
+     stack below, after the device's own emoji fonts, and only fetched when
+     a page actually has to draw one from it. */
+  @font-face{font-family:"CabiNet Emoji";font-display:swap;
+    src:url("/webui/emoji.woff2") format("woff2");
+    unicode-range:U+200D,U+20E3,U+FE0F,U+2300-23FF,U+2600-27BF,U+2B00-2BFF,
+      U+1F000-1FFFF}
 /* ==========================================================================
    THE GAMEROOM BOARD v2 — a wall-TV spectator page (Fun-menu "Big Board").
    Self-contained (offline slot LAN, no CDN). Modern browser assumed (the
@@ -28,9 +37,9 @@
   --gold:#d9a94f; --gold-hi:#f2d492; --gold-deep:#93692a;
   --felt:#46c483; --felt-deep:#1c3a2b;
   --ruby:#e0564d; --ruby-deep:#43201c;
-  --display:Georgia,"Palatino Linotype","Book Antiqua","Times New Roman",serif;
-  --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
-  --mono:ui-monospace,"Cascadia Mono","JetBrains Mono",Menlo,Consolas,monospace;
+  --display:Georgia,"Palatino Linotype","Book Antiqua","Times New Roman",serif,"Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji","CabiNet Emoji";
+  --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif,"Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji","CabiNet Emoji";
+  --mono:ui-monospace,"Cascadia Mono","JetBrains Mono",Menlo,Consolas,monospace,"Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji","CabiNet Emoji";
 }
 *{box-sizing:border-box;margin:0;padding:0}
 html,body{height:100%}

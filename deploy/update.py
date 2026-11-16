@@ -84,6 +84,7 @@ G2S_GATES = (
     "test_satellite_catchup.py",
     "test_web_auth.py",
     "test_update_verify.py",
+    "test_emoji_font.py",
 )
 
 # Satellites get the whole SAS tree minus data/caches. It is a SET, not a file:
