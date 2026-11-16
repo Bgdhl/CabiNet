@@ -154,7 +154,13 @@ HOST_SETTING_KEYS = ("sysval_fallback", "house_allow_negative",
                      # tools/hub_login.py — /api/settings never touches them.
                      # web_login_idle_min: minutes of no use before a session
                      # is signed out, "0" = never.
-                     "web_login_required", "web_login_idle_min")
+                     "web_login_required", "web_login_idle_min",
+                     # Settings ▸ Debug tab (v0.3.5). "1" = the hub page
+                     # shows its Debug tab to admin logins; absent/"0" =
+                     # hidden, the default — day to day nobody needs it. A
+                     # display switch only: the /api/debug/* endpoints are
+                     # admin-gated either way.
+                     "ui_debug_tab")
 TICKET_TEXT_KEYS = ("ticket_prop_name", "ticket_line1", "ticket_line2",
                     "ticket_title_cash")
 MAX_TICKET_FIELD_LEN = 64

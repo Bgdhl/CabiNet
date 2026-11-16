@@ -676,6 +676,24 @@ def http_layer():
         with open(os.path.join(webui, name), encoding="utf-8") as f:
             check(f"keyboard: {name} loads the on-screen keyboard",
                   '<script src="/webui/osk.js"></script>' in f.read())
+    # An open kiosk page reloads when the hub's uiStamp changes. The stamp
+    # must move when osk.js changes too, not only home.html — the keyboard
+    # and the kiosk's look live in osk.js.
+    hp, kp = os.path.join(webui, "home.html"), os.path.join(webui, "osk.js")
+    keep = [(p, os.stat(p)) for p in (hp, kp)]
+    try:
+        os.utime(hp, (1_700_000_000, 1_700_000_000))
+        os.utime(kp, (1_700_000_500, 1_700_000_500))
+        check("keyboard: a newer osk.js moves the page stamp",
+              g2s_host.home_ui_stamp() == 1_700_000_500,
+              g2s_host.home_ui_stamp())
+        os.utime(kp, (1_600_000_000, 1_600_000_000))
+        check("keyboard: ...and an older one leaves it at home.html's",
+              g2s_host.home_ui_stamp() == 1_700_000_000,
+              g2s_host.home_ui_stamp())
+    finally:
+        for p, st_ in keep:
+            os.utime(p, ns=(st_.st_atime_ns, st_.st_mtime_ns))
     st, js, raw, _ = anon.get("/api/status?slim=1")
     check("display: /api/status answers, as the display view",
           st == 200 and js.get("loginRequired") is True

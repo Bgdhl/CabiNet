@@ -187,6 +187,37 @@ def main():
           code == 200 and body.get("sasEnabled") is True and
           body.get("sasLink") == SAS, body)
 
+    print("— Settings ▸ Debug tab (v0.3.5): hidden unless switched on")
+    check("ships off: nothing stored means hidden",
+          eng.hub_store.host_setting("ui_debug_tab", "0") == "0")
+    code, body = settings(eng, {"debugTab": True})
+    check("debugTab:true -> 200, echoed, stored",
+          code == 200 and body.get("debugTab") is True
+          and eng.hub_store.host_setting("ui_debug_tab", "0") == "1",
+          (code, body))
+    code, body = settings(eng, {"debugTab": False})
+    check("debugTab:false -> 200, stored off",
+          code == 200 and body.get("debugTab") is False
+          and eng.hub_store.host_setting("ui_debug_tab", "0") == "0",
+          (code, body))
+    for junk in ("yes", 1, None, [True]):
+        code, body = settings(eng, {"debugTab": junk})
+        check(f"debugTab:{junk!r} -> 400 (a strict boolean)",
+              code == 400 and "debugTab" in body.get("error", ""),
+              (code, body))
+    check("...and junk never reaches the store",
+          eng.hub_store.host_setting("ui_debug_tab", "0") == "0")
+    with open(os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "webui", "home.html"),
+            encoding="utf-8") as f:
+        home = f.read()
+    check("the page reads the switch and offers it in Settings",
+          "hostOptions||{}" in home and "debugTabToggle(this)" in home
+          and "function tabShown(id)" in home)
+    check("the tab bar shares its width among the tabs that are shown",
+          "grid-auto-flow:column;grid-auto-columns:1fr" in home
+          and "repeat(7,1fr)" not in home)
+
     print("— uniqueness: one SAS leg, ONE owner")
     # Two G2S cards claiming the same leg would double-face that leg's
     # credits (two tiles, one machine) — the floor double-count linking

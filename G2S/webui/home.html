@@ -23,6 +23,24 @@
   the host root / serves THIS page).
 -->
 <style>
+  /* Emoji for a device that has no emoji font of its own (the hub's
+     touchscreen, a wall TV): a small subset of Noto Color Emoji that the hub
+     serves itself — see G2S/tools/build_emoji_font.py.
+     It goes FIRST in the font stacks, and only on a device that needs it
+     (html.emoji-own, set by the script under this style block once the font
+     has loaded). First, because Chromium on the hub's kiosk does not
+     reliably reach a web font listed AFTER system fonts: the tab bar stayed
+     empty boxes while the same emoji drew elsewhere (2026-11-16). The
+     unicode-range keeps it away from letters, digits and arrows. */
+  @font-face{font-family:"CabiNet Emoji";font-display:swap;
+    src:url("/webui/emoji.woff2") format("woff2");
+    unicode-range:U+200D,U+20E3,U+FE0F,U+2300-23FF,U+2600-27BF,U+2B00-2BFF,
+      U+1F000-1FFFF}
+  :root.emoji-own{
+    --display:"CabiNet Emoji",Georgia,"Palatino Linotype","Book Antiqua","Times New Roman",serif;
+    --sans:"CabiNet Emoji",-apple-system,"Segoe UI",Roboto,"DejaVu Sans",Arial,sans-serif;
+    --mono:"CabiNet Emoji",ui-monospace,"Cascadia Mono",Consolas,"DejaVu Sans Mono",Menlo,monospace;
+  }
   /* ---- tokens: mahogany lounge ---------------------------------------- */
   :root{
     --bg:#150f0b; --bg-hi:#241812;
@@ -78,7 +96,9 @@
   #tabs-top .tab.on{color:var(--gold-hi);border-color:var(--gold-deep);
     background:linear-gradient(180deg,#2b2013,#241a0f)}
   #tabbar{position:fixed;left:0;right:0;bottom:0;z-index:40;display:none;
-    grid-template-columns:repeat(7,1fr);height:62px;
+    /* equal columns for the tabs that are SHOWN: a fixed 7 left a gap at the
+       right whenever one was hidden (a normal login, or Debug switched off) */
+    grid-auto-flow:column;grid-auto-columns:1fr;height:62px;
     background:linear-gradient(180deg,#1c130d,#150e09);
     border-top:1px solid var(--line)}
   #tabbar .tab{appearance:none;border:0;background:none;cursor:pointer;
@@ -533,6 +553,31 @@
     .brand .sub{display:none}
   }
 </style>
+<script>
+/* Does this device draw emoji by itself? Paint one in black and look for any
+   colour. A phone or a desktop does, and keeps its own. A Pi does not: load
+   the hub's font and, once it HAS loaded, put it first in the font stacks
+   (html.emoji-own) — see the note on @font-face above. */
+(function(){
+  function own(){
+    try{
+      var c=document.createElement("canvas"); c.width=c.height=24;
+      var x=c.getContext("2d"); x.textBaseline="top"; x.font="18px sans-serif";
+      x.fillStyle="#000"; x.fillText("\u{1F3B0}",1,1);
+      var d=x.getImageData(0,0,24,24).data;
+      for(var i=0;i<d.length;i+=4)
+        if(d[i+3]>64&&(d[i]>48||d[i+1]>48||d[i+2]>48)) return true;
+    }catch(e){}
+    return false;
+  }
+  if(own()) return;
+  try{
+    document.fonts.load('16px "CabiNet Emoji"',"\u{1F3B0}").then(function(f){
+      if(f&&f.length) document.documentElement.classList.add("emoji-own");
+    },function(){});
+  }catch(e){}
+})();
+</script>
 <!-- on-screen keyboard for a hub with no physical one (touch kiosk) -->
 <script src="/webui/osk.js"></script>
 </head>
@@ -650,7 +695,6 @@
              aria-label="Search tickets by validation number" oninput="tkSearch()">
     </div>
     <div class="dchips" id="tk-states" style="margin:0 0 12px"></div>
-    <div id="tk-dev" style="margin:0 0 12px"></div>
     <div class="card"><h2>Tickets <span class="hn" id="tk-n"></span></h2>
       <div class="body" id="tk-list" style="padding-top:2px"></div></div>
     <div id="tk-more" style="margin-top:12px"></div>
@@ -1322,6 +1366,7 @@ async function tickStatus(){
       if(j&&j.loginRequired===true){goLogin(); return;}
       S.status=j;
       S.statusErr=false;
+      tabsApply();            // the Debug tab follows hostOptions.debugTab
       uiStampCheck(j.uiStamp);
       sasResultCheck(j);
       keyOffCheck(j);
@@ -4330,26 +4375,40 @@ function xmBadge(origin, redeemer){
   return `<span class="xm">${esc(titoName(origin))}`+
     ` <span class="ar">→</span> ${esc(titoName(redeemer))}</span>`;
 }
+/* Does this SAS machine ticket over SAS, and is that working right now?
+   -> null when there is no sign it does (the caller falls back to the G2S
+   ticket device), else {on, why}.
+   A machine tickets through ONE system — whichever its own validation
+   setting names (AJ 2026-11-16: the Bluebird 2 tickets over SAS, and after
+   a fresh image the page said "ticketing off" for it from the G2S voucher
+   device's hostEnabled flag while tickets printed and redeemed fine).
+   Evidence, from the satellite's own report: the machine accepted the hub's
+   ticket header this session (ticketData.appliedRev — it answered the SAS
+   extended-ticket-data polls), or the satellite holds tickets from it
+   (tickets.total — which also covers a machine that is switched off, when
+   appliedRev is unknown). SAS has no ticketing on/off of its own to switch:
+   it works whenever the SAS link is up, so "on" IS the link. */
+function sasTicketing(m){
+  if(!m) return null;
+  const td=m.ticketData||{};
+  const n=Number((m.tickets||{}).total)||0;
+  if(td.appliedRev==null && !n) return null;
+  if(m.sasEnabled===false) return {on:false, why:"SAS is off"};
+  if(m.stale) return {on:false, why:"its Pi is not reporting"};
+  if(!m.online) return {on:false,
+    why:m.chirping?SAS_DEAF_SHORT:"SAS link is down"};
+  return {on:true, why:""};
+}
+/* One machine's ticketing line for Settings · Machines (dim when on, warm
+   when off — an off line is the thing worth noticing). */
+function tkLine(on, text){
+  return `<div class="kd" style="color:var(${on?"--dim":"--gold-hi"})">${esc(text)}</div>`;
+}
 function renderTickets(){
   setHTML($("tk-pend"), S.caps.vouchers===false?pendChip("The ticket browser"):"");
   setHTML($("tk-states"), TK_STATES.map(([v,l])=>
     `<button class="fchip ${S.tk.state===v?"on":""}" aria-pressed="${S.tk.state===v}"
       onclick="tkState('${v}')">${esc(l)}</button>`).join(""));
-
-  /* per-machine ticketing device state + on/off (feature-detected) */
-  const devRows=[];
-  for(const e of egmList()){
-    const vd=snap(e).voucherDevice;
-    if(!vd) continue;
-    const st=vd.status||{};
-    const on=String(st.hostEnabled)!=="false";
-    devRows.push(`<span class="chip ${on?"ok":"warn"}">${esc(machineName(snap(e),e))}
-      · ticketing ${on?"on":"off"}</span>
-      <button class="btn slim ${on?"danger":""}" data-egm="${esc(e)}" data-en="${on?"0":"1"}"
-        onclick="tkToggle(this)"><span class="bl">${on?"Turn ticketing off":"Turn ticketing on"}</span></button>`);
-  }
-  setHTML($("tk-dev"), devRows.length
-    ?`<div class="chips" style="align-items:center">${devRows.join("")}</div>`:"");
 
   /* partial numbers filter the loaded pages client-side; a full-length
      number already went to the hosts' exact-match vid= lookups
@@ -4818,6 +4877,15 @@ async function ticketSave(){
   const ok=await settingsPost(body,"Ticket header");
   if(ok) tickStatus();
 }
+async function debugTabToggle(btn){
+  /* Debug tab shown/hidden — a display switch, no arm. Every open hub page
+     follows on its next poll; this one reconciles straight away. */
+  const cur=debugTabOn();
+  const ok=await settingsPost({debugTab:!cur},
+    !cur?"Debug tab shown":"Debug tab hidden");
+  flash(btn,ok);
+  if(ok) tickStatus();
+}
 async function boardToggle(btn){
   /* Gameroom board on/off — reversible display toggle, no arm. The board
      page reads hostOptions.boardEnabled every poll and blanks itself. */
@@ -5045,6 +5113,22 @@ function renderSettings(){
        otherwise) — plus the focus hold above. */
     const tk=(ho.ticket&&typeof ho.ticket==="object")?ho.ticket:null;
     const tv=k=>(tk&&tk[k]!=null)?String(tk[k]):"";
+    /* Debug tab — feature-detected like the rest (an older hub has no
+       hostOptions.debugTab and keeps showing the tab). */
+    const dbgOn=!!ho.debugTab;
+    const debugHtml=ho.debugTab===undefined?"":`
+      <div class="hblk">
+        ${htLine("debugtab","🛠️ Debug tab")}
+        ${HINTS.debugtab?`<p class="none">The live host log, raw machine state and
+          protocol tools. Hidden unless you turn it on: day to day nobody needs
+          it. Switching it on shows it to admin logins, in every browser and on
+          the hub's own screen.</p>`:""}
+        <div class="btnrow" style="margin-top:8px">
+          <button class="btn slim ${dbgOn?"":"gold"}" onclick="debugTabToggle(this)">
+            <span class="bl">${dbgOn?"Hide the Debug tab":"Show the Debug tab"}</span>
+            <span class="ba">${dbgOn?"showing":"hidden"}</span></button>
+        </div>
+      </div>`;
     const tkHtml=!tk?"":`
       <div class="hblk">
         ${htLine("ticket","🎫 Ticket header")}
@@ -5089,17 +5173,43 @@ function renderSettings(){
             <span class="bl">${on?"Turn off":"Turn on"}</span></button>
         </div>
       </div>
-      ${tkHtml}</div>`);
+      ${tkHtml}
+      ${debugHtml}</div>`);
   }
   /* Machines — every machine the hub knows, G2S + SAS; the SAS rows carry
-     the on/off switch (this is where a hidden machine gets re-enabled). */
+     the on/off switch (this is where a hidden machine gets re-enabled).
+     TICKETING lives here too (AJ 2026-11-16): each machine's ticketing
+     state, and the switch for a machine that tickets over G2S. It used to
+     head the Tickets page, but someone opens that to look a ticket up or
+     void one, not to see or set what a machine is doing — that is a
+     per-machine switch, and these are the per-machine switches.
+     A machine tickets through one system: when its linked SAS side carries
+     the tickets, the G2S row only says so and offers no switch, because the
+     G2S ticket device does not control anything there. */
   const rows=[];
   for(const e of egmList()){
     const s=snap(e);
+    const lk=(s.sasLink!==undefined)?sasLinkFace(e,s):"";
+    const leg=lk?((((S.status||{}).sas||{})[lk])||null):null;
+    const vd=s.voucherDevice;
+    let tk="", tkBtn="";
+    if(sasTicketing(leg)){
+      tk=tkLine(true,"tickets run over SAS — see "
+        +(getNick(lk)||leg.smibId||lk)+" below");
+    }else if(vd){
+      const on=String((vd.status||{}).hostEnabled)!=="false";
+      tk=tkLine(on, on?"ticketing on":"ticketing off");
+      tkBtn=`<button class="btn slim ${on?"danger":"gold"}" data-egm="${esc(e)}"
+          data-en="${on?"0":"1"}" onclick="tkToggle(this)">
+        <span class="bl">${on?"Turn ticketing off":"Turn ticketing on"}</span>
+        <span class="ba">${on?"pause tickets on this machine"
+                             :"tickets on this machine again"}</span></button>`;
+    }
     rows.push(`<div class="acct">
       <div class="an"><div class="nm">${esc(machineName(s,e))}</div>
-        <div class="kd">${esc(e)}</div></div>
+        <div class="kd">${esc(e)}</div>${tk}</div>
       ${chip("G2S","gold")}
+      ${tkBtn}
     </div>`);
   }
   /* Ticket-header lag note: a SAS satellite reports the rev it last APPLIED
@@ -5113,10 +5223,13 @@ function renderSettings(){
     const td=m.ticketData;
     const tkPend=tkRev!=null&&td&&typeof td==="object"
       &&!(typeof td.appliedRev==="number"&&td.appliedRev>=tkRev);
+    const sasTk=sasTicketing(m);      // null = no sign it tickets over SAS
     rows.push(`<div class="acct">
       <div class="an"><div class="nm">${esc(getNick(k)||m.smibId||k)}</div>
         <div class="kd">${esc(k)}</div>
         ${en?"":`<div class="kd" style="color:var(--dim)">SAS off — hidden from the floor</div>`}
+        ${sasTk?tkLine(sasTk.on, sasTk.on?"ticketing on"
+                                         :"ticketing off — "+sasTk.why):""}
         ${tkPend?`<div class="kd" style="color:var(--dim)">ticket header pending</div>`:""}</div>
       ${chip("SAS","gold")}
       <button class="btn slim ${en?"danger":"gold"}" onclick="sasEnabledToggle('${jsq(k)}',this)">
@@ -6198,6 +6311,30 @@ document.addEventListener("keydown",e=>{
 const AUTH={known:false, required:false, signedIn:false, user:null,
             role:"admin", idleMin:30, logins:null, me:null};
 const ADMIN_TABS=["settings","debug"];
+/* The Debug tab is the host log and protocol tools: useful to the few who
+   want it, noise to everyone else. It ships hidden; Settings ▸ Debug tab
+   shows it (a hub-wide switch — hostOptions.debugTab — so it holds on the
+   kiosk too, whose browser forgets everything between starts). */
+function debugTabOn(){
+  const ho=(S.status||{}).hostOptions;
+  if(!ho) return false;                  // the hub has not answered yet
+  /* an older hub has no switch: the tab shows, as it always did */
+  return ho.debugTab===undefined || ho.debugTab===true;
+}
+function tabShown(id){
+  if(!ADMIN_TABS.includes(id)) return true;
+  if(!isAdmin()) return false;
+  return id!=="debug" || debugTabOn();
+}
+function tabsApply(){
+  for(const el of document.querySelectorAll("#tabs-top .tab,#tabbar .tab"))
+    el.style.display=tabShown(el.dataset.tab)?"":"none";
+  /* Standing on a tab that is no longer shown: back to the Floor. Not until
+     the hub has answered both questions, though (who is signed in, and is
+     Debug switched on) — before that the tab only LOOKS hidden, and a
+     reload on #debug or #settings must land where it was. */
+  if(!tabShown(S.tab) && AUTH.known && S.status) goTab("floor");
+}
 function isAdmin(){return AUTH.role==="admin";}
 async function authTick(){
   try{
@@ -6218,10 +6355,7 @@ function authApply(){
     w.style.display="";
     w.textContent="👤 "+AUTH.user+(isAdmin()?"":" · normal");
   }else w.style.display="none";
-  for(const el of document.querySelectorAll("#tabs-top .tab,#tabbar .tab"))
-    if(ADMIN_TABS.includes(el.dataset.tab))
-      el.style.display=isAdmin()?"":"none";
-  if(!isAdmin()&&ADMIN_TABS.includes(S.tab)) goTab("floor");
+  tabsApply();
   $("card-login").style.display=(AUTH.known&&isAdmin())?"":"none";
   if(AUTH.known&&isAdmin()&&AUTH.logins===null) loginsFetch();
   renderLogin();

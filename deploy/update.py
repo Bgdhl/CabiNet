@@ -84,6 +84,7 @@ G2S_GATES = (
     "test_satellite_catchup.py",
     "test_web_auth.py",
     "test_update_verify.py",
+    "test_emoji_font.py",
 )
 
 # Satellites get the whole SAS tree minus data/caches. It is a SET, not a file:
@@ -1692,6 +1693,34 @@ def verify(hub_url, sats, machines, comps, dry, key=None):
     return True
 
 
+#: The hub's own touchscreen kiosk, by either name it has shipped under.
+KIOSK_UNITS = ("/etc/systemd/system/cabinet-kiosk.service",
+               "/etc/systemd/system/casinonet-kiosk.service")
+KIOSK_POINTER_RULE = "/etc/udev/rules.d/99-cabinet-kiosk-pointer.rules"
+
+
+def kiosk_notes(root, exists=os.path.exists):
+    """Say what an update cannot fix but one command can.
+
+    The updater runs as the hub's own login and may restart cabinet-g2s —
+    nothing else. Anything that needs root (a udev rule, a unit file) is out
+    of its reach, and silently leaving it broken helps nobody. So when it can
+    SEE the gap without root, it names the command that closes it.
+
+    Today that is one thing: a kiosk set up before v0.3.5 draws a mouse arrow
+    in the middle of the touchscreen (deploy/99-cabinet-kiosk-pointer.rules
+    has the why). -> True if it said anything."""
+    if not any(exists(u) for u in KIOSK_UNITS) or exists(KIOSK_POINTER_RULE):
+        return False
+    say("")
+    say("   💡 This hub's touchscreen shows a mouse arrow in the middle of "
+        "the screen.")
+    say("      An update cannot remove it (that needs root). One command "
+        "does, for good:")
+    say("        sudo %s" % os.path.join(root, "deploy", "kiosk_pointer.sh"))
+    return True
+
+
 def repair_upstream(root):
     """Give the clone a working @{u}, or the whole run lies (2026-08-17).
 
@@ -2490,6 +2519,7 @@ def main():
         say("   Your data snapshot is kept at %s" % snapshot)
     say("   If a kiosk/tablet is showing the UI, hard-reload it — the browser "
         "will be holding the old page.")
+    kiosk_notes(root)
     return 0
 
 

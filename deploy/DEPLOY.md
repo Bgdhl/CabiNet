@@ -174,6 +174,14 @@ On a Pi 5 with the DSI touchscreen, also run `sudo ./deploy/kiosk_setup.sh`
 for the on-hub kiosk — the web UI is the same thing in any browser, so a
 generic box skips this.
 
+If the touchscreen shows a mouse arrow in the middle of the screen (a kiosk
+set up before v0.3.5 does), run `sudo ./deploy/kiosk_pointer.sh` on the hub
+once. The Pi's HDMI ports count as pointing devices, so the kiosk draws a
+cursor for a mouse that is not there; the script installs the one rule that
+stops it and restarts the kiosk. `kiosk_setup.sh` does the same on a new
+kiosk. The hub also carries its own emoji font, so the page's icons draw on
+a Pi with nothing extra installed.
+
 ### By hand (what the script does)
 
 1. **Clone the repo** (adjust the path to taste — the units below assume

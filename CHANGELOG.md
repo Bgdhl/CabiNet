@@ -1,5 +1,52 @@
 # Changelog
 
+## v0.3.5
+- **Ticketing status moved from the Tickets page to Settings, and it is
+  now right for a machine that tickets over SAS.** The Tickets page is for
+  looking a ticket up or voiding one, so the row of machine chips and the
+  "Turn ticketing on/off" button are gone from it. Each machine's
+  ticketing state now sits with the other per-machine switches, under
+  **Settings → Machines**:
+  - a machine that tickets over G2S shows **ticketing on** or **off** and
+    keeps its "Turn ticketing off/on" button;
+  - a machine that tickets over SAS shows **ticketing on**, or **off** with
+    the reason (the SAS link is down, its Pi is not reporting, the machine
+    is not hearing the Pi, or SAS is off). It has no button, because SAS
+    ticketing follows the link. Before, such a machine (a Bluebird 2, for
+    one) could say "ticketing off" while it printed and redeemed tickets
+    normally, because only its G2S ticket device was looked at.
+- **The Debug tab is hidden unless you turn it on.** It is the live host
+  log and the protocol tools, which most people never need. It now ships
+  hidden, and **Settings → Host options → Debug tab** shows it again. The
+  switch is kept on the hub, so it applies in every browser and on the
+  hub's own screen, and only admin logins see the tab. After this update
+  the tab is hidden on every hub until someone switches it on. The tab
+  bar also fills its width now when a tab is hidden.
+- **No scroll bars on the hub's touchscreen.** The kiosk drew a pale
+  desktop scroll bar down the side of every page. It is gone on the hub's
+  own kiosk; scrolling is still a swipe. Other browsers, small windows and
+  phones are not affected.
+- **No mouse arrow on the hub's touchscreen — one command on an existing
+  kiosk.** The kiosk parked an arrow in the middle of the screen. It was
+  never a mouse: the Pi's HDMI ports count as pointing devices. Removing it
+  takes a system rule that only root can install, which an update cannot
+  do, so:
+  - a kiosk set up from now on (`sudo ./deploy/kiosk_setup.sh`) has it;
+  - on a kiosk you already have, run **`sudo ./deploy/kiosk_pointer.sh`**
+    on the hub once. The screen restarts and, if the hub login is on, asks
+    you to sign in again. The updater reminds you of the command until it
+    is done. `--undo` puts the arrow back. A real mouse still works.
+- **Icons show on a screen that has no emoji font.** The pages use emoji
+  as icons, and a Raspberry Pi has no emoji font, so on the hub's own
+  touchscreen (and on a wall board run from a Pi) every icon was an empty
+  box. The hub now carries a small emoji font of its own, and a page uses
+  it when it finds the device has none. It comes with this update:
+  nothing to install, and it works with no internet. Phones and computers
+  keep using their own emoji.
+- **An open kiosk page picks up a change to the on-screen keyboard.** It
+  already reloaded itself when the hub page changed; it now does the same
+  when only the keyboard file changes.
+
 ## v0.3.4
 - **Use a ticket again.** Open any ticket on the Tickets page and press
   **Set back to Issued**: the same paper can be redeemed once more. It

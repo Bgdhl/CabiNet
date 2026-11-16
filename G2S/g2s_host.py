@@ -125,7 +125,7 @@ if "tournament_names" not in _hub_store_mod.HOST_SETTING_KEYS:
 # the MINOR bump per the repo's version rule). Surfaced in engine_meta() ->
 # /api/status ["_engine"]["version"]; bump this and add a CHANGELOG.md
 # section on every commit with a user-visible change.
-CABINET_VERSION = "0.3.4"
+CABINET_VERSION = "0.3.5"
 
 WSDL_NS = "http://www.gamingstandards.com/wsdl/g2s/v1.0"
 SCHEMA_NS = "http://www.gamingstandards.com/g2s/schemas/v1.0.3"
@@ -21948,6 +21948,26 @@ class G2SHost:
 # HTTP layer
 # ----------------------------------------------------------------------------
 
+def home_ui_stamp():
+    """The Home page's build watermark (/api/status uiStamp): the newest
+    mtime of home.html AND the script it loads, osk.js. An open kiosk page
+    reloads itself when this changes, and /api/command refuses a page whose
+    stamp is behind — so both read it from here, or they disagree.
+
+    osk.js has to count: it carries the on-screen keyboard and the kiosk's
+    look, and until 2026-11-16 a deploy that changed only that file left
+    the kiosk running the old script until someone restarted the kiosk
+    service. Raises OSError if home.html is missing (callers already treat
+    that as "no stamp"); a tree with no osk.js just uses home.html."""
+    base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webui")
+    stamp = int(os.path.getmtime(os.path.join(base, "home.html")))
+    try:
+        stamp = max(stamp, int(os.path.getmtime(os.path.join(base, "osk.js"))))
+    except OSError:
+        pass
+    return stamp
+
+
 # G2S-36 Test Panel: content types for the webui/ static tree, keyed by
 # extension (stdlib-only — no mimetypes surprises across Pi OS images).
 # Anything unknown ships as octet-stream rather than guessing.
@@ -22622,6 +22642,11 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                         # blanks the page render, the route always serves.
                         "boardEnabled": engine.hub_store.host_setting(
                             "board_enabled", "1") == "1",
+                        # Debug tab on the hub page: ships OFF (it is the
+                        # host log and protocol tools — useful to the few
+                        # who want it, noise to everyone else).
+                        "debugTab": engine.hub_store.host_setting(
+                            "ui_debug_tab", "0") == "1",
                         # Lock-message brand (2026-08-17): ON = a locked
                         # machine's own screen names the GAMEROOM ("Locked
                         # by THE GOLDEN PALACE"), OFF = the neutral "the
@@ -22674,9 +22699,7 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                     # this changes, so a webui deploy shows up without restarting
                     # the kiosk service. One stat per poll — negligible.
                     try:
-                        snap["uiStamp"] = int(os.path.getmtime(os.path.join(
-                            os.path.dirname(os.path.abspath(__file__)),
-                            "webui", "home.html")))
+                        snap["uiStamp"] = home_ui_stamp()
                     except OSError:
                         pass
                     # smib.html's OWN mtime: the BB2 panel is a kiosk too (no keyboard
@@ -23035,9 +23058,7 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
         ui_stamp = req.get("uiStamp")
         if ui_stamp is not None:
             try:
-                cur_stamp = int(os.path.getmtime(os.path.join(
-                    os.path.dirname(os.path.abspath(__file__)),
-                    "webui", "home.html")))
+                cur_stamp = home_ui_stamp()
             except OSError:
                 cur_stamp = None
             try:
@@ -25177,6 +25198,7 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                                                    leg (task #20) — the SAS
                                                    key, null/"" unlinks
           {"sysvalFallback": bool}                 host option
+          {"debugTab": bool}                       show the page's Debug tab
           {"ticketPropName"/"ticketLine1"/"ticketLine2"/"ticketTitleCash":
            str}  ticket-header fields (C3) — strict strings, stripped,
                  64-char bound, "" clears the tenant. ANY accepted ticket
@@ -25410,6 +25432,16 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                 engine.hub_store.set_host_setting(
                     "board_enabled", "1" if be else "0")
                 out["boardEnabled"] = be
+            if "debugTab" in req:
+                # Settings ▸ Debug tab. Strict boolean; stored "1"/"0"; every
+                # open hub page reads it off hostOptions on its next poll
+                # and shows or hides the tab — no restart, no push.
+                dt = req.get("debugTab")
+                if not isinstance(dt, bool):
+                    raise ValueError("debugTab must be a boolean")
+                engine.hub_store.set_host_setting(
+                    "ui_debug_tab", "1" if dt else "0")
+                out["debugTab"] = dt
             if "lockBrandGameroom" in req:
                 # Settings ▸ Gameroom: what a locked machine's screen says.
                 # Strict boolean, stored "1"/"0"; lock_sayer() reads it live
@@ -25620,6 +25652,7 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                                  "machineKey + sasCashoutReady, "
                                  "companionId + g2sEgmId (assign a Companion), "
                                  "sysvalFallback, houseAllowNegative, "
+                                 "debugTab, "
                                  "houseBankrollMc, gameroomName, "
                                  "tournamentNames and/or the "
                                  "ticket-header fields (ticketPropName/"

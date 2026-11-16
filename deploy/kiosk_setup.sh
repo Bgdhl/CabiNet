@@ -14,8 +14,10 @@
 #                                           http://127.0.0.1:8081/home?kiosk=1
 #      install cabinet-console.service -> tty2: the curses debug cockpit
 #                                           (it lived on tty1 before)
-#   3. disable getty@tty1 (the kiosk owns VT1; Conflicts= also enforces it)
-#   4. enable + (re)start both units
+#   3. install a udev rule so the kiosk draws no mouse arrow (the Pi's HDMI
+#      ports count as pointing devices; see 99-cabinet-kiosk-pointer.rules)
+#   4. disable getty@tty1 (the kiosk owns VT1; Conflicts= also enforces it)
+#   5. enable + (re)start both units
 #
 # Day-to-day: Ctrl+Alt+F2 on an attached keyboard (or `sudo chvt 2`) shows
 # the debug console; Ctrl+Alt+F1 / `sudo chvt 1` returns to the kiosk.
@@ -111,6 +113,16 @@ for u in "${UNITS[@]}"; do
         exit 1
     fi
 done
+
+# No mouse arrow on a touch-only screen: the Pi's HDMI ports count as pointing
+# devices, so the compositor would park a cursor in the middle of the kiosk.
+# See the rule file for the why. (deploy/kiosk_pointer.sh installs the same
+# rule on a kiosk that was set up before this was here.) The kiosk restart
+# below is what makes it take effect.
+echo "==> hiding the mouse arrow on the touchscreen (udev rule)"
+install -m 644 "$UNIT_SRC/99-cabinet-kiosk-pointer.rules" /etc/udev/rules.d/
+udevadm control --reload
+udevadm trigger --subsystem-match=input --action=change || true
 
 echo "==> freeing VT1 for the kiosk (getty@tty1 off)"
 systemctl disable --now getty@tty1.service || true
