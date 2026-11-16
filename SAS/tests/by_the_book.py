@@ -247,3 +247,167 @@ class ByTheBookMachine:
             entry["reported"] = True
         self._on_ack = reported
         return frame(self.address, 0x1B, entry["data"])
+
+
+# ---------------------------------------------------------------------------
+# §8 — Advanced Funds Transfer (audit batch 2)
+# ---------------------------------------------------------------------------
+
+class ByTheBookAFTMachine(ByTheBookMachine):
+    """The transfer cycle of SAS 6.02 §8.3, kept to the letter.
+
+    A cycle begins with an initiating long poll 72 and ends only "when the
+    host retrieves the final transfer and transaction receipt completion
+    status codes" — read with 72/FF AND acknowledged. Until then this
+    machine:
+      * raises exception 69 when the transfer completes and again every
+        fifteen seconds (a priority exception, not in the queue);
+      * answers any other initiating 72 with the short C0 form, "and omit
+        the remaining fields";
+      * never enters the locked state (§8.2).
+    Cancelling is "always at the discretion of the gaming machine": this
+    one declines unless honours_cancel. With no current or previous
+    transfer, an interrogation gets the short form: position 00, status FF,
+    receipt FF.
+
+    The transfer stays PENDING until the test calls complete(), or until
+    `complete_after` general polls have come in after a declined cancel —
+    which is exactly when our host has given up on it.
+
+    counts_idle_general_polls defaults to False here: the transfer wait
+    still sends bare general polls in a row (audit item 4)."""
+
+    def __init__(self, credits=0, honours_cancel=False, complete_after=None,
+                 hears_initiate=True, **kw):
+        kw.setdefault("counts_idle_general_polls", False)
+        super().__init__(**kw)
+        self.asset = bytes([0x92, 0x10, 0x00, 0x00])
+        self.key = bytes(range(20))
+        self.pos = b"\x01\x00\x00\x00"
+        self.credits = credits
+        self.honours_cancel = honours_cancel
+        self.complete_after = complete_after
+        self.hears_initiate = hears_initiate    # False: the 0x72 is lost
+        self.locked = False
+        self.cycle = None            # the open transfer cycle
+        self.last = None             # the most recent closed one
+        self.started = []            # txn ids that began a cycle
+        self.refused_while_open = 0  # initiating 72s answered C0
+        self.locks_refused = 0
+        self.cancels_declined = 0
+        self._countdown = None
+        self._69_due = False
+
+    # -- what happens AT the machine ----------------------------------------
+
+    def complete(self):
+        """The pending transfer happens: credits move, exception 69."""
+        c = self.cycle
+        if c is None or c["status"] != 0x40:
+            return
+        if c["type"] == 0x80:                       # machine -> host
+            self.credits -= c["cents"]
+        else:                                       # host -> machine
+            self.credits += c["cents"]
+        c["status"] = 0x00
+        self._69_due = True
+
+    def fifteen_seconds_pass(self):
+        super().fifteen_seconds_pass()
+        if self.cycle is not None and self.cycle["status"] != 0x40:
+            self._69_due = True
+
+    def _close_cycle(self):
+        self.last, self.cycle = self.cycle, None
+        self._69_due = False
+        self.locked = False
+
+    # -- the wire --------------------------------------------------------------
+
+    def _general(self):
+        if self._countdown is not None:
+            self._countdown -= 1
+            if self._countdown <= 0:
+                self._countdown = None
+                self.complete()
+        if self._69_due:
+            def delivered():
+                self._69_due = False
+            self._on_ack = delivered
+            return b"\x69"
+        return super()._general()
+
+    def _framed(self, command, body):
+        return frame(self.address, command, bytes([len(body)]) + bytes(body))
+
+    def _long(self, raw):
+        command = raw[1]
+        if command not in (0x72, 0x73, 0x74):
+            return super()._long(raw)
+        if len(raw) < 4 or sas_crc(raw[:-2]).to_bytes(2, "little") != raw[-2:]:
+            return b""
+        if command == 0x73:
+            return self._framed(0x73, bytes([0x01]) + self.asset + self.key
+                                + self.pos)
+        if command == 0x74:
+            return self._lock(raw[2])
+        return self._transfer(raw[3:-2])
+
+    def _lock(self, code):
+        if code == 0x00:                            # request
+            if self.cycle is not None:
+                self.locks_refused += 1
+                self.locked = False
+            else:
+                self.locked = True
+        elif code == 0x80:                          # cancel
+            self.locked = False
+        status = 0x00 if self.locked else 0xFF
+        return self._framed(0x74, self.asset
+                            + bytes([status, 0x03, 0x00, 0xFF, 0x0A])
+                            + int_to_bcd(self.credits, 5) + bytes(10)
+                            + int_to_bcd(1000000, 5))
+
+    def _status(self, t):
+        txn = t["txn"].encode("ascii")
+        moved = t["cents"] if t["status"] in (0x00, 0x40) else 0
+        return self._framed(0x72, bytes([0x00, t["status"], 0xFF, t["type"]])
+                            + int_to_bcd(moved, 5) + bytes(10) + bytes([0x00])
+                            + self.asset + bytes([len(txn)]) + txn)
+
+    def _report(self, t):
+        """Answer with a transfer's status; a FINAL status of the open
+        cycle ends that cycle once the host acknowledges this answer."""
+        if t is self.cycle and t["status"] != 0x40:
+            self._on_ack = self._close_cycle
+        return self._status(t)
+
+    def _transfer(self, d):
+        code = d[0]
+        current = self.cycle or self.last
+        if code == 0xFF:                            # interrogate
+            if current is None:
+                return self._framed(0x72, bytes([0x00, 0xFF, 0xFF]))
+            return self._report(current)
+        if code == 0x80:                            # cancel
+            if current is None:
+                return self._framed(0x72, bytes([0x00, 0xFF, 0xFF]))
+            if self.cycle is not None and self.cycle["status"] == 0x40:
+                if self.honours_cancel:
+                    self.cycle["status"] = 0x80
+                else:
+                    self.cancels_declined += 1
+                    self._countdown = self.complete_after
+            return self._report(current)
+        # an initiating poll
+        if not self.hears_initiate:
+            return b""
+        if self.cycle is not None:
+            self.refused_while_open += 1
+            return self._framed(0x72, bytes([0x00, 0xC0]))
+        txn_len = d[43]
+        self.cycle = {"txn": d[44:44 + txn_len].decode("ascii"),
+                      "type": d[2], "cents": int(d[3:8].hex()),
+                      "status": 0x40}
+        self.started.append(self.cycle["txn"])
+        return self._status(self.cycle)

@@ -70,6 +70,7 @@ from core.sas_tito_host import (SASTITOHost, TicketCaptureOutcome,
                                 parse_ticket_data_flag)
 from core.sas_bonus import (MAX_BONUS_CREDITS, build_legacy_bonus_poll,
                             classify_bonus_reply)
+from modules.aft.open_transfer import OpenTransferJournal
 from modules.aft.aft_handler import (
     AFTHost, AFTTransferRequest, TRANSFER_TYPE_HOST_TO_EGM,
     TRANSFER_TYPE_EGM_TO_HOST, TRANSFER_CODE_FULL_ONLY, TRANSFER_FLAGS_NONE,
@@ -377,6 +378,50 @@ def parse_ticket_data_reply(value):
     return {"propName": prop.strip()[:64], "line1": line1.strip()[:64],
             "line2": line2.strip()[:64], "titleCash": title,
             "expireDays": exp, "rev": rev}
+
+
+def late_transfer_record(ended):
+    """The hub result record for a transfer that ENDED after its own
+    command had already answered "unconfirmed" (AFTHost.service_open).
+
+    Same shape and `type` as the record the live path sends, with the SAME
+    txnId: the hub books a transfer by its transaction id, exactly once, so
+    this is what debits the funding account for a push that landed late, or
+    credits the wallet for a cash-out that did. A new `id`, because the
+    first verdict for the original command id has already been read."""
+    rec = ended.get("rec")
+    if not rec:
+        return None
+    out = {"id": f"late-{rec['txnId']}", "type": rec["kind"],
+           "when": time.strftime("%Y-%m-%dT%H:%M:%S"),
+           "ok": bool(ended["ok"]), "outcome": ended["outcome"],
+           "txnId": rec["txnId"], "amountCents": int(ended["amountCents"]),
+           "detail": f"settled late — {ended['detail']}",
+           "result": "ack" if ended["ok"] else ended["outcome"],
+           "late": True}
+    if rec.get("kind") == "aft_transfer":
+        out["cents"] = rec.get("cents")
+    if rec.get("accountId"):
+        out["accountId"] = rec["accountId"]
+    if rec.get("cmdId"):
+        out["lateFor"] = rec["cmdId"]
+    return out
+
+
+def note_transfer_end(ended, reporter) -> None:
+    """Log the END of a followed-up transfer and hand it to the hub."""
+    record = late_transfer_record(ended)
+    if record is None:
+        logger.warning("🏦 AFT: {} — txn {} for {}c. Nothing booked; check "
+                       "it against the hub by hand", ended.get("detail"),
+                       ended.get("txnId"), ended.get("amountCents"))
+        return
+    (logger.info if record["ok"] else logger.warning)(
+        "🏦 AFT transfer {} ({}) ended late: {} for {}c — {}",
+        record["txnId"], record["type"], record["outcome"],
+        record["amountCents"], ended["detail"])
+    if reporter is not None:
+        reporter.record_result(record)
 
 
 def note_ticket_capture(addr, result, recent_events) -> None:
@@ -1555,9 +1600,28 @@ def main():
     # for any later transfer. Constructed AFTER SASTITOHost so both chain
     # poller.on_typed_event (each forwards prev) and TITO events still fire.
     # on_cashout_request wires the machine-initiated host-cashout (0x6A) path.
+    # The transfer in flight is written down before it is sent and kept
+    # until the machine has given its final status (open_transfer.py). A
+    # mock run keeps it in memory, so tests and bench runs leave no file.
+    aft_journal = OpenTransferJournal(
+        None if args.mock else
+        str(Path(__file__).resolve().parent / "data"
+            / "aft_open_transfer.json"))
+    if aft_journal.corrupt:
+        logger.warning("🏦 AFT: the open-transfer file could not be read "
+                       "({}) and was set aside — check the machine's meters "
+                       "against the hub for a transfer with no result",
+                       aft_journal.corrupt)
+    if aft_journal.current:
+        logger.warning("🏦 AFT: transfer {} ({}c, started {}) had no final "
+                       "status when this satellite last stopped — asking the "
+                       "machine", aft_journal.current["txnId"],
+                       aft_journal.current["cents"],
+                       aft_journal.current["startedAt"])
     aft_host = AFTHost(poller, asset_number=None, registration_key=aft_key,
                        pos_id=aft_pos, sleep=time.sleep,
-                       on_cashout_request=on_cashout_request)
+                       on_cashout_request=on_cashout_request,
+                       journal=aft_journal)
     logger.info("AFT register ready: rig key fp {} · POS {}",
                 aft_key.hex()[:12], args.aft_pos)
 
@@ -1775,6 +1839,8 @@ def main():
                 # future refusal decodes against Table 8.3e without a re-run.
                 res = aft_host.transfer(
                     req, require_lock=require_lock,
+                    kind="aft_transfer",
+                    account_id=result.get("accountId"), cmd_id=cmd_id,
                     on_wire=lambda lbl, rq, rp: logger.info(
                         "💵 {} REQ {} | RESP {}", lbl, rq.hex(),
                         rp.hex() if rp else "(silence)"))
@@ -1904,6 +1970,8 @@ def main():
                             result.get("accountId") or "-")
                 res = aft_host.transfer(
                     req, require_lock=True,
+                    kind="aft_cashout",
+                    account_id=result.get("accountId"), cmd_id=cmd_id,
                     on_wire=lambda lbl, rq, rp: logger.info(
                         "🏦 {} REQ {} | RESP {}", lbl, rq.hex(),
                         rp.hex() if rp else "(silence)"))
@@ -2723,6 +2791,8 @@ def main():
                                 "(acct {})", cashable, rec["accountId"] or "-")
                     res = aft_host.transfer(
                         req, require_lock=False,
+                        kind="aft_cashout",
+                        account_id=rec.get("accountId"), cmd_id=rec["id"],
                         on_wire=lambda lbl, rq, rp: logger.info(
                             "🏦 {} REQ {} | RESP {}", lbl, rq.hex(),
                             rp.hex() if rp else "(silence)"))
@@ -2800,6 +2870,14 @@ def main():
         # (a 0x6A only fires on a live, armed machine).
         if poller.state.online:
             handle_cashout_if_pending()
+            # A transfer whose final status was not read in time is followed
+            # up here until the machine gives one (SAS 6.02 §8.3: "It is the
+            # responsibility of the host to read the completion status").
+            try:
+                for ended in aft_host.service_open():
+                    note_transfer_end(ended, reporter)
+            except Exception as e:                        # noqa: BLE001
+                logger.warning("🏦 AFT follow-up failed (ignored): {}", e)
         elif cashout_state["pending"]:
             # STALE-0x6A guard: a host-cashout request raised while the link
             # was up but not yet answered when the machine dropped OFFLINE is

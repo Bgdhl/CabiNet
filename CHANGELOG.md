@@ -1,5 +1,35 @@
 # Changelog
 
+## v0.3.9
+Second batch from the SAS audit: an AFT transfer always ends in a known
+result.
+- **A transfer that finishes late is no longer lost.** The SAS box waited
+  about three seconds for a transfer's final status, tried one cancel,
+  and reported "unconfirmed, verify meters". If the machine finished the
+  transfer after that, or while the SAS box was restarting, the credits
+  had moved and the hub never heard: a push could be sent a second time,
+  and a cash-out left the machine without reaching the wallet. Now the
+  transfer is written to disk before it is sent and kept until the
+  machine has given a final answer. The SAS box asks again after 2, 5
+  and then every 15 seconds, at once when the machine says "transfer
+  complete", and first thing after a restart. The hub then gets a second
+  result, marked "settled late", under the same transaction number, and
+  books it once as it would have the first time. No hub change was
+  needed for that.
+- **One transfer at a time.** The document forbids starting a transfer
+  while an earlier one has no final status, and a machine that keeps it
+  refuses the new one and will not lock. A new transfer now waits: it
+  comes back as "an earlier transfer has no final status yet" and nothing
+  is sent.
+- **A plain "no" from the machine reads as "no".** Three short answers
+  the document defines (unsupported, not compatible with the transfer in
+  progress, no transfer on record) were read as silence, which turned a
+  definite refusal into "unconfirmed".
+- If the transfer cannot be written to disk first, it is not sent.
+- Tested against a pretend machine that holds a transfer open until its
+  status is read, including a full run of the SAS box's own program. Not
+  yet seen on a real machine: a Bluebird 2 answers within the wait.
+
 ## v0.3.8
 First batch from an audit of the SAS code against the SAS 6.02 document.
 - **A printed ticket can no longer go missing because one answer arrived

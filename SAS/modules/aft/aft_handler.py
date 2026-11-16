@@ -68,7 +68,7 @@ import enum
 import itertools
 import time
 from dataclasses import dataclass
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import sys
 from pathlib import Path
@@ -76,6 +76,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from core.sas_protocol import SASProtocol, sas_crc
 from core.sas_meters import SAS_POLL_FLOOR, bcd_to_int, int_to_bcd
+from modules.aft.open_transfer import OpenTransferJournal
 # The registration-INDEPENDENT asset source (CONTRACT assetSource): a 0x7B
 # extended-validation-status READ (all-zero control -> never reconfigures)
 # still reports the operator-set asset on a freshly RAM-cleared, NOT_REGISTERED
@@ -617,6 +618,18 @@ def parse_aft_transfer_response(data: bytes) -> AFTTransferStatusData:
     if len(data) < 2 or data[0] != len(data) - 1:
         raise ValueError("transfer response length byte mismatch")
     body = data[1:]
+    if len(body) in (2, 3):
+        # The short forms of SAS 6.02 §8.3, where the machine "omits the
+        # remaining fields": status C1 (unsupported transfer code), C0 (not
+        # compatible with the transfer in progress), and the answer to an
+        # interrogation when there is no current or previous transfer —
+        # "a transfer buffer position of 00, a transfer status of FF and a
+        # receipt status of FF". These used to raise here and so read as
+        # silence, which made a definite "not taken" look like an unknown.
+        # No transaction id comes with them (transaction_id is "").
+        return AFTTransferStatusData(
+            body[0], body[1], body[2] if len(body) == 3 else 0xFF, 0,
+            None, None, None, 0, b"", "")
     if len(body) < 25:
         raise ValueError("transfer response too short for core fields")
     idx, status, receipt, ttype = body[0], body[1], body[2], body[3]
@@ -736,6 +749,10 @@ class AFTOutcome(enum.Enum):
     UNCONFIRMED = "unconfirmed"           # issued; final status never seen —
                                           # verify meters before retrying
     TIMEOUT = "timeout"                   # silence where consent was needed
+    UNRESOLVED_EARLIER = "unresolved_earlier"   # an earlier transfer has no
+    #                                       final status yet; nothing sent
+    NOT_SAVED = "not_saved"               # could not write the transfer down
+    #                                       first; nothing sent
 
 
 @dataclass(frozen=True)
@@ -1139,6 +1156,72 @@ def _await_aft_complete(transport, address, proto, pace, sleep,
 
 
 # --------------------------------------------------------------------------
+# A transfer with no final status yet (see open_transfer.py)
+# --------------------------------------------------------------------------
+
+OPEN_RETRY_SEC = (2.0, 5.0, 15.0)   # wait before asking the machine again;
+#                                     the last value repeats. Exception 69,
+#                                     which the machine raises every fifteen
+#                                     seconds until its status is read, asks
+#                                     at once whatever this says.
+
+
+def judge_open_transfer(rec: Dict,
+                        status: Optional[AFTTransferStatusData]
+                        ) -> Optional[Dict]:
+    """What a 72/FF interrogation says about the transfer we have open.
+
+    None means "still open": no answer, or the machine says pending. Else a
+    dict {ok, outcome, amountCents, detail} — the END of that transfer:
+
+      completed / partial   it happened, for the amount the machine names;
+      rolled_back, refused  it ended without moving anything;
+      not_taken             the machine does not know it. Its answer is the
+                            short "no transfer information" form, or names a
+                            different transaction as its latest. Our 0x72
+                            never started a cycle, so nothing moved.
+
+    The amount is the machine's own figure. Where it cannot be read, a push
+    falls back to what was asked for and a cash-out credits nothing — the
+    same rule the live paths use."""
+    if status is None:
+        return None
+    if status.transaction_id != rec["txnId"]:
+        why = ("the machine has no transfer on record"
+               if not status.transaction_id else
+               f"the machine's latest transfer is {status.transaction_id!r}")
+        return {"ok": False, "outcome": "not_taken", "amountCents": 0,
+                "detail": f"{why} — this one never started, nothing moved"}
+    event = status_to_event(status.status)
+    if event == AFTTxnEvent.STATUS_PENDING:
+        return None
+    if event in (AFTTxnEvent.STATUS_FULL, AFTTxnEvent.STATUS_PARTIAL):
+        amount = status.cashable_cents
+        note = ""
+        if amount is None:
+            if rec.get("kind") == "aft_transfer":
+                amount = int(rec.get("cents") or 0)
+            else:
+                amount, note = 0, (" — amount unreadable, NOT credited "
+                                   "(verify meters)")
+        full = event == AFTTxnEvent.STATUS_FULL
+        return {"ok": True, "outcome": "completed" if full else "partial",
+                "amountCents": int(amount),
+                "detail": ("full transfer successful" if full else
+                           f"partial transfer: {amount} cashable cents")
+                + note}
+    if event == AFTTxnEvent.CANCEL_CONFIRMED:
+        return {"ok": False, "outcome": "rolled_back", "amountCents": 0,
+                "detail": "transfer cancelled — no funds moved"}
+    try:
+        name = AFTStatus(status.status).name
+    except ValueError:
+        name = f"0x{status.status:02X}"
+    return {"ok": False, "outcome": "refused", "amountCents": 0,
+            "detail": f"machine refused the transfer: {name}"}
+
+
+# --------------------------------------------------------------------------
 # Poller integration
 # --------------------------------------------------------------------------
 
@@ -1161,7 +1244,9 @@ class AFTHost:
                  on_cashout_request: Optional[
                      Callable[[int, int], None]] = None,
                  pace: float = SAS_POLL_FLOOR,
-                 sleep: Callable[[float], None] = time.sleep):
+                 sleep: Callable[[float], None] = time.sleep,
+                 journal: Optional[OpenTransferJournal] = None,
+                 clock: Callable[[], float] = time.monotonic):
         # asset_number is OPTIONAL (None) so the runner can build one AFTHost
         # purely for registration — auto_register() READS the machine's real
         # asset and never leaves this None for a transfer. A non-None asset
@@ -1179,6 +1264,16 @@ class AFTHost:
         self.on_cashout_request = on_cashout_request
         self.pace = pace
         self.sleep = sleep
+        # The transfer in flight, written down before its 0x72 goes out and
+        # kept until its final status is read (open_transfer.py).
+        self.journal = journal if journal is not None \
+            else OpenTransferJournal(None)
+        self.clock = clock
+        self.complete_seen = False     # exception 69 came off the FIFO
+        self._ended = []               # verdicts waiting for service_open()
+        self._ask_at = 0.0             # clock time of the next 72/FF
+        self._asked = 0                # times asked without a final answer
+        self._last_txn = None          # the last transfer we saw the end of
         self._prev_typed = poller.on_typed_event
         poller.on_typed_event = self._typed_event
 
@@ -1299,8 +1394,13 @@ class AFTHost:
 
     def transfer(self, request: AFTTransferRequest,
                  require_lock: bool = True,
-                 on_wire: Optional[Callable[[str, bytes, bytes], None]] = None
-                 ) -> AFTTransferResult:
+                 on_wire: Optional[Callable[[str, bytes, bytes], None]] = None,
+                 kind: str = "aft_transfer",
+                 account_id: Optional[str] = None,
+                 cmd_id: Optional[str] = None) -> AFTTransferResult:
+        """Run one transfer. kind / account_id / cmd_id are what the caller
+        will need to report its END if that comes later than this call
+        (they are written down with it — see open_transfer.py)."""
         p = self.poller
         if self.asset_number is None:
             # Built for registration only, never READ/adopted an asset.
@@ -1313,14 +1413,113 @@ class AFTHost:
                 "no asset number known — auto_register (read asset) first")
             p._safe(self.on_transfer, p.address, result)
             return result
+        # One cycle at a time (§8.3): "the host may not send another
+        # initiating long poll 72 until the current transfer cycle is
+        # complete" and its final status read. Ask once more; if the earlier
+        # one still has no end, this one does not start.
+        if self.journal.current is not None:
+            ended = self.resolve_open()
+            if ended is not None:
+                self._ended.append(ended)
+        earlier = self.journal.current
+        if earlier is not None:
+            result = AFTTransferResult(
+                AFTOutcome.UNRESOLVED_EARLIER, AFTTxnState.CREATED, request,
+                None, None, None, False,
+                f"an earlier transfer (txn {earlier['txnId']}, "
+                f"{earlier['cents']}c, started {earlier['startedAt']}) has "
+                "no final status from the machine yet; nothing sent")
+            p._safe(self.on_transfer, p.address, result)
+            return result
+        try:
+            self.journal.open(request.transaction_id, kind,
+                              request.transfer_type, request.cashable_cents,
+                              account_id, cmd_id)
+        except OSError as e:
+            result = AFTTransferResult(
+                AFTOutcome.NOT_SAVED, AFTTxnState.CREATED, request, None,
+                None, None, False,
+                f"could not write the transfer down first ({e}); "
+                "nothing sent")
+            p._safe(self.on_transfer, p.address, result)
+            return result
+        # If this raises, the record stays: we do not know what the machine
+        # did, and service_open() will find out.
         result = aft_transfer(
             p.transport, p.address, request, self.asset_number,
             self.registration_key, p.protocol, pace=self.pace,
             sleep=self.sleep, require_lock=require_lock,
             on_exception=p._dispatch_event,
             on_frame=p._handle_long_poll_result, on_wire=on_wire)
+        if result.outcome is AFTOutcome.UNCONFIRMED:
+            self.journal.mark_reported(result.outcome.value)
+            self._asked = 0
+            self._ask_at = self.clock() + OPEN_RETRY_SEC[0]
+        else:
+            # every other outcome is an end: a final status was read, or
+            # nothing was sent
+            self.journal.close()
+            self._last_txn = request.transaction_id
         p._safe(self.on_transfer, p.address, result)
         return result
+
+    def resolve_open(self) -> Optional[Dict]:
+        """Ask the machine (72/FF) about the open transfer. Returns its END
+        as {"rec", "ok", "outcome", "amountCents", "detail"} and forgets it,
+        or None while it is still open. Poll thread only."""
+        rec = self.journal.current
+        if rec is None:
+            return None
+        p = self.poller
+        verdict = judge_open_transfer(
+            rec, _read_transfer_status(p.transport, p.address, p.protocol))
+        if verdict is None:
+            return None
+        self.journal.close()
+        self._last_txn = rec["txnId"]
+        return dict(verdict, rec=rec)
+
+    def service_open(self) -> List[Dict]:
+        """Poll thread, BETWEEN polls: follow up the open transfer. Returns
+        the ENDs to report (usually none).
+
+        Asks when exception 69 has come in, and otherwise on a wait that
+        grows to fifteen seconds. Exception 69 with nothing of ours open is
+        still answered with one 72/FF: the machine raises it every fifteen
+        seconds until its status has been read, whoever started the
+        transfer (that END has rec=None and is only logged)."""
+        ended, self._ended = self._ended, []
+        rec = self.journal.current
+        if rec is None:
+            if self.complete_seen:
+                self.complete_seen = False
+                p = self.poller
+                status = _read_transfer_status(p.transport, p.address,
+                                               p.protocol)
+                # a repeat of the 69 for a transfer we already saw end is
+                # nothing new; reading it again is all the machine wants
+                if status is not None and status.transaction_id \
+                        and status.transaction_id != self._last_txn:
+                    ended.append({
+                        "rec": None, "ok": status.completed,
+                        "outcome": "foreign", "txnId": status.transaction_id,
+                        "amountCents": status.cashable_cents or 0,
+                        "detail": "exception 69 for a transfer this "
+                                  "satellite has no record of starting "
+                                  f"(status 0x{status.status:02X})"})
+            return ended
+        now = self.clock()
+        if not self.complete_seen and now < self._ask_at:
+            return ended
+        self.complete_seen = False
+        verdict = self.resolve_open()
+        if verdict is not None:
+            ended.append(verdict)
+        else:
+            self._asked += 1
+            self._ask_at = now + OPEN_RETRY_SEC[
+                min(self._asked, len(OPEN_RETRY_SEC) - 1)]
+        return ended
 
     def _typed_event(self, address: int, info) -> None:
         if self._prev_typed is not None:
@@ -1329,3 +1528,7 @@ class AFTHost:
             return
         if info.code in (0x6A, 0x6B):     # believed host-cashout requests
             self.poller._safe(self.on_cashout_request, address, info.code)
+        elif info.code == AFT_TRANSFER_COMPLETE_EXCEPTION:
+            # Not answered here (no transact inside an exception callback):
+            # service_open() reads the status between polls.
+            self.complete_seen = True
