@@ -1133,10 +1133,13 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     setMoney('ph-credits', credits || '');
     setStyle($('ph-credits'), 'display', credits ? 'block' : 'none');
     setStyle($('ph-cr-l'), 'display', credits ? 'block' : 'none');
-    // the 320px identity column clips silently on very long balances at
-    // 40px bold, so step the font DOWN: every digit stays on the panel
+    // the 320px identity column clips silently on long balances at 40px
+    // bold, so step the font DOWN: every digit stays on the panel. The
+    // Pi draws DejaVu Sans, wider than Arial: 13 characters at 40px
+    // ("$1,058,441.00") is 2px too wide, so that length gets 36px.
     setStyle($('ph-credits'), 'fontSize',
-      (credits && credits.length > 13) ? '28px' : '40px');
+      (!credits || credits.length <= 12) ? '40px'
+        : credits.length <= 13 ? '36px' : '28px');
     setMoney('wl-bal', credits || '—');
     paintWalletKind();      // Free Slot Play line + rows, and the figure fit
     // footer = just the gameroom name (the raw UTC "in since HH:MM" was
