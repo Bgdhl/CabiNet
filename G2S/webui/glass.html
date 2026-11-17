@@ -213,9 +213,9 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
 #wl-bal   { position: absolute; left: 12px; top: 100px; width: 232px;
             text-align: center; font-size: 40px; font-weight: bold;
             color: #e8c266; overflow: hidden; white-space: nowrap; }
-/* Free Slot Play (the player's restricted promotional balance): the line
-   under the wallet balance shows the balance NOT in the big figure and
-   switches the two when tapped. Hidden when the player has none. */
+/* Free Slot Play (the player's restricted promotional balance): its own
+   row under the wallet balance. The two rows are a radio-style pick of
+   which one ADD CREDITS loads from. Hidden when the player has none. */
 #wl-fsp   { position: absolute; left: 12px; top: 143px; width: 232px;
             text-align: center; font-size: 11px; line-height: 13px;
             letter-spacing: 0.5px; color: #7fd0a8; display: none;
@@ -872,9 +872,9 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   // balance. On THIS page it is called FREE SLOT PLAY (AJ: "on the players
   // glass side it should be listed as Free Slot Play"); the operator pages
   // use the machine's own wording, restricted promotional. When the player
-  // has some, the big figure shows one balance and the line under it the
-  // other; tapping either switches them, and ADD CREDITS loads the one in
-  // the big figure. No carryover between players.
+  // has some, it has its own row under the wallet balance, and the two
+  // rows work as radio buttons: tap the one to fund from, and ADD CREDITS
+  // loads that one. No carryover between players.
   var coRestrMc = 0;                 // restricted balance (millicents)
   var coUseRestr = false;            // ADD CREDITS loads restricted credit
   var coCanFund = false;             // funding allowed (linked + path available)
@@ -1183,9 +1183,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     setStyle($('ph-credits'), 'display', credits ? 'block' : 'none');
     setStyle($('ph-credits'), 'fontSize',
       (credits && credits.length > 14) ? '13px' : '17px');
-    // while the player has switched to their restricted promotional
-    // balance, that is the figure this line shows
-    setMoney('wl-bal', coUseRestr ? fmtMc(coRestrMc) : (credits || '\u2014'));
+    setMoney('wl-bal', credits || '\u2014');
     // the 232px column clips silently past ~$1M at 40px bold, so step
     // the font DOWN on long balances: every digit stays on the glass
     var wlLen = (credits || '\u2014').length;
@@ -1398,31 +1396,28 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     setBtnOff('wl-add', !coCanFund);
     setWalletToggleFace();
   }
-  // Which balance is in the big figure, and what the line under it says.
+  // Which wallet balance ADD CREDITS loads from: a radio-style pick between
+  // the two rows (AJ, 2026-11-17: "an option to fund from wallet or free
+  // slot play ... like a check box or radio button"). The dot marks the
+  // one chosen; the balances themselves never move. With no Free Slot
+  // Play there is nothing to pick and the row is hidden.
   function paintWalletKind() {
     var line = $('wl-fsp');
     if (!coRestrMc) {
       setText('wl-label', 'WALLET BALANCE');
       setStyle(line, 'display', 'none');
+      setText('wl-add', 'ADD CREDITS');
       return;
     }
     setStyle(line, 'display', 'block');
-    if (coUseRestr) {
-      setText('wl-label', 'FREE SLOT PLAY');
-      setMoney('wl-bal', fmtMc(coRestrMc));
-      setText('wl-fsp', 'CASH ' + (coWalletMc === null ? '\u2014' : fmtMc(coWalletMc))
-        + ' \u00b7 TAP');
-    } else {
-      setText('wl-label', 'WALLET BALANCE');
-      setText('wl-fsp', 'FREE SLOT PLAY ' + fmtMc(coRestrMc) + ' \u00b7 TAP');
-    }
+    setText('wl-label', (coUseRestr ? '( ) ' : '(\u2022) ') + 'WALLET BALANCE');
+    setText('wl-fsp', (coUseRestr ? '(\u2022) ' : '( ) ')
+      + 'FREE SLOT PLAY ' + fmtMc(coRestrMc));
+    setText('wl-add', coUseRestr ? 'ADD FREE PLAY' : 'ADD CREDITS');
   }
-  function switchWalletKind() {
+  function pickWalletKind(restr) {
     if (!coRestrMc) { return; }
-    coUseRestr = !coUseRestr;
-    if (!coUseRestr) {
-      setMoney('wl-bal', coWalletMc === null ? '\u2014' : fmtMc(coWalletMc));
-    }
+    coUseRestr = restr;
     paintWalletKind();
     setText('wl-fund-msg', '');
   }
@@ -1808,8 +1803,9 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
       'Moves ' + fmtCents(selCents) + ' from your wallet to this machine.',
       { action: 'walletFund', cents: selCents }, 'wallet');
   };
-  $('wl-bal').onclick = switchWalletKind;
-  $('wl-fsp').onclick = switchWalletKind;
+  $('wl-label').onclick = function () { pickWalletKind(false); };
+  $('wl-bal').onclick = function () { pickWalletKind(false); };
+  $('wl-fsp').onclick = function () { pickWalletKind(true); };
   $('wl-toggle').onclick = function () {
     if (!coHasWallet || coToggleBusy) { return; }
     coToggleBusy = true;
