@@ -795,8 +795,7 @@ def _persist_4d(store, rec, address, note="") -> TicketCaptureResult:
             None, f"{label} — not a ticket, not stored{note}",
             validation_type=rec.validation_type)
     if kind == "playable":
-        note = (f" · {label} (playable only): stored as an ordinary ticket, "
-                f"the hub cannot flag it yet{note}")
+        note = f" · {label}{note}"
     elif kind == "unknown":
         note = f" · {label}; stored as a cash ticket{note}"
     out = _persist(store, rec.validation_number, rec.amount_cents, address,

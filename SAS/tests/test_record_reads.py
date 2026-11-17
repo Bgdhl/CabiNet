@@ -380,7 +380,7 @@ class TestOnlyATicketIsStored:
         result = _capture(port, store)
         assert result.outcome is TicketCaptureOutcome.RECORDED and result.ok
         assert result.validation_type == vtype
-        assert "(playable only)" in result.detail
+        assert "restricted" in result.detail
         assert store.get(VN)["state"] == ISSUED
         assert store.get(VN)["amountCents"] == AMOUNT
         assert store.get(VN)["extra"] == {"validationType": vtype}
