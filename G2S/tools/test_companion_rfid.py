@@ -1555,6 +1555,30 @@ def main():
     check("a host_setting fault degrades gameroom to '' (poll never 500s)",
           gst3.get("ok") is True and gst3.get("gameroom") == "")
 
+    print("— SMIB player screen: its reload stamp rides the poll it reads")
+    # smib.html has no keyboard, so it reloads itself (while idle) when the
+    # stamp in ITS OWN poll changes. Until 2026-11-17 the hub only put the
+    # stamp on /api/status, which that page never reads, so an update did
+    # not reach the screen until its browser was restarted. Both ends are
+    # pinned here: the name the page watches, and the reply carrying it.
+    smib_page = open(os.path.join(G2S_DIR, "webui", "smib.html"),
+                     encoding="utf-8").read()
+    check("smib.html polls /api/glass/state and watches s.smibStamp",
+          "'/api/glass/state?egm='" in smib_page and
+          "s.smibStamp !== lastSmibStamp" in smib_page)
+    check("glass_state carries smibStamp = smib.html's own mtime",
+          gst.get("smibStamp") == int(os.path.getmtime(
+              os.path.join(G2S_DIR, "webui", "smib.html"))) and
+          gst.get("smibStamp") == gh.smib_ui_stamp())
+    _real_stamp = gh.smib_ui_stamp
+    gh.smib_ui_stamp = lambda: (_ for _ in ()).throw(OSError("gone"))
+    try:
+        gst4 = engG.glass_state(EGM)
+    finally:
+        gh.smib_ui_stamp = _real_stamp
+    check("a missing page just drops the stamp (poll never 500s)",
+          gst4.get("ok") is True and "smibStamp" not in gst4)
+
     devices_fold()
     glass_window_picker()
 

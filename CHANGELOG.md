@@ -18,6 +18,13 @@ Play".
   under their wallet balance. In MY WALLET the two balances are two
   rows, each with a radio button: tap the one to load from, and the ADD
   button loads that one. A player with none sees the pages as before.
+- **The SMIB player screen picks up updates by itself.** That screen
+  reloads its page, while nobody is carded in, when the hub says the
+  page changed. The hub was only saying so on a poll that screen never
+  reads, so after an update it kept the old page until its browser was
+  restarted. The signal now goes out on the screen's own poll. A
+  balance of 13 characters (such as $1,058,441.00) also no longer loses
+  the edge of its last digit on the home page.
 - **Cashing it out to the wallet.** A SAS cash-out to the wallet now
   takes the machine's restricted credit along with its cash and puts
   each in its own balance. Before, restricted credit was left on the

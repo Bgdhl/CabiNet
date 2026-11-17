@@ -9009,6 +9009,15 @@ class G2SHost:
         out = {"ok": True, "egmId": egm_id, "nick": nick, "carded": False,
                "gameroom": gameroom, "uiBuild": self._glass_ui_build(),
                "currency": money_symbol()}
+        # The SMIB player screen (smib.html) polls this same endpoint and
+        # reloads itself, while idle, when smibStamp changes. Until
+        # 2026-11-17 the stamp only went out on /api/status, which that
+        # page never reads, so an update did not reach the screen until
+        # its browser was restarted.
+        try:
+            out["smibStamp"] = smib_ui_stamp()
+        except OSError:
+            pass
         try:
             # PIN login (2026-09-14): the attract screen shows ENTER PIN
             # only while some player actually has a PIN; minDigits sizes
@@ -21999,6 +22008,16 @@ class G2SHost:
 # HTTP layer
 # ----------------------------------------------------------------------------
 
+def smib_ui_stamp():
+    """The SMIB player screen's build watermark: smib.html's mtime. That
+    screen is a kiosk with no keyboard; its page reloads itself, while
+    idle, when this changes. It rides /api/status (smibStamp) and the
+    page's own poll, /api/glass/state. Raises OSError if the page is
+    missing (callers treat that as "no stamp")."""
+    return int(os.path.getmtime(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "webui", "smib.html")))
+
+
 def home_ui_stamp():
     """The Home page's build watermark (/api/status uiStamp): the newest
     mtime of home.html AND the script it loads, osk.js. An open kiosk page
@@ -22759,9 +22778,7 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                     # (attract). A webui deploy then reaches the panel without bouncing
                     # its kiosk browser. One extra stat per poll — negligible.
                     try:
-                        snap["smibStamp"] = int(os.path.getmtime(os.path.join(
-                            os.path.dirname(os.path.abspath(__file__)),
-                            "webui", "smib.html")))
+                        snap["smibStamp"] = smib_ui_stamp()
                     except OSError:
                         pass
                     # board.html's OWN mtime (board v2): the wall TV is a kiosk too
