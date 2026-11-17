@@ -25222,6 +25222,21 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                         {"ok": False, "error": "lock must be a boolean"}),
                         "application/json", soap=False)
                 cmd["lock"] = lock
+            # Optional zeroKey:true sends this one push with a registration
+            # key of all zeros even to a registered machine. SAS 6.02 §8.1
+            # recommends that key for every in-house transfer; the satellite
+            # sends the machine's own key to a registered machine because
+            # that is what has been proven. This is the way to find out
+            # what a machine does with the zeros (it refuses with status 88
+            # or 89 if it minds, and no money moves). Raw endpoint only.
+            zero_key = req.get("zeroKey")
+            if zero_key is not None:
+                if not isinstance(zero_key, bool):
+                    return self._send(400, json.dumps(
+                        {"ok": False, "error": "zeroKey must be a boolean"}),
+                        "application/json", soap=False)
+                if zero_key:
+                    cmd["zeroKey"] = True
             # R1 funding parity: optional funding account. Money moves at
             # SETTLE time (debit-on-confirm of the echoed accountId), so
             # this is only a COURTESY pre-check — refuse a push a player

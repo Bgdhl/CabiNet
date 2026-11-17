@@ -82,7 +82,7 @@ from modules.aft.aft_handler import (
     TRANSFER_TYPE_EGM_TO_HOST, TRANSFER_TYPE_WIN_TO_HOST,
     TRANSFER_CODE_FULL_ONLY, TRANSFER_CODE_PARTIAL_OK, TRANSFER_FLAGS_NONE,
     ALL_OF_IT_CENTS, HOST_CASHOUT_CONTROLLABLE, HOST_CASHOUT_ENABLED,
-    HOST_CASHOUT_HARD,
+    HOST_CASHOUT_HARD, ZERO_KEY,
     make_transaction_id, AFT_ST_IN_HOUSE_ENABLED, AVAIL_XFER_FROM_EGM,
     describe_available_transfers, describe_aft_status)
 
@@ -2253,10 +2253,25 @@ def main():
                 restricted = cmd.get("creditType") == "restricted"
                 result["creditType"] = "restricted" if restricted \
                     else "cashable"
+                # Which registration key the 0x72 carries: the machine's
+                # own once it is registered, all zeros for one that could
+                # not be (prepare_transfer). {"zeroKey": true} sends the
+                # zeros to a REGISTERED machine for this one push: SAS 6.02
+                # §8.1 recommends that key for every in-house transfer, and
+                # this is how to find out what a given machine does with it.
+                # A machine that minds answers status 88 or 89 and no money
+                # moves.
+                force_zero = cmd.get("zeroKey") is True
+                zero_key = force_zero or aft_host.registration_key == ZERO_KEY
+                result["keySent"] = "zero" if zero_key else "machine"
+                if force_zero and reg is not None and reg.registered:
+                    result["experiment"] = "zero key to a registered machine"
                 logger.info("💵 hub command {}: AFT ready ({}) — pushing {}c "
-                            "{}host->EGM ({})", cmd_id, reg_detail, cents,
+                            "{}host->EGM ({}){}", cmd_id, reg_detail, cents,
                             "RESTRICTED PROMOTIONAL " if restricted else "",
-                            "lock-first" if require_lock else "lockless")
+                            "lock-first" if require_lock else "lockless",
+                            ", registration key of all zeros as the command "
+                            "asked" if force_zero else "")
                 req = AFTTransferRequest(
                     transaction_id=make_transaction_id(),
                     transfer_type=TRANSFER_TYPE_HOST_TO_EGM,
@@ -2269,6 +2284,7 @@ def main():
                 res = aft_host.transfer(
                     req, require_lock=require_lock,
                     kind="aft_transfer",
+                    key=ZERO_KEY if force_zero else None,
                     account_id=result.get("accountId"), cmd_id=cmd_id,
                     on_wire=lambda lbl, rq, rp: logger.info(
                         "💵 {} REQ {} | RESP {}", lbl, rq.hex(),

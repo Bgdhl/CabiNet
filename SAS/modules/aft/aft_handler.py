@@ -1605,11 +1605,20 @@ class AFTHost:
                  on_wire: Optional[Callable[[str, bytes, bytes], None]] = None,
                  kind: str = "aft_transfer",
                  account_id: Optional[str] = None,
-                 cmd_id: Optional[str] = None) -> AFTTransferResult:
+                 cmd_id: Optional[str] = None,
+                 key: Optional[bytes] = None) -> AFTTransferResult:
         """Run one transfer. kind / account_id / cmd_id are what the caller
         will need to report its END if that comes later than this call
-        (they are written down with it — see open_transfer.py)."""
+        (they are written down with it — see open_transfer.py).
+
+        `key` sends this one transfer with that registration key instead of
+        the one prepare_transfer settled on, and leaves the latter as it
+        is. It exists for one experiment: ZERO_KEY to a machine that IS
+        registered, which SAS 6.02 §8.1 recommends for every in-house
+        transfer and which had not been tried on any machine."""
         p = self.poller
+        if key is not None and len(key) != REGISTRATION_KEY_LEN:
+            raise ValueError("registration key is exactly 20 bytes")
         if self.asset_number is None:
             # Built for registration only, never READ/adopted an asset.
             # build_aft_transfer_poll would len(None) -> TypeError; refuse
@@ -1657,8 +1666,8 @@ class AFTHost:
         # did, and service_open() will find out.
         result = aft_transfer(
             p.transport, p.address, request, self.asset_number,
-            self.registration_key, p.protocol, pace=self.pace,
-            sleep=self.sleep, require_lock=require_lock,
+            self.registration_key if key is None else key, p.protocol,
+            pace=self.pace, sleep=self.sleep, require_lock=require_lock,
             on_exception=p._dispatch_event,
             on_frame=p._handle_long_poll_result, on_wire=on_wire)
         if result.outcome is AFTOutcome.UNCONFIRMED:

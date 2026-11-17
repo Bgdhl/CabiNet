@@ -25,6 +25,10 @@ The last four items of the SAS audit. With these it is complete.
 - A machine set to an address that is also an event code (81 is "handpay
   pending") has that event read as an event. This was fixed in v0.3.13
   and is now covered by a test.
+- For trying a machine out: a push sent through the hub's command API
+  with `"zeroKey": true` carries the all-zero key even to a registered
+  machine, and its result says which key went. Nothing on the pages uses
+  it.
 
 ## v0.3.16
 Seventh and last batch from the SAS audit: meters, denominations and the

@@ -538,6 +538,89 @@ class TestAMachineThatCannotBeRegistered:
         assert machine.keys_seen == [ZERO_KEY, RIG_KEY]
 
 
+class TestTheZeroKeyExperiment:
+    """SAS 6.02 §8.1 recommends a key of all zeros for every in-house
+    transfer. The satellite sends a registered machine its own key, because
+    that is what has been seen to work. transfer(key=ZERO_KEY) sends one
+    transfer the other way, to find out what a machine does with it."""
+
+    def test_a_machine_that_follows_the_document_takes_it(self):
+        machine, port, host, _clock = _aft(credits=0)
+        ok, _reg, _detail = host.prepare_transfer()
+        assert ok and host.registration_key == machine.key
+        before = len(_long_polls(port))
+        result = host.transfer(AFTTransferRequest(
+            transaction_id="ZERO0001",
+            transfer_type=TRANSFER_TYPE_HOST_TO_EGM, cashable_cents=100),
+            key=ZERO_KEY)
+        assert result.outcome is AFTOutcome.COMPLETED
+        assert machine.credits == 100 and machine.keys_seen == [ZERO_KEY]
+        # with no key to check, the transfer does not read 73 first
+        assert _long_polls(port)[before:before + 2] == [
+            (0x74, 0x00), (0x72, 0x00)]
+        # and the key the host holds for this machine is untouched
+        assert host.registration_key == machine.key
+
+    def test_a_machine_that_minds_refuses_and_the_next_push_is_normal(self):
+        machine, port, host, _clock = _aft(credits=0, needs_registration=True)
+        host.prepare_transfer()
+        result = host.transfer(AFTTransferRequest(
+            transaction_id="ZERO0002",
+            transfer_type=TRANSFER_TYPE_HOST_TO_EGM, cashable_cents=100),
+            key=ZERO_KEY)
+        assert result.outcome is AFTOutcome.REFUSED
+        assert result.final.status == \
+            AFTStatus.REGISTRATION_KEY_DOES_NOT_MATCH
+        assert machine.credits == 0
+        result, detail = _push(host, cents=100)
+        assert result.outcome is AFTOutcome.COMPLETED
+        assert detail == "already registered" and machine.credits == 100
+        assert machine.keys_seen == [ZERO_KEY, machine.key]
+
+    def test_a_key_of_the_wrong_length_is_a_bug(self):
+        machine, port, host, _clock = _aft(credits=0)
+        host.prepare_transfer()
+        with pytest.raises(ValueError, match="exactly 20 bytes"):
+            host.transfer(AFTTransferRequest(
+                transaction_id="ZERO0003",
+                transfer_type=TRANSFER_TYPE_HOST_TO_EGM, cashable_cents=100),
+                key=b"\x00")
+
+    def test_the_hub_command(self):
+        """{"zeroKey": true} on the push command: the record says which key
+        went and that it was the experiment. A push without it says
+        "machine"."""
+        from test_sas_host_commands import _run_scripted
+        served = {"n": 0}
+
+        def script(i, reports):
+            if any(isinstance(r.get("aft"), dict) for r in reports):
+                served["n"] += 1
+                if served["n"] == 1:
+                    return {"commands": [
+                        {"id": "zero-1", "type": "aft_transfer", "cents": 100,
+                         "zeroKey": True}]}
+                if served["n"] == 40:
+                    return {"commands": [
+                        {"id": "plain-1", "type": "aft_transfer",
+                         "cents": 200}]}
+            return {}
+
+        run = _run_scripted(
+            "zerokeypush",
+            lambda: ByTheBookAFTMachine(credits=0, complete_in=2),
+            script, max_polls=400)
+        zero, plain = run["by_id"]["zero-1"], run["by_id"]["plain-1"]
+        assert (zero["ok"], zero["outcome"], zero["keySent"]) == (
+            True, "completed", "zero")
+        assert zero["experiment"] == "zero key to a registered machine"
+        assert (plain["ok"], plain["keySent"]) == (True, "machine")
+        assert "experiment" not in plain
+        machine = run["machine"]
+        assert machine.keys_seen == [ZERO_KEY, machine.key]
+        assert machine.credits == 300
+
+
 class TestTheWholeSatelliteOnAnUnregisteredMachine:
     def test_a_push_from_the_hub_lands(self):
         from test_sas_host_commands import _run_scripted
@@ -558,6 +641,7 @@ class TestTheWholeSatelliteOnAnUnregisteredMachine:
             script, max_polls=300)
         record = run["by_id"]["push-1"]
         assert (record["ok"], record["outcome"]) == (True, "completed")
+        assert record["keySent"] == "zero" and "experiment" not in record
         assert run["machine"].credits == 700
         assert run["machine"].keys_seen[-1] == ZERO_KEY
         # the report still says what the machine is: not registered
