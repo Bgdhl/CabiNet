@@ -1,5 +1,32 @@
 # Bench Bring-Up — BB2 SAS AFT host-cashout (machine → wallet return leg)
 
+> **Corrected in v0.3.14 (2026-11-17), after reading SAS 6.02 §8.7 and
+> Table 8.2b. Read this before the rest of the sheet, which is kept as the
+> record of the July bench work.**
+>
+> - There are two ways credits go from a SAS machine to a wallet, and this
+>   sheet treats them as one. **The hub's pull** (the CASH OUT TO WALLET
+>   button on the player screen, and the tournament sweep) is a transfer the
+>   host starts. It needs AFT in-house transfers and nothing else. **The
+>   machine's own CASH OUT button** going to the wallet is "cashout to
+>   host": a setting on the machine that makes the button raise exception
+>   0x6A for the host to answer.
+> - `available_transfers` bit 1 (`0x02`) is **not** the cashout-to-host
+>   setting. It says a transfer from the machine might be accepted right
+>   now, which is what a pull needs. The setting is in the next byte of the
+>   `0x74` answer, the **host cashout status**: bit 0 the host may switch
+>   it, bit 1 it is on, bit 2 hard mode. The hub's arm gate reads that byte
+>   now (`sasHostCashout` in `/api/status`), and where bit 0 is set the
+>   satellite switches it on for an arm and off again at disarm.
+> - **Do not switch on cash-out to host just to use the pull.** With it on,
+>   every press of CASH OUT asks the host first. The satellite now answers
+>   every such request (it declines the ones nobody is armed for, and the
+>   machine prints its ticket at once); before v0.3.14 an unarmed press
+>   waited out the machine's eight seconds, and a machine in hard mode
+>   tilted.
+> - A WMS Bluebird 2 here has cashout to host off and has never raised
+>   0x6A since it was re-imaged; its cash-out to the wallet is the pull.
+
 Goal (NARROW): prove that a SAS-linked WMS BB2 — set in its **operator menu**
 to **"soft cash-out to host, fail to ticket"** — raises SAS exception **0x6A**
 "AFT request for host cashout" when the player presses the cabinet's own **CASH

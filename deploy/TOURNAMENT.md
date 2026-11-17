@@ -14,10 +14,12 @@ left goes back to it. Nobody's wallet is ever debited to play.
   those). A machine whose transfers don't work yet sits out with the reason
   shown — fix the rail, re-arm. **A SAS machine needs AFT in BOTH
   directions:** *to-machine* (in-house AFT) so the arm can fund the seat, and
-  *from-EGM* ("soft cash-out to host") so the arm can pull any parked glass
-  credits home first — a machine holding credits with from-EGM cash-out
-  **off** parks its seat `failed` and blocks the whole floor from reaching
-  *ready* until it's emptied or that menu option is enabled.
+  *from-machine* so the arm can pull any parked glass credits home first — a
+  machine holding credits that will not accept a transfer from it parks its
+  seat `failed` and blocks the whole floor from reaching *ready* until it's
+  emptied. (This is ordinary in-house AFT, the hub pulling the credits. It
+  is not the machine's "cash out to host" setting, which the pull does not
+  need.)
 - **Non-penny SAS machines: set the denomination first.** The leaderboard
   scores a SAS seat off its raw credit meter × its denomination; if the
   denomination is unset the hub scores it at **1¢/credit** (right for a penny

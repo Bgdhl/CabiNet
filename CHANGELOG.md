@@ -1,5 +1,42 @@
 # Changelog
 
+## v0.3.14
+Fifth batch from the SAS audit: cash-out to the wallet on SAS machines.
+There are two ways credits leave a SAS machine for a wallet. The hub can
+pull them (the CASH OUT TO WALLET button on the player screen); that is
+unchanged. Or the machine's own CASH OUT button can send them, which only
+works where the machine has "cashout to host" switched on. This release is
+about the second.
+- **Every cash-out request from a machine is answered.** With cashout to
+  host on, each press of CASH OUT asks the hub first and waits up to eight
+  seconds. When nobody was armed for a wallet cash-out the satellite said
+  nothing, so the player stood through the eight seconds before the ticket
+  printed, and a machine set to hard mode tilted instead. The satellite
+  now declines at once and the machine prints its ticket.
+- **A win the machine wants to send to the host is taken as a win.** It
+  was answered as if it were the cash-out button, asking for whatever was
+  on the credit meter, which a machine has to refuse.
+- **Arming looks at the right setting.** The hub decided whether a
+  machine's button could go to the wallet from a bit that only says the
+  hub could pull credits. A machine with cashout to host off was armed,
+  the page said cash-out goes to the wallet, and the button printed a
+  ticket. The hub now reads the machine's host cashout status, shown in
+  the Machines status as `sasHostCashout`. Where the machine lets the
+  host switch the setting, the satellite switches it on when a player
+  arms and off again when they disarm. Where it is off and set at the
+  machine, the arm is refused with the reason.
+- The refusal for a pull no longer tells the owner to turn on "soft
+  cash-out to host". A pull does not need it.
+- **A refused AFT registration says why.** It was always reported as
+  "possibly awaiting operator acknowledgment at the machine". A machine
+  cannot ask for that by itself. The usual cause is the asset number not
+  matching the one set at the machine, and the message says so.
+- `SAS/BENCH_AFT_CASHOUT.md` and `deploy/TOURNAMENT.md` are corrected on
+  the same point.
+- On a Bluebird 2 here cashout to host is off, so none of the button path
+  could be tried on it; the tests run against a pretend machine that
+  follows the document.
+
 ## v0.3.13
 Fourth batch from the SAS audit: the link rules. This changes the rhythm
 on the wire for every SAS machine. A WMS Bluebird 2 took the old rhythm

@@ -75,7 +75,10 @@ from modules.aft.open_transfer import OpenTransferJournal
 from core.sas_machine_info import read_extended_validation_status
 from modules.aft.aft_handler import (
     AFTHost, AFTTransferRequest, TRANSFER_TYPE_HOST_TO_EGM,
-    TRANSFER_TYPE_EGM_TO_HOST, TRANSFER_CODE_FULL_ONLY, TRANSFER_FLAGS_NONE,
+    TRANSFER_TYPE_EGM_TO_HOST, TRANSFER_TYPE_WIN_TO_HOST,
+    TRANSFER_CODE_FULL_ONLY, TRANSFER_CODE_PARTIAL_OK, TRANSFER_FLAGS_NONE,
+    ALL_OF_IT_CENTS, HOST_CASHOUT_CONTROLLABLE, HOST_CASHOUT_ENABLED,
+    HOST_CASHOUT_HARD,
     make_transaction_id, AFT_ST_IN_HOUSE_ENABLED, AVAIL_XFER_FROM_EGM,
     describe_available_transfers, describe_aft_status)
 
@@ -394,6 +397,158 @@ def _restricted_moved(res) -> int:
     return int(final.restricted_cents)
 
 
+CASHOUT_REQUEST = 0x6A          # AFT request for host cashout
+CASHOUT_WIN_REQUEST = 0x6B      # AFT request for host to cash out win
+# Transfers that move no money: a zero-amount answer to a 6A/6B we are not
+# taking, and the zero-amount transfer that sets the host cashout enable.
+# Their end is logged, never sent to the hub as a result.
+NO_MONEY_KINDS = ("aft_cashout_decline", "aft_host_cashout_enable")
+
+
+def describe_host_cashout(status) -> str:
+    """The host cashout status byte of a 0x74 answer, in words."""
+    if status is None:
+        return "unknown"
+    if status & HOST_CASHOUT_ENABLED:
+        words = "ON, " + ("hard" if status & HOST_CASHOUT_HARD else "soft")
+    else:
+        words = "off"
+    return words + (", the host may change it"
+                    if status & HOST_CASHOUT_CONTROLLABLE
+                    else ", set at the machine")
+
+
+def answer_cashout_request(aft_host, code, armed, account_id, on_wire=None):
+    """Answer one host-cashout request from the machine: exception 6A (the
+    player pressed CASH OUT) or 6B (a win has to be cashed out). SAS 6.02
+    §8.7. Returns the result record for the hub, or None when there is
+    nothing to tell it (a request nobody was armed for, declined).
+
+    EVERY request gets an answer. The machine repeats the exception every
+    800 ms and gives the host eight seconds; with no answer it then cashes
+    out some other way if its mode is soft, and TILTS if its mode is hard.
+    Until v0.3.14 a request we were not going to take was simply left: the
+    player stood through the eight seconds on every cash-out with nobody
+    carded in. Now:
+
+      armed, 6A   the credit meter goes to the host: the amounts are read
+                  with 0x74 and asked for exactly, type 80 (as before).
+      armed, 6B   the win goes to the host: type 90, every amount field
+                  all 9s with partial transfer allowed, which the document
+                  defines as "the entire win amount". (It used to be
+                  answered like a 6A, with type 80 for whatever was on the
+                  credit meter, which a machine must refuse with 87.)
+      otherwise   declined: the same transfer type with every amount zero,
+                  "to instruct the gaming machine to perform the cashout by
+                  whatever other means are available". The machine prints
+                  its ticket, or pays the win to the meter, at once.
+
+    What is credited is only what the machine's final status says moved."""
+    win = code == CASHOUT_WIN_REQUEST
+    rec = {"id": f"cashout-{int(time.time() * 1000)}", "type": "aft_cashout",
+           "when": time.strftime("%Y-%m-%dT%H:%M:%S"),
+           "accountId": account_id if armed else None}
+    # Register + adopt the machine's asset/key (idempotent) so the 0x72 can
+    # be built against the real identity. Without it nothing can be sent,
+    # not even a decline, and the machine falls back by itself.
+    ok_reg, _reg, reg_detail = aft_host.auto_register()
+    if not ok_reg:
+        logger.warning("🏦 host-cashout request 0x{:02X} cannot be answered"
+                       " — {}", code, reg_detail)
+        if not armed:
+            return None
+        rec.update(ok=False, amountCents=0,
+                   outcome=("asset_unknown" if "no asset" in reg_detail
+                            else "not_registered"),
+                   detail=f"cannot cash out — {reg_detail}",
+                   result="rejected")
+        return rec
+    why_not = None if armed else ("not_armed", "nobody is armed for a "
+                                  "cash-out to the wallet")
+    cashable = restricted_now = 0
+    if armed and not win:
+        # Full cashable off the machine (0x74/FF read-only interrogate).
+        ls = aft_host.read_lock_status()
+        cashable = (ls.current_cashable_cents
+                    if ls and ls.current_cashable_cents else 0)
+        # restricted promotional credit comes back too, as restricted: the
+        # hub credits it to the wallet's restricted balance, never to cash
+        restricted_now = (ls.current_restricted_cents
+                          if ls and ls.current_restricted_cents else 0)
+        if cashable + restricted_now <= 0:
+            why_not = ("no_credits", "machine reports no cashable credits")
+        elif cashable + restricted_now > MAX_AFT_CENTS:
+            why_not = ("over_ceiling",
+                       f"cashable {cashable}c over the {MAX_AFT_CENTS}c "
+                       "ceiling — cash out at the machine")
+    if why_not is not None:
+        declined = aft_host.transfer(
+            AFTTransferRequest(
+                transaction_id=make_transaction_id(),
+                transfer_type=(TRANSFER_TYPE_WIN_TO_HOST if win
+                               else TRANSFER_TYPE_EGM_TO_HOST),
+                transfer_code=TRANSFER_CODE_FULL_ONLY,
+                transfer_flags=TRANSFER_FLAGS_NONE, zero_ok=True),
+            require_lock=False, kind="aft_cashout_decline", on_wire=on_wire)
+        told = ("the machine was told to cash out another way"
+                if declined.ok else
+                f"the decline did not go through ({declined.detail}); the "
+                "machine falls back by itself after eight seconds")
+        logger.info("🏦 host-cashout request 0x{:02X} declined ({}) — {}",
+                    code, why_not[1], told)
+        if not armed:
+            return None
+        rec.update(ok=False, outcome=why_not[0], amountCents=0,
+                   detail=f"{why_not[1]}; {told}", result="rejected")
+        return rec
+    if win:
+        req = AFTTransferRequest(
+            transaction_id=make_transaction_id(),
+            transfer_type=TRANSFER_TYPE_WIN_TO_HOST,
+            cashable_cents=ALL_OF_IT_CENTS,
+            restricted_cents=ALL_OF_IT_CENTS,
+            nonrestricted_cents=ALL_OF_IT_CENTS,
+            transfer_code=TRANSFER_CODE_PARTIAL_OK,
+            transfer_flags=TRANSFER_FLAGS_NONE)
+        asked = "the whole win"
+    else:
+        req = AFTTransferRequest(
+            transaction_id=make_transaction_id(),
+            transfer_type=TRANSFER_TYPE_EGM_TO_HOST,
+            cashable_cents=cashable, restricted_cents=restricted_now,
+            transfer_code=TRANSFER_CODE_FULL_ONLY,
+            transfer_flags=TRANSFER_FLAGS_NONE)
+        asked = f"{cashable}c"
+    logger.info("🏦 host-cashout: pulling {} EGM->host (acct {})", asked,
+                rec["accountId"] or "-")
+    res = aft_host.transfer(req, require_lock=False, kind="aft_cashout",
+                            account_id=rec.get("accountId"),
+                            cmd_id=rec["id"], on_wire=on_wire)
+    # Credit ONLY what the MACHINE confirmed left the machine — NEVER the
+    # requested amount. If the completion parsed no amount (res.final
+    # missing, or its cashable BCD field unreadable) credit NOTHING
+    # (amountCents=0) even when the status byte said success: a wallet
+    # credit is irreversible, so an unconfirmed amount is left for a meter
+    # check, never back-filled with the figure we asked for.
+    confirmed = (res.final.cashable_cents
+                 if res.final is not None
+                 and res.final.cashable_cents is not None else None)
+    credited = confirmed if res.ok and confirmed is not None else 0
+    rcredited = _restricted_moved(res)
+    rec.update(ok=res.ok, outcome=res.outcome.value,
+               txnId=req.transaction_id, amountCents=credited,
+               restrictedCents=rcredited,
+               detail=(res.detail if credited or rcredited or not res.ok
+                       else res.detail + " — amount UNCONFIRMED, NOT "
+                       "credited (verify meters)"),
+               result="ack" if res.ok else res.outcome.value)
+    if win:
+        rec["win"] = True
+    logger.info("🏦 host-cashout {} -> {} ({})", asked, res.outcome.value,
+                res.detail)
+    return rec
+
+
 def link_down_reason(state):
     """Why a command must not be sent to this machine right now, or None.
 
@@ -440,6 +595,11 @@ def late_transfer_record(ended):
 
 def note_transfer_end(ended, reporter) -> None:
     """Log the END of a followed-up transfer and hand it to the hub."""
+    if (ended.get("rec") or {}).get("kind") in NO_MONEY_KINDS:
+        logger.info("🏦 AFT {} (txn {}) ended late: {} — {}",
+                    ended["rec"]["kind"], ended["rec"].get("txnId"),
+                    ended.get("outcome"), ended.get("detail"))
+        return
     record = late_transfer_record(ended)
     if record is None:
         logger.warning("🏦 AFT: {} — txn {} for {}c. Nothing booked; check "
@@ -1655,22 +1815,24 @@ def main():
     # is echoed to the hub so the confirmed completion credits the right
     # wallet; "pending" hands a raised 0x6A to handle_cashout_if_pending()
     # between polls (never a re-entrant transact inside the exception cb).
-    cashout_state = {"armed": False, "pending": False, "accountId": None}
+    cashout_state = {"armed": False, "pending": False, "accountId": None,
+                     "code": CASHOUT_REQUEST}
 
     def on_cashout_request(addr, code):
-        # Machine raised an AFT host-cashout request (believed 0x6A/0x6B) off
-        # the general poll — the cash-out button on an armed machine. Only a
-        # machine WE armed is answered: flag it for the between-polls handler
-        # on THIS poll thread. Setting a flag is the whole job here (the
-        # transport is mid-exchange in the exception callback — never transact
-        # from inside it).
-        if cashout_state["armed"]:
-            cashout_state["pending"] = True
-            logger.info("🏦 addr {} host-cashout request 0x{:02X} — armed, "
-                        "answering EGM->host between polls", addr, code)
-        else:
-            logger.info("🏦 addr {} host-cashout request 0x{:02X} — NOT armed"
-                        " — left to the machine default (ticket)", addr, code)
+        # Machine raised an AFT host-cashout request off the general poll:
+        # 0x6A, the cash-out button, or 0x6B, a win to be cashed out. EVERY
+        # one is answered (answer_cashout_request): taken when armed,
+        # declined when not, so the machine never waits out its eight
+        # seconds. Setting a flag is the whole job here (the transport is
+        # mid-exchange in the exception callback — never transact from
+        # inside it); the machine repeats the exception every 800 ms, so
+        # only the first of a burst is logged.
+        if not cashout_state["pending"]:
+            logger.info("🏦 addr {} host-cashout request 0x{:02X} — {}, "
+                        "answering between polls", addr, code,
+                        "armed" if cashout_state["armed"] else "not armed")
+        cashout_state["pending"] = True
+        cashout_state["code"] = code
 
     # AFT auto-registration host (the 🎫 register path). Built with NO asset —
     # auto_register() READS the operator-set asset off the machine and
@@ -2132,30 +2294,55 @@ def main():
                 acct = cmd.get("accountId")
                 if isinstance(acct, str) and acct:
                     result["accountId"] = acct[:64]
-                cashout_state["armed"] = enable
-                cashout_state["accountId"] = (result.get("accountId")
-                                              if enable else None)
-                if not enable:
-                    cashout_state["pending"] = False
                 ls = None
                 try:
+                    if enable:
+                        # the 0x72 that switches host cashout on needs the
+                        # machine's asset and our key (idempotent)
+                        aft_host.auto_register()
                     ls = aft_host.set_host_cashout(enable)
                 except Exception as ce:            # noqa: BLE001 — best-effort
                     logger.warning("🏦 hub command {}: host-cashout arm wire "
-                                   "error (armed flag still applied): {}",
-                                   cmd_id, ce)
-                result["ok"] = True
-                result["outcome"] = "armed" if enable else "disarmed"
-                result["armed"] = enable
+                                   "error: {}", cmd_id, ce)
+                hc = ls.host_cashout_status if ls is not None else None
+                # Armed only when the machine WILL raise 6A on its button:
+                # its host cashout is on (it was, or we just switched it
+                # on). An arm on a machine where it is off and not ours to
+                # set would say "cash-out goes to the wallet" and print a
+                # ticket (SAS 6.02 audit, item 6).
+                armed = bool(enable and hc is not None
+                             and hc & HOST_CASHOUT_ENABLED)
+                cashout_state["armed"] = armed
+                cashout_state["accountId"] = (result.get("accountId")
+                                              if armed else None)
                 if ls is not None:
                     result["availXfers"] = ls.available_transfers
-                    result["hostCashoutStatus"] = ls.host_cashout_status
+                    result["hostCashoutStatus"] = hc
                     result["fromEgmOk"] = bool(
                         ls.available_transfers & AVAIL_XFER_FROM_EGM)
-                result["result"] = "ack"
-                logger.info("🏦 hub command {}: AFT host-cashout {} (acct {})",
-                            cmd_id, "ARMED" if enable else "disarmed",
-                            result.get("accountId") or "-")
+                result["armed"] = armed
+                if enable and not armed:
+                    result["ok"] = False
+                    result["outcome"] = ("no_answer" if hc is None
+                                         else "host_cashout_off")
+                    result["detail"] = (
+                        "the machine did not answer the status read"
+                        if hc is None else
+                        "cashout to host is off on this machine ("
+                        + describe_host_cashout(hc) + "); its CASH OUT "
+                        "button will keep printing a ticket")
+                    result["result"] = "rejected"
+                else:
+                    result["ok"] = True
+                    result["outcome"] = "armed" if enable else "disarmed"
+                    result["result"] = "ack"
+                logger.info("🏦 hub command {}: AFT host-cashout {} (acct {};"
+                            " machine: {})", cmd_id,
+                            "ARMED" if armed else
+                            ("NOT armed" if enable else "disarmed"),
+                            result.get("accountId") or "-",
+                            describe_host_cashout(hc) if hc is not None
+                            else ("not read" if not enable else "no answer"))
                 return result
             if cmd.get("type") in ("sas_disable", "sas_enable"):
                 # Machine lock/unlock = SAS shutdown 0x01 / startup 0x02
@@ -2855,102 +3042,43 @@ def main():
             reporter.record_result(run_hub_command(cmd))
 
     def handle_cashout_if_pending():
-        """Answer a machine-initiated host-cashout request (exception 0x6A)
-        on THIS (poll) thread, BETWEEN polls — the transport single-writer
-        rule (never a re-entrant transact inside the exception callback,
-        never a second serial writer, tcdrain timing untouched). Reads the
-        machine's cashable balance and pushes it EGM->host (0x80); the hub
-        credits the pinned wallet on the confirmed completion (a satellite-
-        originated 'aft_cashout' result record). Fires ONLY when armed
-        (on_cashout_request gates the flag), so an un-armed machine's
-        cash-out is never silently pulled. Never raises — an exception here
-        would kill the poll loop via SASPoller.run's bare stop()."""
+        """Answer a machine-initiated host-cashout request (exception 0x6A
+        or 0x6B) on THIS (poll) thread, BETWEEN polls — the transport
+        single-writer rule (never a re-entrant transact inside the
+        exception callback, never a second serial writer). The answer
+        itself is answer_cashout_request: armed, the credits (or the win)
+        go to the host and the hub credits the pinned wallet on the
+        confirmed completion; not armed, the request is declined so the
+        machine cashes out its own way at once. Never raises — an
+        exception here would kill the poll loop via SASPoller.run's bare
+        stop()."""
         if not cashout_state["pending"]:
             return
-        cashout_state["pending"] = False
         if not sas_enabled.is_set():
+            cashout_state["pending"] = False
             return                                 # parked — no wire traffic
-        rec = {"id": f"cashout-{int(time.time() * 1000)}",
-               "type": "aft_cashout",
-               "when": time.strftime("%Y-%m-%dT%H:%M:%S"),
-               "accountId": cashout_state["accountId"]}
+        rec = None
         try:
-            # Register + adopt the machine's asset/key (idempotent) so the
-            # EGM->host 0x72 can build against the real identity.
-            ok_reg, reg, reg_detail = aft_host.auto_register()
-            if not ok_reg:
-                rec.update(ok=False, amountCents=0,
-                           outcome=("asset_unknown" if "no asset" in reg_detail
-                                    else "not_registered"),
-                           detail=f"cannot cash out — {reg_detail}",
-                           result="rejected")
-            else:
-                # Full cashable off the machine (0x74/FF read-only interrogate).
-                ls = aft_host.read_lock_status()
-                cashable = (ls.current_cashable_cents
-                            if ls and ls.current_cashable_cents else 0)
-                # restricted promotional credit comes back too, as
-                # restricted: the hub credits it to the wallet's restricted
-                # balance, never to cash (2026-11-16)
-                restricted_now = (ls.current_restricted_cents
-                                  if ls and ls.current_restricted_cents
-                                  else 0)
-                if cashable + restricted_now <= 0:
-                    rec.update(ok=False, outcome="no_credits", amountCents=0,
-                               detail="machine reports no cashable credits",
-                               result="rejected")
-                elif cashable + restricted_now > MAX_AFT_CENTS:
-                    rec.update(ok=False, outcome="over_ceiling", amountCents=0,
-                               detail=(f"cashable {cashable}c over the "
-                                       f"{MAX_AFT_CENTS}c ceiling — cash out "
-                                       "at the machine"), result="rejected")
-                else:
-                    req = AFTTransferRequest(
-                        transaction_id=make_transaction_id(),
-                        transfer_type=TRANSFER_TYPE_EGM_TO_HOST,
-                        cashable_cents=cashable,
-                        restricted_cents=restricted_now,
-                        transfer_code=TRANSFER_CODE_FULL_ONLY,
-                        transfer_flags=TRANSFER_FLAGS_NONE)
-                    logger.info("🏦 host-cashout: pushing {}c EGM->host "
-                                "(acct {})", cashable, rec["accountId"] or "-")
-                    res = aft_host.transfer(
-                        req, require_lock=False,
-                        kind="aft_cashout",
-                        account_id=rec.get("accountId"), cmd_id=rec["id"],
-                        on_wire=lambda lbl, rq, rp: logger.info(
-                            "🏦 {} REQ {} | RESP {}", lbl, rq.hex(),
-                            rp.hex() if rp else "(silence)"))
-                    # Credit ONLY what the MACHINE confirmed left the machine —
-                    # NEVER the requested `cashable`. If the completion parsed
-                    # no amount (res.final missing, or its cashable BCD field
-                    # unreadable) credit NOTHING (amountCents=0) even when the
-                    # status byte said success: a wallet credit is irreversible,
-                    # so an unconfirmed amount is left for a meter check, never
-                    # back-filled with the figure we asked for.
-                    confirmed = (res.final.cashable_cents
-                                 if res.final is not None
-                                 and res.final.cashable_cents is not None
-                                 else None)
-                    credited = (confirmed if res.ok and confirmed is not None
-                                else 0)
-                    rcredited = _restricted_moved(res)
-                    rec.update(ok=res.ok, outcome=res.outcome.value,
-                               txnId=req.transaction_id,
-                               amountCents=credited,
-                               restrictedCents=rcredited,
-                               detail=(res.detail
-                                       if credited or rcredited or not res.ok
-                                       else res.detail + " — amount UNCONFIRMED"
-                                       ", NOT credited (verify meters)"),
-                               result="ack" if res.ok else res.outcome.value)
-                    logger.info("🏦 host-cashout {}c -> {} ({})",
-                                cashable, res.outcome.value, res.detail)
+            rec = answer_cashout_request(
+                aft_host, cashout_state["code"], cashout_state["armed"],
+                cashout_state["accountId"],
+                on_wire=lambda lbl, rq, rp: logger.info(
+                    "🏦 {} REQ {} | RESP {}", lbl, rq.hex(),
+                    rp.hex() if rp else "(silence)"))
         except Exception as e:                     # noqa: BLE001 — never fatal
-            rec.update(ok=False, outcome="error", amountCents=0,
-                       detail=f"{type(e).__name__}: {e}", result="error")
             logger.warning("🏦 host-cashout failed: {}", e)
-        if reporter is not None:
+            if cashout_state["armed"]:
+                rec = {"id": f"cashout-{int(time.time() * 1000)}",
+                       "type": "aft_cashout",
+                       "when": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                       "accountId": cashout_state["accountId"],
+                       "ok": False, "outcome": "error", "amountCents": 0,
+                       "detail": f"{type(e).__name__}: {e}",
+                       "result": "error"}
+        # The machine repeated its request while this one was being
+        # answered; those repeats are the same request, already dealt with.
+        cashout_state["pending"] = False
+        if rec is not None and reporter is not None:
             reporter.record_result(rec)
 
     def heartbeat_if_due(now):
@@ -3073,6 +3201,13 @@ def main():
                              and any(reg.registration_key) else None,
                     "availXfers": ls.available_transfers if ls else None,
                     "aftStatus": ls.aft_status if ls else None,
+                    # The host cashout status byte (SAS 6.02 Table 8.2b):
+                    # bit 0 the host may change the enable, bit 1 cashout
+                    # to host is enabled now, bit 2 hard mode. THIS is
+                    # what says whether the machine's CASH OUT button will
+                    # raise 6A; availXfers bit 1 is not.
+                    "hostCashoutStatus": ls.host_cashout_status
+                                         if ls else None,
                     # tri-state on purpose: None = unknown (silent read /
                     # old firmware) — the hub/UI may only act on a REAL
                     # False (never exclude a machine on missing data)

@@ -125,7 +125,7 @@ if "tournament_names" not in _hub_store_mod.HOST_SETTING_KEYS:
 # the MINOR bump per the repo's version rule). Surfaced in engine_meta() ->
 # /api/status ["_engine"]["version"]; bump this and add a CHANGELOG.md
 # section on every commit with a user-visible change.
-CABINET_VERSION = "0.3.13"
+CABINET_VERSION = "0.3.14"
 
 WSDL_NS = "http://www.gamingstandards.com/wsdl/g2s/v1.0"
 SCHEMA_NS = "http://www.gamingstandards.com/g2s/schemas/v1.0.3"
@@ -362,12 +362,18 @@ def pin_min_digits(hub_store):
     return v if v in (4, 6) else PIN_MIN_DIGITS_DEFAULT
 GLASS_WALLET_ACTIONS = ("walletFund", "cashOutToWallet", "cashOutNow")
 GLASS_ADMIN_ACTIONS = ("clearHandpay", "refreshGames")
-# 0x74 "available transfers" bit for machine->host cash-out (real SAS 6.02
-# Table 8.2b; the from-EGM counterpart of AVAIL_XFER_TO_EGM 0x01). The
-# machine->wallet cash-out gate (sas_from_egm_ready) reads this off the
-# satellite's reported aft.availXfers: set == the BB2 is menu-configured for
-# "soft cash-out to host". Mirrors SAS/modules/aft/aft_handler.py.
+# 0x74 "available transfers" bit 1 (SAS 6.02 Table 8.2b): a transfer FROM
+# the gaming machine might be accepted right now. It gates the host-initiated
+# PULL (cashOutNow). It says nothing about the machine's CASH OUT button:
+# that is the host cashout status byte below. Until v0.3.14 this one bit was
+# read as both. Mirrors SAS/modules/aft/aft_handler.py.
 AVAIL_XFER_FROM_EGM = 0x02
+# 0x74 "host cashout status" byte (same table): whether the machine's CASH
+# OUT button goes to the host, i.e. raises exception 6A for the satellite to
+# answer. It gates the ARM (cashOutToWallet) on a SAS machine.
+HOST_CASHOUT_CONTROLLABLE = 0x01     # bit 0: the host may change the enable
+HOST_CASHOUT_ENABLED = 0x02          # bit 1: cashout to host is enabled now
+HOST_CASHOUT_HARD = 0x04             # bit 2: hard mode (failure tilts)
 # Sequencer setActiveContent retry knobs (BENCH LESSON 2026-07-10: the EGM
 # rejects setActiveContent with IGT_MDX005 "Content not loaded." until its
 # browser has fetched the page, so the advance is poll-driven with spaced
@@ -5973,6 +5979,10 @@ class G2SHost:
                 "keyFp": _s(key_fp, 16) if isinstance(key_fp, str) else None,
                 "availXfers": _bi(af.get("availXfers"), 0, 0xFF),
                 "aftStatus": _bi(af.get("aftStatus"), 0, 0xFF),
+                # the 0x74 host cashout status byte; None on an old
+                # satellite or before its first status read
+                "hostCashoutStatus": _bi(af.get("hostCashoutStatus"), 0,
+                                         0xFF),
                 "inHouseEnabled": in_house if isinstance(in_house, bool)
                                   else None,
             }
@@ -6169,14 +6179,15 @@ class G2SHost:
         sas_enabled = prefs.get("sasEnabled")
         sas_enabled = True if sas_enabled is None else bool(sas_enabled)
         entry["sasEnabled"] = sas_enabled
-        # sasCashoutReady (the machine->wallet return-leg gate): SELF-DETERMINED
-        # from the wire (CONFIRMED 2026-07-12) — true iff this report's 0x74
-        # status advertises AVAIL_XFER_FROM_EGM (the machine is menu-set to
-        # "soft cash-out to host"). NO manual flag: the arm gate and this
-        # /api/status display both read the same live from-EGM bit, so the UI
-        # can never show a fake ON for a machine that isn't configured. Derived
-        # AFTER entry["aft"] is populated above.
+        # sasCashoutReady: the machine reports that a transfer FROM it might
+        # be accepted (0x74 available transfers bit 1) — what the hub's own
+        # PULL to the wallet needs. No manual flag. Derived AFTER
+        # entry["aft"] is populated above.
         entry["sasCashoutReady"] = self.sas_from_egm_ready(entry)
+        # sasHostCashout: what the machine's own CASH OUT button does, from
+        # the host cashout status byte — None until the satellite has read
+        # it. "enabled" = the button asks the host (exception 6A).
+        entry["sasHostCashout"] = self.sas_host_cashout(entry)
         with self.sas_lock:
             known = key in self.sas_machines
             if not known and len(self.sas_machines) >= self.SAS_MAX_MACHINES:
@@ -6245,6 +6256,7 @@ class G2SHost:
                 # entry (the denomSuggest ordering trap) — recompute
                 # against the carried registration.
                 entry["sasCashoutReady"] = self.sas_from_egm_ready(entry)
+                entry["sasHostCashout"] = self.sas_host_cashout(entry)
             self.sas_machines[key] = entry
             # Drain this SMIB's pending commands into the reply (AFTER the
             # registry-full early return — a rejected report must never
@@ -6303,6 +6315,9 @@ class G2SHost:
         # the push settle: after admission, outside sas_lock, idempotent on
         # txnId, raw commandResults.
         self._settle_aft_cashouts(cr, key)
+        # An arm the satellite could not make (the machine's host cashout
+        # is off): drop the pin so no page shows a fake ON.
+        self._drop_refused_cashout_arms(cr, key)
         # Tournament-pin reaper: an answered NON-crediting tournament pull
         # (lock_failed / no_credits on a cancel sweep whose runner already
         # stood down) must retire its House pin HERE — no observer tick
@@ -6560,6 +6575,51 @@ class G2SHost:
                          acct_id, cents / 100, txn,
                          "restricted" if restricted else "cashable",
                          bal / 100000)
+
+    def _drop_refused_cashout_arms(self, command_results, key):
+        """Un-pin a cash-out arm the satellite answered it could NOT make.
+
+        The hub pins the wallet when it queues the arm, on what the
+        machine's last status said. The satellite then reads the machine
+        afresh; where cashout to host turns out to be off and not the
+        host's to switch, it answers ok:false armed:false (outcome
+        host_cashout_off, or no_answer). Leaving the pin would show
+        "TO WALLET ON" on a machine whose button prints a ticket. Each
+        result is acted on once (the satellite re-reports its recent
+        results every second), and only a pin that is still there is
+        dropped. Never raises."""
+        if not isinstance(command_results, list):
+            return
+        try:
+            seen = getattr(self, "_cashout_arms_seen", None)
+            if seen is None:
+                seen = self._cashout_arms_seen = set()
+            for r in command_results:
+                if not isinstance(r, dict) \
+                        or r.get("type") != "aft_set_host_cashout" \
+                        or r.get("ok") is not False \
+                        or r.get("armed") is not False \
+                        or r.get("outcome") not in ("host_cashout_off",
+                                                    "no_answer"):
+                    continue
+                rid = r.get("id")
+                if not isinstance(rid, str) or rid in seen:
+                    continue
+                if len(seen) > 4096:
+                    seen.clear()
+                seen.add(rid)
+                owners = [m for m, sk in self.sas_links.items()
+                          if sk == key] + [key]
+                with self._glass_pin_lock:
+                    dropped = [o for o in owners
+                               if self._glass_cash_out_pin.pop(o, None)]
+                log.warning("🏦 [sas:%s] cash-out arm %s refused by the "
+                            "machine (%s)%s", key, rid,
+                            str(r.get("detail") or r.get("outcome"))[:200],
+                            " — pin dropped" if dropped else "")
+        except Exception:  # noqa: BLE001 — rides the report, never fatal
+            log.exception("cash-out arm result handling (%s) failed "
+                          "(ignored)", key)
 
     def _sas_cashout_pin(self, key):
         """The hub's OWN armed cash-out destination for a reporting SAS machine
@@ -9543,18 +9603,42 @@ class G2SHost:
 
     @staticmethod
     def sas_from_egm_ready(entry):
-        """The machine->wallet SAS cash-out gate SELF-DETERMINES from the wire
-        (CONFIRMED 2026-07-12): the machine's last 0x74 status must advertise
-        AVAIL_XFER_FROM_EGM (0x02) — i.e. it is menu-set to "soft cash-out to
-        host, fail to ticket". NO manual operator flag — an un-configured
-        machine simply never reports the from-EGM bit, so the arm is refused
-        and its CASH OUT falls to a ticket. `entry` is a live sas_machines
-        record; its "aft" block carries availXfers straight off the
-        satellite's read-only 0x74/FF interrogate."""
+        """Can the hub PULL this machine's credits to a wallet right now?
+        True when the machine's last 0x74 status had "available transfers"
+        bit 1 set: a transfer from the gaming machine might be accepted
+        (SAS 6.02 Table 8.2b). `entry` is a live sas_machines record; its
+        "aft" block carries availXfers off the satellite's read-only
+        0x74/FF interrogate. No manual operator flag.
+
+        This is NOT the machine's host cashout setting, and until v0.3.14
+        it was used as if it were (see sas_host_cashout)."""
         aft = (entry or {}).get("aft") or {}
         xf = aft.get("availXfers")
         return (isinstance(xf, int) and not isinstance(xf, bool)
                 and bool(xf & AVAIL_XFER_FROM_EGM))
+
+    @staticmethod
+    def sas_host_cashout(entry):
+        """What the machine's own CASH OUT button does, from the 0x74 host
+        cashout status byte: {"enabled", "controllable", "hard"}, or None
+        when the satellite has not reported the byte.
+
+          enabled       cashout to host is on: a press raises exception 6A
+                        and the satellite answers it (takes it for an armed
+                        wallet, declines it otherwise).
+          controllable  the host may switch that on and off. The satellite
+                        switches it on when a player arms and off again
+                        when they disarm.
+          hard          with it on, a cashout the host does not answer
+                        tilts the machine instead of printing a ticket."""
+        aft = (entry or {}).get("aft") or {}
+        hc = aft.get("hostCashoutStatus")
+        if not isinstance(hc, int) or isinstance(hc, bool):
+            return None
+        return {"enabled": bool(hc & HOST_CASHOUT_ENABLED),
+                "controllable": bool(hc & HOST_CASHOUT_CONTROLLABLE),
+                "hard": bool(hc & HOST_CASHOUT_ENABLED
+                             and hc & HOST_CASHOUT_HARD)}
 
     def glass_wallet_fund(self, egm_id, account_id, cents, restricted=False):
         """walletFund — push the carded player's OWN wallet onto THIS machine,
@@ -9668,18 +9752,21 @@ class G2SHost:
             (enqueue_set_wat_cash_out) — the fromEgm transfer credits the
             pinned account at commitTransfer (_wat_decide_authorization).
             KEPT VERBATIM.
-          * BB2 (SAS-linked, self.sas_links): the arm is a PURELY HUB-SIDE
-            flag pushed to the satellite (aft_set_host_cashout) — no game-lock,
-            no wire write to the machine. The machine is menu-set to "soft
-            cash-out to host, fail to ticket", so the CASH OUT button raises
-            SAS exception 0x6A; while armed the satellite answers it with a
-            0x72 EGM_TO_HOST transfer and the hub credits the pinned wallet on
-            the confirmed completion (_settle_aft_cashouts); unarmed, the 0x6A
-            goes unanswered and the machine tickets. The gate SELF-DETERMINES
-            from the wire (sas_from_egm_ready — the machine's 0x74 from-EGM
-            bit): arming a machine that isn't reporting from-EGM answers an
-            honest refusal, never a fake ON. Disarm is always allowed
-            (idempotent revert to the ticket default).
+          * SAS-linked (self.sas_links): the arm goes to the satellite
+            (aft_set_host_cashout). It works only where the machine's own
+            host cashout is on, because that is what makes the CASH OUT
+            button raise SAS exception 0x6A: while armed the satellite
+            answers it with a 0x72 EGM_TO_HOST transfer and the hub credits
+            the pinned wallet on the confirmed completion
+            (_settle_aft_cashouts); unarmed, the satellite declines it and
+            the machine tickets at once. The gate reads the machine's 0x74
+            host cashout status (sas_host_cashout): on, or off but the
+            host's to switch (the satellite then switches it on for the
+            arm and off again at disarm). Anything else is refused, never
+            a fake ON — and if the satellite then finds it cannot arm, its
+            answer drops the pin (_drop_refused_cashout_arms). Disarm is
+            always allowed. Until v0.3.14 this gate read "available
+            transfers" bit 1, which says nothing about the button.
 
         Both protocols share the _glass_cash_out_pin + expect_tok TOCTOU guard:
         the pin is armed ONLY while the requester's token is STILL this EGM's
@@ -9706,17 +9793,23 @@ class G2SHost:
         if leg:
             with self.sas_lock:
                 entry = self.sas_machines.get(leg) or {}
-            if enable and not self.sas_from_egm_ready(entry):
-                # GATE (self-determined from the wire, NOT a manual flag): the
-                # machine's last 0x74 status must advertise from-EGM cash-out
-                # (it is menu-set to "soft cash-out to host"). Un-configured ->
-                # refuse honestly (surfaced verbatim to the UI), never a fake
-                # ON. Disarm is never gated (idempotent revert to the ticket).
+            hc = self.sas_host_cashout(entry)
+            if enable and (hc is None
+                           or not (hc["enabled"] or hc["controllable"])):
+                # GATE (from the wire, NOT a manual flag): the machine's
+                # CASH OUT button must go to the host, or be the host's to
+                # switch. Otherwise the button prints a ticket whatever we
+                # arm — refuse (surfaced verbatim to the UI), never a fake
+                # ON. Disarm is never gated.
                 return 400, {"ok": False, "cashOutToWat": False,
                              "egmId": egm_id, "path": "sas",
-                             "error": "cash-out to wallet isn't set up on this "
-                                      "machine yet (turn on soft cash-out to "
-                                      "host in its operator menu)"}
+                             "error": (
+                                 "This machine hasn't reported its cash-out "
+                                 "setting yet. Try again in a moment."
+                                 if hc is None else
+                                 "This machine's CASH OUT button prints a "
+                                 "ticket: cashout to host is off in its "
+                                 "operator menu.")}
             smib = entry.get("smibId") or str(leg).split("/", 1)[0]
             cmd = {"id": f"coarm{next(self._fob_seq)}-{int(time.time())}",
                    "type": "aft_set_host_cashout", "enable": bool(enable),
@@ -9778,8 +9871,9 @@ class G2SHost:
         aft_cashout_pull to the satellite, which does a LOCK-FIRST EGM_TO_HOST
         pull and reports an 'aft_cashout' completion; the hub credits the
         PINNED wallet on the CONFIRMED amount (_settle_aft_cashouts), never the
-        wire's echoed account. Gated the SAME self-determined way as the arm
-        toggle — the machine's 0x74 from-EGM bit (soft-cash-out-to-host config).
+        wire's echoed account. Gated on the machine's 0x74 "transfer from
+        gaming machine OK" bit (sas_from_egm_ready); the machine's host
+        cashout setting does not come into a pull.
         AVP/plain-G2S cabinets are NOT host-control here (they keep the WAT
         arm+button via cashOutToWallet) — this refuses on them. The credit is
         ASYNC: the reply says pending; the wallet updates when the completion
@@ -9792,10 +9886,14 @@ class G2SHost:
         with self.sas_lock:
             entry = self.sas_machines.get(leg) or {}
         if not self.sas_from_egm_ready(entry):
+            # The machine's last status did not say a transfer from it is
+            # possible. (This used to advise turning on "soft cash-out to
+            # host", which a pull does not need and which makes every
+            # CASH OUT press ask the host first.)
             return 400, {"ok": False, "egmId": egm_id, "path": "sas",
-                         "error": "cash-out to wallet isn't set up on this "
-                                  "machine yet (turn on soft cash-out to host "
-                                  "in its operator menu)"}
+                         "error": "This machine can't send its credits to "
+                                  "the wallet right now. Its CASH OUT button "
+                                  "still works."}
         smib = entry.get("smibId") or str(leg).split("/", 1)[0]
         # Pin the destination FIRST (TOCTOU-guarded) so the pull never fires
         # without a wallet home; then enqueue. A card switch that superseded

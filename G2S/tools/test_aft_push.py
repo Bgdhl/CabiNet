@@ -429,6 +429,122 @@ def main():
           len(rows) == 2 and all("restricted promotional" in e["note"]
                                  for e in rows))
 
+    print("— the machine's CASH OUT button: armed on the right status byte")
+    # SAS 6.02 Table 8.2b. Until v0.3.14 the arm gate read "available
+    # transfers" bit 1 (a transfer from the machine might be accepted) as
+    # if it were the host cashout enable, so a machine with host cashout
+    # off was armed and its button printed a ticket (audit item 6).
+    hc = G.G2SHost.sas_host_cashout
+    check("no status byte reported yet reads as unknown",
+          hc({"aft": {"availXfers": 0x17}}) is None and hc({}) is None)
+    check("0x00: off, and not the host's to switch",
+          hc({"aft": {"hostCashoutStatus": 0}}) ==
+          {"enabled": False, "controllable": False, "hard": False})
+    check("0x01: off, the host may switch it",
+          hc({"aft": {"hostCashoutStatus": 1}}) ==
+          {"enabled": False, "controllable": True, "hard": False})
+    check("0x06: on, hard mode, set at the machine",
+          hc({"aft": {"hostCashoutStatus": 6}}) ==
+          {"enabled": True, "controllable": False, "hard": True})
+    check("the hard bit means nothing while it is off",
+          hc({"aft": {"hostCashoutStatus": 4}})["hard"] is False)
+    check("junk is unknown, never a guess",
+          hc({"aft": {"hostCashoutStatus": True}}) is None
+          and hc({"aft": {"hostCashoutStatus": "2"}}) is None)
+
+    class ArmStub:
+        glass_cash_out_to_wallet = G.G2SHost.glass_cash_out_to_wallet
+        glass_cash_out_now = G.G2SHost.glass_cash_out_now
+        sas_host_cashout = staticmethod(G.G2SHost.sas_host_cashout)
+        sas_from_egm_ready = staticmethod(G.G2SHost.sas_from_egm_ready)
+        _drop_refused_cashout_arms = G.G2SHost._drop_refused_cashout_arms
+
+        def __init__(self, aft):
+            import itertools, threading
+            self.sas_links = {"EGM1": "bb2/1"}
+            self.sas_lock = threading.Lock()
+            self.sas_machines = {"bb2/1": {"smibId": "smib-bb2", "aft": aft}}
+            self._glass_pin_lock = threading.Lock()
+            self._glass_cash_out_pin = {}
+            self._fob_seq = itertools.count(1)
+            self.sent = []
+
+        def sas_enqueue_command(self, smib, cmd):
+            self.sent.append((smib, cmd))
+            return {"ok": True, "id": cmd["id"]}
+
+    # the machine the old gate got wrong: pulls are possible, the button
+    # does not go to the host
+    a = ArmStub({"registered": True, "availXfers": 0x17,
+                 "hostCashoutStatus": 0x00})
+    code, body = a.glass_cash_out_to_wallet("EGM1", "p1", True)
+    check("host cashout off at the machine: the arm is refused, nothing "
+          "queued, nothing pinned",
+          code == 400 and body["cashOutToWat"] is False and not a.sent
+          and a._glass_cash_out_pin == {})
+    check("...and the refusal says what the button does",
+          "prints a ticket" in body["error"]
+          and "operator menu" in body["error"])
+    a = ArmStub({"registered": True, "availXfers": 0x17})
+    code, body = a.glass_cash_out_to_wallet("EGM1", "p1", True)
+    check("status byte not reported yet: refused, with a try-again",
+          code == 400 and "Try again" in body["error"] and not a.sent)
+    for byte, what in ((0x02, "on at the machine"),
+                       (0x01, "off but the host's to switch"),
+                       (0x03, "on and the host's to switch")):
+        a = ArmStub({"registered": True, "availXfers": 0x00,
+                     "hostCashoutStatus": byte})
+        code, body = a.glass_cash_out_to_wallet("EGM1", "p1", True)
+        check(f"host cashout {what}: the arm is queued and pinned (whatever "
+              "the available-transfers bit says)",
+              code == 200 and body["cashOutToWat"] is True
+              and a.sent[-1][1]["type"] == "aft_set_host_cashout"
+              and a.sent[-1][1]["enable"] is True
+              and a._glass_cash_out_pin == {"EGM1": "p1"})
+    code, body = a.glass_cash_out_to_wallet("EGM1", "p1", False)
+    check("a disarm is never gated",
+          code == 200 and a.sent[-1][1]["enable"] is False
+          and a._glass_cash_out_pin == {})
+
+    # the satellite reads the machine afresh and may find it cannot arm
+    a = ArmStub({"registered": True, "hostCashoutStatus": 0x01})
+    a.glass_cash_out_to_wallet("EGM1", "p1", True)
+    arm_id = a.sent[-1][1]["id"]
+    refusal = [{"id": arm_id, "type": "aft_set_host_cashout", "ok": False,
+                "armed": False, "outcome": "host_cashout_off",
+                "detail": "cashout to host is off on this machine"}]
+    a._drop_refused_cashout_arms(refusal, "bb2/1")
+    check("an arm the satellite could not make drops the pin (no fake ON)",
+          a._glass_cash_out_pin == {})
+    a.glass_cash_out_to_wallet("EGM1", "p2", True)       # a later, good arm
+    a._drop_refused_cashout_arms(refusal, "bb2/1")       # re-reported
+    check("the same refusal reported again does not drop a later arm",
+          a._glass_cash_out_pin == {"EGM1": "p2"})
+    a._drop_refused_cashout_arms(
+        [{"id": "x1", "type": "aft_set_host_cashout", "ok": True,
+          "armed": True, "outcome": "armed"},
+         {"id": "x2", "type": "aft_cashout", "ok": False,
+          "outcome": "no_credits"}, "junk", None], "bb2/1")
+    check("a good arm, another kind of result and junk leave the pin alone",
+          a._glass_cash_out_pin == {"EGM1": "p2"})
+
+    print("— the hub's own pull keeps its gate, with honest words")
+    a = ArmStub({"registered": True, "availXfers": 0x15,
+                 "hostCashoutStatus": 0x02})
+    code, body = a.glass_cash_out_now("EGM1", "p1")
+    check("no transfer from the machine possible: the pull is refused",
+          code == 400 and not a.sent)
+    check("...without telling the owner to turn on cash-out to host",
+          "operator menu" not in body["error"]
+          and "soft cash-out" not in body["error"]
+          and "CASH OUT button still works" in body["error"])
+    a = ArmStub({"registered": True, "availXfers": 0x17,
+                 "hostCashoutStatus": 0x00})
+    a.glass_sessions = None
+    code, body = a.glass_cash_out_now("EGM1", "p1")
+    check("a pull does not need host cashout at all",
+          code == 200 and a.sent[-1][1]["type"] == "aft_cashout_pull")
+
     print("=" * 50)
     print(f"RESULT: {_passed} passed, {_failed} failed")
     return 1 if _failed else 0

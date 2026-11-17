@@ -99,7 +99,11 @@ __all__ = [
     "TRANSFER_TYPE_WIN_TO_HOST",
     "TRANSFER_CONDITION_DEFAULT", "TRANSFER_CONDITION_TO_EGM",
     "TRANSFER_CONDITION_FROM_EGM",
+    "registration_refusal",
     "TRANSFER_FLAGS_NONE", "AFT_FLAG_LOCK_REQUIRED", "AFT_FLAG_LOCK_AFTER",
+    "HOST_CASHOUT_CONTROLLABLE", "HOST_CASHOUT_ENABLED", "HOST_CASHOUT_HARD",
+    "AFT_FLAG_HOST_CASHOUT_CONTROL", "AFT_FLAG_HOST_CASHOUT_ENABLE",
+    "AFT_FLAG_HOST_CASHOUT_HARD", "ALL_OF_IT_CENTS",
     "AVAIL_XFER_TO_EGM", "AVAIL_XFER_FROM_EGM", "AVAIL_XFER_TO_PRINTER",
     "AVAIL_XFER_WIN_PENDING_TO_HOST", "AVAIL_XFER_BONUS_TO_EGM",
     "AVAIL_XFER_LOCK_AFTER_OK",
@@ -138,9 +142,12 @@ REG_CODE_READ_CURRENT = 0xFF
 # 0x73 registration status (EGM -> host)          VERIFY_ON_BENCH, all
 REG_STATUS_READY = 0x00          # registration initialized / ready
 REG_STATUS_REGISTERED = 0x01
-REG_STATUS_PENDING = 0x40        # possibly awaiting operator acknowledgment
-                                 # at the machine — VERIFY_ON_BENCH whether
-                                 # AJ's games demand a key/touch confirm
+REG_STATUS_PENDING = 0x40        # waiting for an operator to acknowledge at
+                                 # the machine. SAS 6.02 §8.1: a machine only
+                                 # answers this after the HOST asks for the
+                                 # acknowledgement (73 with code 40), which
+                                 # this code never sends. A machine cannot
+                                 # impose it by itself.
 REG_STATUS_NOT_REGISTERED = 0x80
 
 # 0x74 lock codes (host -> EGM)                   VERIFY_ON_BENCH, all
@@ -177,14 +184,12 @@ TRANSFER_TYPE_WIN_TO_HOST = 0x90     # win amount (in-house), machine -> host
 # this field.
 TRANSFER_CONDITION_DEFAULT = 0x00    # interrogate-only (field ignored on FF)
 TRANSFER_CONDITION_TO_EGM = 0x01     # bit 0 "transfer TO gaming machine OK"
-TRANSFER_CONDITION_FROM_EGM = 0x02   # bit 1 "transfer FROM gaming machine OK"
-#                                      the host-cashout (EGM->host) arm condition
-#                                      — symmetric counterpart of bit 0. §8.7
-#                                      "Host Cashout Enable" body is NOT in the
-#                                      on-disk 6.01 excerpt (pp.1-57 of 181), so
-#                                      the exact arm encoding is VERIFY_ON_BENCH;
-#                                      believed to ride LP 0x74 as a lock for this
-#                                      from-EGM condition. Bench-gated hub-side.
+TRANSFER_CONDITION_FROM_EGM = 0x02   # bit 1 "transfer FROM gaming machine OK":
+#                                      the condition to lock for before a
+#                                      host-initiated pull (type 80). It has
+#                                      nothing to do with host cashout, which
+#                                      is not set with 0x74 at all (see the
+#                                      host cashout constants below).
 
 # 0x72 transfer-flag byte — bits (real SAS 6.02 Table 8.3d; adjudicated
 # 2026-07-09). bit 6 = "accept transfer ONLY if the game is locked": with it
@@ -195,6 +200,29 @@ TRANSFER_CONDITION_FROM_EGM = 0x02   # bit 1 "transfer FROM gaming machine OK"
 TRANSFER_FLAGS_NONE = 0x00           # no flags — the lockless host->EGM push
 AFT_FLAG_LOCK_REQUIRED = 0x40        # bit 6 — host requires a prior game lock
 AFT_FLAG_LOCK_AFTER = 0x10           # bit 4 — hold a lock AFTER the transfer
+
+# Host cashout (SAS 6.02 §8.7). "Cashout to host" is the machine treating
+# the host as a cashout device: with it enabled, a press of CASH OUT raises
+# exception 6A (and a win that must be cashed out raises 6B) and the host
+# answers with a 0x72. It is a setting on the machine, reported in one byte
+# of the 0x74 answer and in the flags byte of every 0x72 answer:
+HOST_CASHOUT_CONTROLLABLE = 0x01     # bit 0: the host may change the enable
+HOST_CASHOUT_ENABLED = 0x02          # bit 1: cashout to host enabled NOW
+HOST_CASHOUT_HARD = 0x04             # bit 2: failure tilts (soft: cash out
+#                                      another way). Only valid while enabled.
+# The host asks for a change in the flags of a 0x72 it sends; the change
+# takes effect when that transfer completes, and a transfer for a total of
+# zero may be sent for that purpose alone:
+AFT_FLAG_HOST_CASHOUT_CONTROL = 0x01  # bit 0: set the enable to bit 1
+AFT_FLAG_HOST_CASHOUT_ENABLE = 0x02   # bit 1: the enable (ignored if bit 0=0)
+AFT_FLAG_HOST_CASHOUT_HARD = 0x04     # bit 2: the mode  (ignored if bit 0=0)
+# Until v0.3.14 this module took "available transfers" bit 1 of the 0x74
+# answer (transfer FROM gaming machine OK) for the host cashout enable. That
+# bit only says a host-initiated pull might be accepted right now.
+
+# §8.7: "The amount fields may all be set to 9999999999, with partial
+# transfer allowed, to transfer the entire cashout amount."
+ALL_OF_IT_CENTS = 9999999999
 
 # Believed completion exception (typed via sas_exceptions.BENCH_EXCEPTIONS)
 AFT_TRANSFER_COMPLETE_EXCEPTION = 0x69   # VERIFY_ON_BENCH
@@ -492,6 +520,10 @@ class AFTTransferRequest:
     lock_timeout_hundredths: int = 0      # 0x72 trailing lock timeout (0 =
     #                                       no lock requested); hundredths of
     #                                       a second, 2-byte BCD
+    # A total of zero is refused unless the caller says it means it. §8.7
+    # gives a zero transfer two uses: to set the host cashout enable, and
+    # to answer a 6A/6B with "cash out by whatever other means".
+    zero_ok: bool = False
 
     def __post_init__(self):
         if not (0 < len(self.transaction_id) <= MAX_TRANSACTION_ID_LEN):
@@ -504,7 +536,7 @@ class AFTTransferRequest:
                      "nonrestricted_cents"):
             if getattr(self, name) < 0:
                 raise ValueError(f"{name} must be non-negative")
-        if self.total_cents <= 0:
+        if self.total_cents <= 0 and not self.zero_ok:
             raise ValueError("total transfer amount must be positive")
         if self.transfer_code not in (TRANSFER_CODE_FULL_ONLY,
                                       TRANSFER_CODE_PARTIAL_OK):
@@ -911,9 +943,24 @@ def aft_register(transport, address: int, asset_number: bytes,
     """Register the machine for AFT (0x73): initialize, then register, then
     read back. Returns (ok, final_registration, detail).
 
-    VERIFY_ON_BENCH: whether real games demand an operator acknowledgment
-    at the machine between initialize and register (REG_STATUS_PENDING) —
-    the sequence tolerates a PENDING intermediate by re-reading once.
+    SAS 6.02 §8.1. 73 with code 00 starts the cycle; "the asset number
+    specified by the host must exactly match the current operator-entered
+    non-zero value", and the machine goes to status 00. 73 with code 01
+    then completes it: status 01. "If the gaming machine receives a
+    registration long poll 73 with an asset number that is not valid, or
+    any long poll 73 ... that does not conform to the proper sequence and
+    data, the gaming machine will set its registration status to 80."
+
+    Status 40 (pending an operator's acknowledgement) only ever follows a
+    73 with code 40 from the host, which is never sent here. Until v0.3.14
+    every refusal was reported as "possibly awaiting operator
+    acknowledgment at the machine", which sent owners looking for a prompt
+    that cannot be there; the usual cause, status 80, is the asset number
+    or the sequence. A 40 is still re-read once, in case a machine strays.
+
+    The register poll is sent whatever the initialize answered, as it
+    always was (a machine that strays there may still register); what the
+    initialize answered is kept for the message when it does not.
 
     Every poll here is command 0x73, so each answer has to be ACKed before
     the next goes out (SAS 6.02 §3.1-3.2). The satellite's transport does
@@ -922,9 +969,14 @@ def aft_register(transport, address: int, asset_number: bytes,
     proto = protocol or _PROTO
     resp = transport.transact(build_aft_register_poll(
         address, REG_CODE_INITIALIZE, asset_number, registration_key, pos_id))
-    if _frame_of(resp, address, AFT_CMD_REGISTER, proto) is None:
+    packet = _frame_of(resp, address, AFT_CMD_REGISTER, proto)
+    if packet is None:
         return False, None, _unanswered(
             "registration initialize (73/00)", resp, address)
+    try:
+        initialized = parse_aft_register_response(packet.data).status
+    except ValueError:
+        initialized = None
     sleep(pace)
     resp = transport.transact(build_aft_register_poll(
         address, REG_CODE_REGISTER, asset_number, registration_key, pos_id))
@@ -940,10 +992,27 @@ def aft_register(transport, address: int, asset_number: bytes,
         reg = _read_registration(transport, address, proto) or reg
     if reg.registered:
         return True, reg, "registered"
-    return False, reg, (f"registration refused "
-                        f"(status 0x{reg.status:02X}) — possibly awaiting "
-                        "operator acknowledgment at the machine "
-                        "(VERIFY_ON_BENCH)")
+    return False, reg, registration_refusal(reg.status, initialized)
+
+
+def registration_refusal(status: int, initialized: Optional[int]) -> str:
+    """Why a registration did not end at status 01, in words an owner can
+    act on (SAS 6.02 §8.1). `initialized` is the status the machine gave
+    to the initialize poll (73/00), None when that could not be read."""
+    if status == REG_STATUS_NOT_REGISTERED:
+        why = ("the machine did not accept the asset number, or it "
+               "rejected the order of the polls")
+    elif status == REG_STATUS_PENDING:
+        why = ("the machine says it is waiting for an operator to "
+               "acknowledge at the machine")
+    elif status == REG_STATUS_READY:
+        why = "the machine started the cycle and did not complete it"
+    else:
+        why = "the machine did not register"
+    start = ("" if initialized is None or initialized == REG_STATUS_READY
+             else f"; it had answered the initialize (73/00) with status "
+                  f"0x{initialized:02X} where 0x00 is expected")
+    return f"registration refused (status 0x{status:02X}): {why}{start}"
 
 
 def aft_transfer(transport, address: int, request: AFTTransferRequest,
@@ -1265,6 +1334,11 @@ class AFTHost:
             else OpenTransferJournal(None)
         self.clock = clock
         self.complete_seen = False     # exception 69 came off the FIFO
+        # True while the machine's host cashout enable is on because THIS
+        # host switched it on (set_host_cashout); a disarm then switches it
+        # off again. Not kept across a restart: a machine left enabled by a
+        # satellite that restarted has its 6A declined like any other.
+        self.enabled_by_host = False
         self._ended = []               # verdicts waiting for service_open()
         self._ask_at = 0.0             # clock time of the next 72/FF
         self._asked = 0                # times asked without a final answer
@@ -1356,36 +1430,73 @@ class AFTHost:
                           LOCK_CODE_INTERROGATE)
 
     def set_host_cashout(self, enable: bool) -> Optional[AFTGameLockStatus]:
-        """Probe the machine's host-cashout availability for the arm gate —
-        a READ-ONLY 0x74/FF interrogate on arm, NOTHING on the wire on
-        disarm. Moves no money and writes NO state to the machine.
+        """Arm or disarm the machine's CASH OUT button for cashout to host
+        (SAS 6.02 §8.7). Returns the machine's 0x74 status as it stands
+        afterwards (None on silence, or on a disarm that had nothing to
+        undo); the caller reads `host_cashout_status` from it.
 
-        CONFIRMED model (AJ 2026-07-12): the machine->wallet return is armed
-        PURELY HUB-SIDE — the arm is a hub flag (sas_host.cashout_state), NOT
-        a wire write. The machine is set in its OPERATOR MENU to "soft
-        cash-out to host, fail to ticket"; it then raises exception 0x6A on
-        every CASH-OUT button press, and the host answers an ARMED 0x6A with a
-        0x72 EGM->host transfer (or lets it lapse to a ticket when unarmed).
-        The machine's readiness shows on the wire as
-        `available_transfers & AVAIL_XFER_FROM_EGM (0x02)` in the 0x74 status
-        (real 6.02 Table 8.2b) — so on arm this READS it (LOCK_CODE_INTERROGATE,
-        the identical read-only 0xFF poll read_lock_status uses) and returns
-        the 0x74 status so the caller can gate honestly on the from-EGM bit
-        (None on silence/corruption). On disarm it returns None WITHOUT
-        touching the wire: an unanswered 0x6A already falls to the machine's
-        ticket default, so there is nothing to un-write. One read through the
-        poller's single transport writer — no second writer, no timing change,
-        no game-lock, no auto-expire.
+        Arming, by what the host cashout status byte says:
 
-        The prior build sent an LP 0x74 REQUEST/CANCEL game-LOCK here — the
-        WRONG primitive: LOCK_CODE_REQUEST locked the cabinet (disabling play)
-        and _read_lock's default timeout auto-EXPIRED it in ~5 s, so it was
-        neither a durable arm nor side-effect-free. Dropped 2026-07-12."""
-        if not enable:
-            return None
+          enabled already      nothing to do. The button raises exception
+                               6A and the caller answers it.
+          off, controllable    switch it on: a 0x72 for a total of zero
+                               whose flags carry "set the enable" and
+                               "enable", soft mode. `enabled_by_host`
+                               remembers that we did.
+          off, not ours to set nothing is sent. The caller must tell the
+                               owner the button will not cash out to the
+                               host until it is turned on at the machine.
+
+        Disarming switches it off again only if this host switched it on.
+        A machine whose operator enabled it stays as the operator left it;
+        a 6A it raises while nobody is armed is declined by the caller with
+        a zero-amount transfer, so the player gets a ticket at once.
+
+        What this used to do (until v0.3.14): one read of 0x74, and the
+        caller took "available transfers" bit 1 for the answer. That bit is
+        "a transfer from the machine might be accepted right now", so a
+        machine with host cashout off was reported ready, the page said
+        cash-out goes to the wallet, and the button printed a ticket.
+        Earlier still it sent a game LOCK here, which locked the cabinet
+        and expired in five seconds."""
         p = self.poller
+        if not enable:
+            if not self.enabled_by_host:
+                return None
+            self._request_host_cashout(False)
+            self.enabled_by_host = False
+            return _read_lock(p.transport, p.address, p.protocol,
+                              LOCK_CODE_INTERROGATE)
+        ls = _read_lock(p.transport, p.address, p.protocol,
+                        LOCK_CODE_INTERROGATE)
+        if ls is None:
+            return None
+        status = ls.host_cashout_status
+        if status & HOST_CASHOUT_ENABLED \
+                or not status & HOST_CASHOUT_CONTROLLABLE:
+            return ls
+        if self._request_host_cashout(True):
+            self.enabled_by_host = True
+        self.sleep(self.pace)
         return _read_lock(p.transport, p.address, p.protocol,
-                          LOCK_CODE_INTERROGATE)
+                          LOCK_CODE_INTERROGATE) or ls
+
+    def _request_host_cashout(self, enable: bool) -> bool:
+        """Ask the machine to change its host cashout enable: a transfer
+        for a total of zero with the control flag set (§8.7). True when the
+        machine completed it. The enable only changes on a completed
+        transfer, and "it is permissible for the gaming machine to override
+        the host's requested Host Cashout Enable state", so the caller
+        reads the status again instead of trusting this."""
+        flags = AFT_FLAG_HOST_CASHOUT_CONTROL | (
+            AFT_FLAG_HOST_CASHOUT_ENABLE if enable else 0)
+        request = AFTTransferRequest(
+            transaction_id=make_transaction_id(),
+            transfer_type=TRANSFER_TYPE_HOST_TO_EGM,
+            transfer_flags=flags, zero_ok=True)
+        result = self.transfer(request, require_lock=False,
+                               kind="aft_host_cashout_enable")
+        return result.ok
 
     def transfer(self, request: AFTTransferRequest,
                  require_lock: bool = True,
