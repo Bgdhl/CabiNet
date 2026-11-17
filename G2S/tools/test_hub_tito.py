@@ -358,6 +358,22 @@ def restricted_promo_flag():
     a = hs.tito_authorize("IGT_AVP", "txnP", promo)
     check("a flagged ticket still redeems, for its amount",
           a["authorized"] and a["amountMc"] == 5_000_000, a)
+    check("...and the decision says to credit it as restricted",
+          a.get("restrictedPromo") is True, a)
+    again = hs.tito_authorize("IGT_AVP", "txnP", promo)
+    check("...on a retry of the same redemption too",
+          again["authorized"] and again["retry"]
+          and again.get("restrictedPromo") is True, again)
+    ac = hs.tito_authorize("IGT_AVP", "txnC", cash)
+    check("a cash ticket's decision does not",
+          ac["authorized"] and ac.get("restrictedPromo") is False, ac)
+    hs.tito_close("IGT_AVP", "txnC", cash, False)
+    import g2s_host as _G
+    check("the engine credits it as G2S_nonCash, a cash ticket as "
+          "G2S_cashable",
+          _G.TitoAuthority._adapt(a)["creditType"] == "G2S_nonCash"
+          and _G.TitoAuthority._adapt(ac)["creditType"] == "G2S_cashable",
+          (_G.TitoAuthority._adapt(a), _G.TitoAuthority._adapt(ac)))
     hs.tito_close("IGT_AVP", "txnP", promo, True)
     check("...and keeps its flag once redeemed",
           row(promo)["state"] == "redeemed"

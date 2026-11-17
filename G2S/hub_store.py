@@ -2422,7 +2422,9 @@ class HubStore:
                             "amountMc": int(pend.get("amountMc", 0)),
                             "reason": "retry — same machine re-drew the "
                                       "same authorization",
-                            "retry": True}
+                            "retry": True,
+                            "restrictedPromo": _validation_type_of(
+                                row["extra_json"]) in RESTRICTED_PROMO_TYPES}
                 return self._tito_reject(
                     "redemption already in process at %s"
                     % pend.get("machine"))
@@ -2450,8 +2452,13 @@ class HubStore:
                              "amountMc": amount, "at": now},
                             separators=(",", ":")), row["canonical"]))
             c.commit()
+            # restrictedPromo: the machine printed this as a restricted
+            # promotional ticket, so it goes back in as restricted credit
+            # (has to be played, never cash), on any machine.
             return {"authorized": True, "amountMc": amount,
-                    "reason": note, "retry": False}
+                    "reason": note, "retry": False,
+                    "restrictedPromo": _validation_type_of(
+                        row["extra_json"]) in RESTRICTED_PROMO_TYPES}
 
     def tito_close(self, machine, txn, validation, redeemed):
         """Close a redemption: redeemed=True CONSUMES the ticket,

@@ -3065,8 +3065,12 @@ class TitoAuthority:
     def _adapt(dec):
         """hub {authorized, amountMc, reason, retry} -> voucher dialect."""
         if dec.get("authorized"):
+            # A restricted promotional ticket is credited as non-cashable
+            # credit: G2S_nonCash to a G2S machine, and the SAS edge turns
+            # that into the restricted transfer code (2026-11-16).
             return {"exc": 0, "amt": str(int(dec.get("amountMc", 0))),
-                    "creditType": "G2S_cashable",
+                    "creditType": "G2S_nonCash"
+                    if dec.get("restrictedPromo") else "G2S_cashable",
                     "retry": bool(dec.get("retry")),
                     "reason": dec.get("reason", "authorized")}
         reason = dec.get("reason", "rejected")
@@ -24328,20 +24332,27 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                     return ok(authorized=False, amountCents=0,
                               reason="amount not a whole cent — cannot "
                                      "represent on SAS", retry=False)
-                if dec["creditType"] != "G2S_cashable":
+                # Cashable, or restricted promotional (the hub's nonCash),
+                # which SAS redeems with transfer code 01. Anything else
+                # (promo) has no SAS ticket form.
+                restricted = dec["creditType"] == "G2S_nonCash"
+                if dec["creditType"] != "G2S_cashable" and not restricted:
                     engine.tito.close(machine, txn, validation,
                                       "G2S_rejected")
                     return ok(authorized=False, amountCents=0,
                               reason=f"creditType {dec['creditType']} not "
-                                     "redeemable on SAS (cashable only)",
+                                     "redeemable on SAS",
                               retry=False)
                 log.info("=" * 64)
-                log.info("🎟️ TICKET IN at %s — %s AUTHORIZED $%.2f%s",
+                log.info("🎟️ TICKET IN at %s — %s AUTHORIZED $%.2f%s%s",
                          machine, validation, amt_mc / 100000,
+                         " as restricted promotional credit"
+                         if restricted else "",
                          " (retry)" if dec["retry"] else "")
                 log.info("=" * 64)
                 return ok(authorized=True, amountCents=amt_mc // 1000,
-                          reason=dec["reason"], retry=dec["retry"])
+                          reason=dec["reason"], retry=dec["retry"],
+                          restricted=restricted)
             log.info("🎟️ TICKET REJECTED at %s — %s: %s", machine,
                      validation, dec["reason"])
             return ok(authorized=False, amountCents=0,

@@ -192,10 +192,22 @@ def test_authorize_sends_canonical_from_raw(hub, local, tmp_path):
     dec = c.authorize_redemption(1, "3829105628374651", 0,
                                  validation_raw=raw)
     assert dec == {"authorized": True, "amount_cents": 25,
-                   "reason": "authorized", "retry": False}
+                   "reason": "authorized", "retry": False,
+                   "restricted": False}
     sent = hub.last("authorize")
     assert sent["canonical"] == "473829105628374651"
     assert sent["vn16"] == "3829105628374651"
+
+
+def test_authorize_passes_on_that_the_ticket_is_restricted(hub, local,
+                                                           tmp_path):
+    """The hub says when a ticket is a restricted promotional one; the
+    redemption then uses transfer code 01 (2026-11-16)."""
+    hub.replies["authorize"] = dict(hub.replies["authorize"],
+                                    restricted=True)
+    c = make_client(hub.url, local, tmp_path)
+    dec = c.authorize_redemption(1, "0100000000000042", 25)
+    assert dec["authorized"] is True and dec["restricted"] is True
 
 
 def test_authorize_without_raw_sends_vn_only(hub, local, tmp_path):
