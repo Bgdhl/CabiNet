@@ -42,10 +42,13 @@ core/sas_protocol.SASCommand:
     them from the FULL spec §8.11/§8.12 (NOT in our on-disk excerpt) when the
     receipt feature is built.
 
-The believed transfer choreography (mirrors the settled two-step handpay
-rule: nothing irreversible goes out until the machine consents):
+The transfer choreography (mirrors the settled two-step handpay rule:
+nothing irreversible goes out until the machine consents):
 
-    interrogate registration (73/FF)  -> must be REGISTERED
+    with a registration key in use: interrogate registration (73/FF)
+                                      -> must be REGISTERED. With a key of
+                                         all zeros this step is skipped
+                                         (SAS 6.02 §8.1, see ZERO_KEY)
  -> request game lock (74/00)         -> must reach LOCKED (re-interrogate
                                          74/FF while PENDING)
  -> issue the transfer (72/00)        -> immediate FULL/PARTIAL, or PENDING
@@ -111,7 +114,7 @@ __all__ = [
     "AFT_ST_CUSTOM_TICKET", "AFT_ST_REGISTERED", "AFT_ST_IN_HOUSE_ENABLED",
     "AFT_ST_BONUS_ENABLED", "AFT_ST_DEBIT_ENABLED", "AFT_ST_ANY_AFT_ENABLED",
     "describe_available_transfers", "describe_aft_status",
-    "AFT_TRANSFER_COMPLETE_EXCEPTION",
+    "AFT_TRANSFER_COMPLETE_EXCEPTION", "ZERO_KEY", "REGISTER_RETRY_SEC",
     "AFTStatus", "AFTRegistration", "AFTGameLockStatus",
     "AFTTransferRequest", "AFTTransferStatusData",
     "cents_to_bcd5", "bcd5_to_cents", "asset_number_bytes",
@@ -224,12 +227,30 @@ AFT_FLAG_HOST_CASHOUT_HARD = 0x04     # bit 2: the mode  (ignored if bit 0=0)
 # transfer allowed, to transfer the entire cashout amount."
 ALL_OF_IT_CENTS = 9999999999
 
-# Believed completion exception (typed via sas_exceptions.BENCH_EXCEPTIONS)
-AFT_TRANSFER_COMPLETE_EXCEPTION = 0x69   # VERIFY_ON_BENCH
+# The completion exception (SAS 6.02 Table A-1 and §8.3; seen on a WMS
+# Bluebird 2). Named in sas_exceptions.BENCH_EXCEPTIONS.
+AFT_TRANSFER_COMPLETE_EXCEPTION = 0x69
 
 _PROTO = SASProtocol()               # stateless; safe to share
 
 REGISTRATION_KEY_LEN = 20            # VERIFY_ON_BENCH
+
+# SAS 6.02 §8.1: "Registration should not be used for in-house and bonus
+# transactions. These transactions should use a registration key of all
+# zeros." Table 8.3a reads that key as "registration not required", and
+# registration itself is "required for debit transfers" (status 88).
+#
+# What this code does with it (audit item 17): a machine that registers is
+# sent its key, as it always was, because every machine this has run on
+# works that way and none has been tried the other way. A machine that
+# cannot be registered used to get no transfer at all; it now gets the
+# transfer with this key.
+ZERO_KEY = bytes(REGISTRATION_KEY_LEN)
+
+# After a registration that did not complete, how long the transfer path
+# leaves it alone before trying again. The hub keeps asking on its own
+# schedule (the aft_register command) whatever this says.
+REGISTER_RETRY_SEC = 300.0
 ASSET_NUMBER_LEN = 4                 # VERIFY_ON_BENCH
 POS_ID_LEN = 4                       # VERIFY_ON_BENCH
 MAX_TRANSACTION_ID_LEN = 20          # VERIFY_ON_BENCH
@@ -1049,7 +1070,10 @@ def aft_transfer(transport, address: int, request: AFTTransferRequest,
                  ) -> AFTTransferResult:
     """Run one complete AFT transfer against one machine:
 
-      1. interrogate registration (73/FF) — REQUIRE registered;
+      1. with a registration key in use, interrogate registration (73/FF)
+         and REQUIRE registered: the machine must still hold that key. With
+         a key of all zeros (ZERO_KEY) there is nothing to check and no 73
+         is sent;
       2. request game lock (74/00), re-interrogating while PENDING —
          REQUIRE locked (a failed lock is cancelled, 74/80, on the way out).
          SKIPPED when require_lock=False (the LOCKLESS host->EGM push: real
@@ -1070,8 +1094,9 @@ def aft_transfer(transport, address: int, request: AFTTransferRequest,
          meters before retrying — the transfer may have landed).
 
     NOTHING IRREVERSIBLE MOVES WITHOUT CONSENT: the 72 initiate is never
-    sent unless registration was read back REGISTERED and the lock was
-    confirmed LOCKED; silence/corruption at any step yields a typed result.
+    sent unless registration was read back REGISTERED (when a key is in
+    use) and the lock was confirmed LOCKED; silence/corruption at any step
+    yields a typed result.
     The pure state machine (advance()) runs alongside as the ledger — an
     illegal transition raises AFTStateError (host bug) rather than lying.
 
@@ -1088,18 +1113,20 @@ def aft_transfer(transport, address: int, request: AFTTransferRequest,
             "lockless transfer requested but transfer_flags sets the "
             "lock-required bit (0x40); clear it or pass require_lock=True")
 
-    # -- 1: registration gate -------------------------------------------------
-    reg = _read_registration(transport, address, proto)
-    if reg is None:
-        return AFTTransferResult(
-            AFTOutcome.TIMEOUT, state, request, None, None, None, False,
-            "silence on registration interrogate (73/FF); nothing sent")
-    if not reg.registered:
-        state = advance(state, AFTTxnEvent.STATUS_ERROR)
-        return AFTTransferResult(
-            AFTOutcome.NOT_REGISTERED, state, request, reg, None, None,
-            False, f"machine not AFT-registered "
-                   f"(status 0x{reg.status:02X}); run aft_register first")
+    # -- 1: registration gate, when a key is in use ---------------------------
+    reg: Optional[AFTRegistration] = None
+    if any(registration_key):
+        reg = _read_registration(transport, address, proto)
+        if reg is None:
+            return AFTTransferResult(
+                AFTOutcome.TIMEOUT, state, request, None, None, None, False,
+                "silence on registration interrogate (73/FF); nothing sent")
+        if not reg.registered:
+            state = advance(state, AFTTxnEvent.STATUS_ERROR)
+            return AFTTransferResult(
+                AFTOutcome.NOT_REGISTERED, state, request, reg, None, None,
+                False, f"machine not AFT-registered "
+                       f"(status 0x{reg.status:02X}); run aft_register first")
 
     # -- 2: game lock (skipped for a LOCKLESS host->EGM push) ------------------
     lock: Optional[AFTGameLockStatus] = None
@@ -1323,7 +1350,10 @@ class AFTHost:
     layer (player_accounts), never automatic here.
 
     per-machine identity: asset_number (4 wire bytes) + registration_key
-    (20 bytes) + pos_id (4 wire bytes), fixed at construction."""
+    (20 bytes) + pos_id (4 wire bytes). `rig_key` is the key this host
+    registers a machine with, fixed at construction. `registration_key` is
+    the key its transfers carry: the machine's own once it is registered,
+    all zeros for a machine that could not be (prepare_transfer)."""
 
     def __init__(self, poller, asset_number: Optional[bytes] = None,
                  registration_key: bytes = b"",
@@ -1347,8 +1377,11 @@ class AFTHost:
             raise ValueError("registration key is exactly 20 bytes")
         self.poller = poller
         self.asset_number = asset_number
+        self.rig_key = registration_key
         self.registration_key = registration_key
         self.pos_id = pos_id
+        self._register_again_at = 0.0  # prepare_transfer's next registration
+        self._unregistered_why = ""    # ... and why the last one failed
         self.on_transfer = on_transfer
         self.on_cashout_request = on_cashout_request
         self.pace = pace
@@ -1369,7 +1402,7 @@ class AFTHost:
     def register(self) -> Tuple[bool, Optional[AFTRegistration], str]:
         p = self.poller
         return aft_register(p.transport, p.address, self.asset_number,
-                            self.registration_key, self.pos_id, p.protocol,
+                            self.rig_key, self.pos_id, p.protocol,
                             pace=self.pace, sleep=self.sleep)
 
     def registration_status(self) -> Optional[AFTRegistration]:
@@ -1416,11 +1449,61 @@ class AFTHost:
         if asset is None:
             return False, reg, "machine reports no asset number"
         ok, final, detail = aft_register(
-            p.transport, p.address, asset, self.registration_key, self.pos_id,
+            p.transport, p.address, asset, self.rig_key, self.pos_id,
             p.protocol, pace=self.pace, sleep=self.sleep)
         if ok and final is not None:
             self._adopt(final)
         return ok, final, detail
+
+    def prepare_transfer(self) -> Tuple[bool, Optional[AFTRegistration], str]:
+        """What a transfer needs before it is sent: the machine's asset
+        number and a registration key. Returns (ok, registration, detail).
+        Call it before every transfer(); a False means nothing can be sent.
+
+        A machine that is registered, or registers now: exactly what
+        auto_register does, poll for poll, and the transfer carries the
+        machine's key.
+
+        A machine that cannot be registered (audit item 17): the transfer
+        goes with a key of all zeros. SAS 6.02 §8.1 asks for that key on
+        every in-house transfer ("registration not required", Table 8.3a);
+        registration is "required for debit transfers", which this host
+        never sends. Until v0.3.17 such a machine got no transfer at all.
+        One that insists on registration answers the transfer with status
+        88 or 89 and no money moves.
+
+        The asset number is still needed: the machine checks it on every
+        0x72 (status 93). No asset from any poll is still a False.
+
+        A registration that did not complete is tried again from here no
+        sooner than REGISTER_RETRY_SEC later, so a machine that never
+        registers does not spend three polls on it before every transfer."""
+        p = self.poller
+        reg = _read_registration(p.transport, p.address, p.protocol)
+        if reg is not None and reg.registered:
+            self._adopt(reg)
+            self._register_again_at = 0.0
+            return True, reg, "already registered"
+        self.sleep(self.pace)
+        asset = self.read_asset(reg=reg)
+        if asset is None:
+            return False, reg, "machine reports no asset number"
+        if self.clock() >= self._register_again_at:
+            ok, final, detail = aft_register(
+                p.transport, p.address, asset, self.rig_key, self.pos_id,
+                p.protocol, pace=self.pace, sleep=self.sleep)
+            if ok and final is not None:
+                self._adopt(final)
+                self._register_again_at = 0.0
+                return ok, final, detail
+            reg = final if final is not None else reg
+            self._unregistered_why = detail
+            self._register_again_at = self.clock() + REGISTER_RETRY_SEC
+        self.asset_number = asset
+        self.registration_key = ZERO_KEY
+        return True, reg, (
+            f"not registered ({self._unregistered_why}); sending with a "
+            "registration key of all zeros")
 
     def _adopt(self, reg: Optional[AFTRegistration]) -> None:
         """Adopt the authoritative key + asset (+ POS) from a register/

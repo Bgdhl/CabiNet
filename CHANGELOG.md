@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.3.17
+The last four items of the SAS audit. With these it is complete.
+- **The machine is polled while the hub decides on a ticket.** When a
+  ticket goes in, or a cash-out asks for a ticket number, the satellite
+  asks the hub and waits. It sent the machine nothing while it waited. A
+  machine that is not being polled takes the link for down and hands the
+  ticket back, or refuses the cash-out. The satellite now keeps polling
+  through the wait. With a hub that answers at once, as it does on the
+  same network, nothing changes on the wire.
+- **A machine that cannot be registered can still take a transfer.** The
+  satellite registers each machine for transfers and sends the machine's
+  registration key with every one; that is unchanged. A machine where the
+  registration would not complete used to get no transfer at all. It now
+  gets the transfer with a key of all zeros, which is what the SAS
+  document asks for on a transfer of this kind. A machine with no asset
+  number set is still refused, with the same message.
+- **Every machine event has a name.** 51 event codes showed in the log and
+  on the hub as a bare number, such as "exception 0x7E" for every game
+  start. All of them are named now, with the bill value on each bill
+  event ($2, $50, $100, $200, $500 were missing).
+- Event names no longer carry a "(VERIFY_ON_BENCH)" tag. The tag was
+  showing in the hub's event list, and it cut two names short.
+- A machine set to an address that is also an event code (81 is "handpay
+  pending") has that event read as an event. This was fixed in v0.3.13
+  and is now covered by a test.
+
 ## v0.3.16
 Seventh and last batch from the SAS audit: meters, denominations and the
 remainder. Twelve smaller items.

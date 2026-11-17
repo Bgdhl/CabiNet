@@ -444,7 +444,7 @@ def parse_extended_game_info(data: bytes) -> ExtendedGameInfo:
 class MachineInfo:
     """Aggregated identity for one SAS machine — what the fleet registry
     keys on. None fields = the machine didn't answer that poll (unsupported
-    commands legitimately get silence, guide §2.7.4)."""
+    commands legitimately get silence, SAS 6.02 §4.4)."""
     address: int
     machine: Optional[GameConfig] = None           # 0x1F
     sas_version: Optional[str] = None              # 0x54
@@ -478,7 +478,7 @@ def read_machine_info(transport, address: int,
     PACING: SAS forbids polling one machine faster than once per 200 ms
     (sas_meters.SAS_POLL_FLOOR), so `sleep(pace)` runs between consecutive
     polls. Because this sweep reads silence as "command unsupported"
-    (§2.7.4), over-rate polling would silently misrecord supported polls as
+    (SAS 6.02 §4.4), over-rate polling would silently misrecord supported polls as
     None fields. Inject a no-op `sleep` in mock tests.
     TODO(bench): lower `pace` only to a bench-measured safe floor."""
     proto = protocol or _PROTO

@@ -500,13 +500,30 @@ class ByTheBookAFTMachine(ByTheBookMachine):
     6A is ever raised.
     A successful transfer whose flags have bit 0 set changes the enable to
     bit 1 and the mode to bit 2, if the machine lets the host control it.
-    A transfer with a total of zero is accepted for that purpose alone."""
+    A transfer with a total of zero is accepted for that purpose alone.
+
+    Registration, §8.1 (audit item 17). `registered` is how the machine
+    starts; `registers` is whether a registration cycle (73/00 then 73/01
+    with the operator's asset number) can complete on it. Every initiating
+    72 is checked: the asset number must be the machine's own (status 93),
+    and a registration key that is not all zeros must be the one the
+    machine holds (88 when it is not registered, 89 when the key differs).
+    A key of all zeros is "registration not required" (Table 8.3a) and an
+    in-house transfer with it is taken, registered or not. A machine made
+    with needs_registration=True does not follow the document there: it
+    answers a zero key 88 until it is registered and 89 after."""
 
     def __init__(self, credits=0, honours_cancel=False, complete_after=None,
                  hears_initiate=True, restricted=0, complete_in=None,
                  cashout_controllable=False, cashout_enabled=False,
-                 cashout_hard=False, **kw):
+                 cashout_hard=False, registered=True, registers=True,
+                 needs_registration=False, **kw):
         super().__init__(**kw)
+        self.registered = registered
+        self.registers = registers
+        self.needs_registration = needs_registration
+        self._reg_started = False    # a 73/00 has been taken
+        self.keys_seen = []          # the key of every initiating 72
         self.cashout_controllable = cashout_controllable
         self.cashout_enabled = cashout_enabled
         self.cashout_hard = cashout_hard
@@ -655,8 +672,7 @@ class ByTheBookAFTMachine(ByTheBookMachine):
         if len(raw) < 4 or sas_crc(raw[:-2]).to_bytes(2, "little") != raw[-2:]:
             return b""
         if command == 0x73:
-            return self._framed(0x73, bytes([0x01]) + self.asset + self.key
-                                + self.pos)
+            return self._register(raw[3:-2])
         if command == 0x74:
             return self._lock(raw[2])
         return self._transfer(raw[3:-2])
@@ -697,6 +713,46 @@ class ByTheBookAFTMachine(ByTheBookMachine):
             self._on_ack = self._close_cycle
         return self._status(t)
 
+    def _register(self, d):
+        """Long poll 73. d = code, then (for 00 and 01) asset number,
+        registration key and POS ID."""
+        code = d[0]
+        if code == 0x80:                            # unregister / cancel
+            self.registered = self._reg_started = False
+        elif code in (0x00, 0x01):
+            asset_ok = (self.registers and len(d) >= 29 and any(self.asset)
+                        and d[1:5] == self.asset)
+            if code == 0x00:
+                self.registered = False
+                self._reg_started = asset_ok
+                if asset_ok:
+                    return self._framed(0x73, bytes([0x00]) + self.asset
+                                        + d[5:25] + d[25:29])
+            elif asset_ok and self._reg_started and any(d[5:25]):
+                self.registered, self._reg_started = True, False
+                self.key, self.pos = d[5:25], d[25:29]
+            else:
+                # "does not conform to the proper sequence and data": 80
+                self.registered = self._reg_started = False
+        status = 0x01 if self.registered else 0x80
+        return self._framed(0x73, bytes([status]) + self.asset + self.key
+                            + self.pos)
+
+    def _key_refusal(self, d):
+        """The status that refuses an initiating 72 for its asset number
+        or its registration key, or None when both are in order."""
+        asset, key = d[19:23], d[23:43]
+        self.keys_seen.append(bytes(key))
+        if not any(self.asset) or asset != self.asset:
+            return 0x93
+        if any(key):
+            if not self.registered:
+                return 0x88
+            return None if key == self.key else 0x89
+        if self.needs_registration:
+            return 0x89 if self.registered else 0x88
+        return None
+
     def _transfer(self, d):
         code = d[0]
         current = self.cycle or self.last
@@ -728,6 +784,9 @@ class ByTheBookAFTMachine(ByTheBookMachine):
                       "type": d[2], "cents": cash, "restricted": restr,
                       "status": 0x40, "flags": d[18]}
         self.started.append(self.cycle["txn"])
+        refusal = self._key_refusal(d)
+        if refusal is not None:
+            return self._final(refusal)
         pending = self.cashout_pending
         if pending is not None:
             wanted = 0x80 if pending["kind"] == "credits" else 0x90

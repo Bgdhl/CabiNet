@@ -591,10 +591,11 @@ def answer_cashout_request(aft_host, code, armed, account_id, on_wire=None):
     rec = {"id": f"cashout-{int(time.time() * 1000)}", "type": "aft_cashout",
            "when": time.strftime("%Y-%m-%dT%H:%M:%S"),
            "accountId": account_id if armed else None}
-    # Register + adopt the machine's asset/key (idempotent) so the 0x72 can
-    # be built against the real identity. Without it nothing can be sent,
-    # not even a decline, and the machine falls back by itself.
-    ok_reg, _reg, reg_detail = aft_host.auto_register()
+    # The machine's asset number and a registration key (its own if it is
+    # registered, all zeros if it cannot be), so the 0x72 can be built.
+    # With no asset number nothing can be sent, not even a decline, and
+    # the machine falls back by itself.
+    ok_reg, _reg, reg_detail = aft_host.prepare_transfer()
     if not ok_reg:
         logger.warning("🏦 host-cashout request 0x{:02X} cannot be answered"
                        " — {}", code, reg_detail)
@@ -1949,6 +1950,12 @@ def main():
         on_system_validation=on_system_validation,
         on_validation_seeded=on_validation_seeded,
         machine_id=validation_machine_id(args.smib_id, args.address))
+    if hasattr(store, "while_waiting"):
+        # The hub is the ticket authority: while a ticket call to it is
+        # out, keep polling the machine (SAS 6.02 §4.3;
+        # HubTicketAuthority._ask). The plain local store answers at once
+        # and has no such hook.
+        store.while_waiting = tito_host.keep_polling
 
     # AFT host-cashout (EGM_TO_HOST) arm state — the machine->wallet RETURN
     # leg (the peer of the host->EGM fund push). Every field is touched ONLY
@@ -2212,10 +2219,13 @@ def main():
                                    "(bad cents {})", cmd_id, cents)
                     return result
                 result["cents"] = cents
-                # Ensure AFT is registered first (idempotent: a REGISTERED
-                # machine short-circuits on one 73/FF and ADOPTS its asset, so
-                # the transfer uses the machine's real asset+key, never None).
-                ok_reg, reg, reg_detail = aft_host.auto_register()
+                # The machine's asset and a registration key first. A
+                # REGISTERED machine short-circuits on one 73/FF and its
+                # asset+key are ADOPTED; one that is not is registered now;
+                # one that cannot be is sent the transfer with a key of all
+                # zeros (SAS 6.02 §8.1; AFTHost.prepare_transfer). Only a
+                # machine with no asset number is refused here.
+                ok_reg, reg, reg_detail = aft_host.prepare_transfer()
                 if not ok_reg:
                     result["ok"] = False
                     result["outcome"] = ("asset_unknown"
@@ -2342,7 +2352,7 @@ def main():
                 acct = cmd.get("accountId")
                 if isinstance(acct, str) and acct:
                     result["accountId"] = acct[:64]
-                ok_reg, reg, reg_detail = aft_host.auto_register()
+                ok_reg, reg, reg_detail = aft_host.prepare_transfer()
                 if not ok_reg:
                     result["ok"] = False
                     result["outcome"] = ("asset_unknown" if "no asset"
@@ -2446,8 +2456,8 @@ def main():
                 ls = None
                 try:
                     # the 0x72 that switches host cashout on or off needs
-                    # the machine's asset and our key (idempotent)
-                    aft_host.auto_register()
+                    # the machine's asset and a key (idempotent)
+                    aft_host.prepare_transfer()
                     ls = aft_host.set_host_cashout(enable)
                 except Exception as ce:            # noqa: BLE001 — best-effort
                     logger.warning("🏦 hub command {}: host-cashout arm wire "

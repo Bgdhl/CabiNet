@@ -149,13 +149,13 @@ PAYLOAD_STYLE_TYPE_AMOUNT = "type_amount"
 DEFAULT_PAYLOAD_STYLE = PAYLOAD_STYLE_BCD
 
 # --------------------------------------------------------------------------
-# VERIFY_ON_BENCH — believed full-SAS-spec values, uncited on disk.
-# (These two exception codes live in sas_exceptions.BENCH_EXCEPTIONS so the
+# The ticket-in exceptions (SAS 6.02 Table A-1, §15.11-15.12; both seen on a
+# WMS Bluebird 2). They are named in sas_exceptions.BENCH_EXCEPTIONS so the
 # poller's typed-event path names them; the command/status bytes live only
-# here, like the handpay module's 0xA8/0x94.)
+# here, like the handpay module's 0xA8/0x94.
 # --------------------------------------------------------------------------
-TICKET_INSERTED_EXCEPTION = 0x67          # VERIFY_ON_BENCH
-TICKET_TRANSFER_COMPLETE_EXCEPTION = 0x68  # VERIFY_ON_BENCH
+TICKET_INSERTED_EXCEPTION = 0x67          # Table A-1: ticket has been inserted
+TICKET_TRANSFER_COMPLETE_EXCEPTION = 0x68  # Table A-1: ticket transfer complete
 
 CMD_SEND_TICKET_VALIDATION_DATA = 0x70    # VERIFY_ON_BENCH: believed type R
 CMD_REDEEM_TICKET = 0x71                  # VERIFY_ON_BENCH
@@ -1332,6 +1332,10 @@ def _await_transfer_complete(transport, address, proto, pace, sleep,
 # Poller integration
 # --------------------------------------------------------------------------
 
+def _no_wait(_seconds: float) -> None:
+    """keep_polling's pause: none. The caller has already waited."""
+
+
 class SASTITOHost:
     """Wires the TITO flows into a SASPoller without modifying it: chains
     the poller's on_typed_event so that
@@ -1440,6 +1444,33 @@ class SASTITOHost:
             self._ask_at = self.clock() + REDEMPTION_RETRY_SEC[0]
         p._safe(self.on_redemption, p.address, result)
         return result
+
+    def keep_polling(self) -> None:
+        """Send the machine one general poll. For the ticket store to call
+        while the poll thread is waiting on an answer from the hub
+        (HubTicketAuthority.while_waiting): between long polls 57 and 58,
+        between 70 and 71, and after a ticket record or a redemption's end
+        has been read.
+
+        Whatever the machine reports is acknowledged and handed to the
+        poller's listeners, so it reaches the log and the hub. It is not
+        acted on here: nothing may start a second ticket cycle inside the
+        one that is waiting (the same rule as for an exception drained in
+        a confirm window, see the class docstring). A machine re-issues
+        the exceptions that matter (57, 67, 68, 3D, 51) until they are
+        dealt with, so one seen here comes round again.
+
+        The transport holds this poll to the machine's polling rate like
+        any other, so it cannot go out too soon after the last one."""
+        p = self.poller
+        was_busy = self._busy
+        self._busy = True
+        try:
+            await_exception(p.transport, p.address, p.protocol, (), 0.0,
+                            _no_wait, 1, on_exception=p._dispatch_event,
+                            on_frame=p._handle_long_poll_result)
+        finally:
+            self._busy = was_busy
 
     def resolve_open_redemption(self) -> Optional[TicketRedemptionResult]:
         """Ask the machine (71/FF) how the last redemption ended and close

@@ -13,7 +13,7 @@ follows the document. Fill in the blanks when you bench it.
 
 | | What starts it | What the machine needs |
 |---|---|---|
-| **The hub pulls them** | CASH OUT TO WALLET on the player screen, or a tournament sweep | AFT registered, in-house transfers on. Nothing else. |
+| **The hub pulls them** | CASH OUT TO WALLET on the player screen, or a tournament sweep | An asset number set on the machine and in-house transfers on. Nothing else. |
 | **The machine's own CASH OUT button** | The player presses the button on the cabinet | The above, plus the machine's **cashout to host** option |
 
 The pull is proven on a WMS Bluebird 2 and needs nothing from this sheet.
