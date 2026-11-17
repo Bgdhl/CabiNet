@@ -125,7 +125,7 @@ if "tournament_names" not in _hub_store_mod.HOST_SETTING_KEYS:
 # the MINOR bump per the repo's version rule). Surfaced in engine_meta() ->
 # /api/status ["_engine"]["version"]; bump this and add a CHANGELOG.md
 # section on every commit with a user-visible change.
-CABINET_VERSION = "0.3.20"
+CABINET_VERSION = "0.3.21"
 
 WSDL_NS = "http://www.gamingstandards.com/wsdl/g2s/v1.0"
 SCHEMA_NS = "http://www.gamingstandards.com/g2s/schemas/v1.0.3"
@@ -659,6 +659,11 @@ STATUS_CACHE_TTL_SEC = 1.0
 # static per theme+paytable — known devices stay status-only (the response
 # merges IN PLACE, gp.update, GR-28, so it never wipes them); the GR-30 rescan
 # re-harvests the inventory first and reads the full trio for NEW devices.
+# A device id is not tied to one theme+paytable for life, though (§6.13: the
+# profile's options "can be set locally at the EGM or remotely"): when a
+# status names another theme or paytable than the profile held, or the
+# machine reports G2S_GPE005/GPE006, the profile and denominations are read
+# again (_game_profile_outdated, _reread_game_profile).
 
 # gamePlay inventory persistence debounce (GR-28). The sweep lands ~357
 # status/profile/denoms parses in bursts; persisting (tmp+fsync+rename+dir
@@ -765,10 +770,30 @@ def g2s_true(value):
     return str(value or "").strip().lower() in ("true", "1")
 
 
+def g2s_bool(value, default="false"):
+    """A G2S boolean attribute as the text "true" or "false", whichever
+    way the machine wrote it. The type is XML Schema's boolean (Appendix
+    C), which may be written true/false or 1/0, and the document's own
+    examples write sessionRetry="0". Everything the hub and its pages
+    compare is one of the two words, so the value is put into that form
+    where it is read. Absent, or anything else, gives `default`."""
+    v = str("" if value is None else value).strip().lower()
+    if v in ("true", "1"):
+        return "true"
+    if v in ("false", "0"):
+        return "false"
+    return default
+
+
 def same_stamp(a, b):
     """Do two date-time attributes name the same moment, as far as can be
     told? An absent one cannot say no."""
     return not a or not b or a == b
+
+
+#: The meter groups of a meterInfo that are a breakdown of a device's
+#: meters, not the device's own (§5.19.2-5.19.4).
+METER_BREAKDOWN_GROUPS = ("wagerMeters", "gameDenomMeters", "currencyMeters")
 
 
 def attr(el, name):
@@ -1012,10 +1037,90 @@ CURRENCY_SYMBOLS = {"USD": "$", "EUR": "€", "GBP": "£", "CAD": "$", "AUD": "$
                     "NOK": "kr ", "DKK": "kr ", "PLN": "zł "}
 _MONEY = {"symbol": "$", "source": "default"}   # source: setting|machine|default
 
+# Every amount on the wire is in thousandths of the MINOR unit of the
+# machine's base currency, and how many decimal places lie between the
+# minor and the major unit is the currency's own (§3.2, ISO 4217); the
+# table of 100000 = $1.00 there is "an example for US Dollars". Every money
+# string in the hub divides by 100000, which is right for a currency with
+# two decimal places and for no other. These are the ones that have another
+# number; a code not listed has two.
+CURRENCY_DECIMALS = dict(
+    [(c, 0) for c in ("JPY", "KRW", "VND", "CLP", "ISK", "PYG", "UGX",
+                      "XAF", "XOF", "XPF", "BIF", "DJF", "GNF", "KMF",
+                      "RWF", "VUV")]
+    + [(c, 3) for c in ("BHD", "KWD", "OMR", "JOD", "TND", "IQD", "LYD")])
+
+
+def currency_scale_note(code):
+    """What to say about a machine whose base currency does not have two
+    decimal places, or None. The hub does not rescale: it says the figures
+    for that machine are off, and by how much, and does not put that
+    currency's sign in front of them."""
+    code = str(code or "").strip().upper()
+    places = CURRENCY_DECIMALS.get(code, 2)
+    if places == 2:
+        return None
+    if places < 2:
+        return (f"{code} amounts show {10 ** (2 - places)} times too small "
+                f"(the currency has {places} decimal places)")
+    return (f"{code} amounts show {10 ** (places - 2)} times too large "
+            f"(the currency has {places} decimal places)")
+
 
 def money_symbol():
     """The symbol every money string on every surface leads with."""
     return _MONEY["symbol"]
+
+
+#: The most denominations one gameRange is listed out into. A range is a
+#: shorthand for a series (§6.3); one that would run to more than this is
+#: not a list anybody picks from, and is reported instead.
+GAME_RANGE_MAX = 200
+
+
+def expand_game_denoms(singles, ranges):
+    """A gameDenomList's denominations as one list: its gameDenom entries,
+    and each gameRange listed out from denomMin to denomMax in steps of
+    denomInterval (default 1000, Table 6.17), every entry carrying the
+    range's own active flag. A denomination named singly keeps what its own
+    entry says. Returns (list in ascending order, why a range could not be
+    listed or None)."""
+    by_id, order, partial = {}, [], None
+    for r in ranges:
+        try:
+            lo, hi = int(r["denomMin"]), int(r["denomMax"])
+            step = int(r.get("denomInterval") or 1000)
+        except (TypeError, ValueError, KeyError):
+            partial = f"range {r.get('denomMin')}..{r.get('denomMax')} " \
+                      "is not numeric"
+            continue
+        if step <= 0 or lo <= 0 or hi < lo:
+            partial = f"range {lo}..{hi} step {step} is not a series"
+            continue
+        if (hi - lo) // step + 1 > GAME_RANGE_MAX:
+            partial = (f"range {lo}..{hi} step {step} is more than "
+                       f"{GAME_RANGE_MAX} denominations")
+            continue
+        for d in range(lo, hi + 1, step):
+            key = str(d)
+            if key not in by_id:
+                order.append(key)
+            by_id[key] = {"denomId": key, "active": r["active"],
+                          "fromRange": True}
+    for s in singles:
+        key = s.get("denomId")
+        if key not in by_id:
+            order.append(key)
+        by_id[key] = dict(s)
+
+    def rank(k):
+        try:
+            return (0, int(k))
+        except (TypeError, ValueError):
+            return (1, 0)
+    if ranges:
+        order.sort(key=rank)        # singles alone keep the machine's order
+    return [by_id[k] for k in order], partial
 
 
 def denom_dollars(millicents):
@@ -1245,14 +1350,21 @@ def option_values_equal(a, b):
     case-fold while the verify compared strict — an EGM emitting 'True'
     would read as already-enabled yet stamp verifyFailed). Whitespace is
     stripped on both sides; boolean literals compare case-folded (an
-    xs:boolean read-back may legally spell True/TRUE); everything else stays
-    strict, so a stringValue case change still fails verification honestly."""
+    xs:boolean read-back may legally spell True/TRUE) and by meaning (the
+    same type may be written 1/0: a machine that wrote its booleans so had
+    every target of "true" read as not reached, a change sent at every
+    join and each one stamped verifyFailed); everything else stays strict,
+    so a stringValue case change still fails verification honestly. (Two
+    numbers that are each 1 or 0 compare the same read either way.)"""
     a = ("" if a is None else str(a)).strip()
     b = ("" if b is None else str(b)).strip()
     la, lb = a.lower(), b.lower()
-    if la in ("true", "false") and lb in ("true", "false"):
-        return la == lb
+    if la in _BOOL_TEXT and lb in _BOOL_TEXT:
+        return _BOOL_TEXT[la] == _BOOL_TEXT[lb]
     return a == b
+
+
+_BOOL_TEXT = {"true": True, "1": True, "false": False, "0": False}
 
 
 def derive_handpay_options(config_options):
@@ -1433,7 +1545,7 @@ def pick_remote_key_off_type(rec):
     is born localCredit=false because no key can put it on the meter), so
     a false there means hand-pay is the only shape that can work."""
     def _t(k):
-        return str(rec.get(k) or "false").strip().lower() == "true"
+        return g2s_true(rec.get(k))
     if _t("remoteCredit"):
         return "G2S_remoteCredit"
     if _t("remoteHandpay"):
@@ -1699,15 +1811,29 @@ class EgmAssociation:
         self.cabinet = {}
         self.meters = {}
         # freshness stamps (wall clock) for the two folds above — the
-        # tournament pipeline's staleness discipline: meters_at flips on
-        # every landed meterInfo (the CLEAR stage refuses to settle a $0
+        # tournament pipeline's staleness discipline: meters_at is WHEN
+        # THE HUB ASKED for the newest read of the cabinet's meters that
+        # the machine has answered (the CLEAR stage refuses to settle a $0
         # glass off a fold older than its own post-arm read — a bill fed
         # in during the 60 s standing-sub window is invisible to the cold
         # mirror), cabinet_at on every cabinetStatus (the lock restage
         # only trusts a hostEnabled report FRESHER than its own last
         # send). 0.0 = never reported.
+        # Until v0.3.21 meters_at was stamped by every meterInfo that
+        # arrived. A periodic or end-of-day push is a snapshot taken
+        # before it is delivered (§5.19 Table 5.10: meterDateTime is when
+        # "the meter snapshot was taken"; an end-of-day set is queued and
+        # retried), and an answer about another class carries no cabinet
+        # meters, so either could pass the CLEAR stage with figures from
+        # before its question. meter_reads pairs an answer to its request
+        # by sessionId: sessionId -> {deviceClass, deviceId, askedAt}.
         self.meters_at = 0.0
         self.cabinet_at = 0.0
+        self.meter_reads = {}
+        # gamePlay device -> when its profile and denominations were last
+        # asked for again because the machine said its configuration
+        # changed (one such re-read per device per GP_REREAD_DEBOUNCE_SEC).
+        self.gp_reread_at = {}
         # gamePlay read state (G2S-21): per-deviceId dict keyed by the string
         # deviceId (a multi-game cabinet exposes several gamePlay devices, one
         # per theme+paytable, §6.1). Each holds themeId/paytableId/enabled/
@@ -2375,8 +2501,8 @@ class EgmAssociation:
             "handpayOptions": handpay_options,
             # "true"/"false" from the config-sync, None = not yet revealed —
             # the pre-bench visibility for the reset-to-credits path (G2S-25)
-            "handpayRemoteCreditAllowed":
-                handpay_options.get("G2S_enabledRemoteCredit"),
+            "handpayRemoteCreditAllowed": g2s_bool(
+                handpay_options.get("G2S_enabledRemoteCredit"), None),
             "noteAcceptor": note_acceptor,
             "billInCount": self.bill_in_count,
             "billInSessionAmt": self.bill_in_session_amt,
@@ -9276,7 +9402,9 @@ class G2SHost:
             code = str(cabinet_currency or self.any_cabinet_currency()
                        or "").upper()
             new = ((CURRENCY_SYMBOLS[code], "machine")
-                   if code in CURRENCY_SYMBOLS else ("$", "default"))
+                   if code in CURRENCY_SYMBOLS
+                   and currency_scale_note(code) is None
+                   else ("$", "default"))
         if (new[0], new[1]) != (_MONEY["symbol"], _MONEY["source"]):
             _MONEY["symbol"], _MONEY["source"] = new
             log.info("💱 money symbol %r (%s)%s", new[0], new[1],
@@ -9619,7 +9747,8 @@ class G2SHost:
         return suggest
 
     def _machine_credits_mc(self, assoc):
-        """The cabinet's current cashable credits (millicents). 0 when
+        """The credit on the cabinet, all types together (millicents): what
+        the machine's own credit meter shows the player. 0 when
         unmetered/disconnected. Never raises (best-effort read).
 
         For a SAS-LINKED cabinet the SAS leg's LIVE 0x1A×denom is the
@@ -9632,7 +9761,8 @@ class G2SHost:
         THIS MACHINE" over-read by exactly one transfer (the $10k display
         bug). The SAS leg polls ~every 0.4s and is current. Falls back to the
         G2S meter only when there is no SAS leg or it can't answer (plain G2S
-        cabinet / dark / parked / no 0x1A)."""
+        cabinet / dark / parked / no 0x1A), and then to the total of its
+        three credit meters (_g2s_credit_buckets_mc)."""
         if assoc is None:
             return 0
         # 1) SAS leg = credit authority for a linked cabinet (live 0x1A×denom).
@@ -9656,19 +9786,49 @@ class G2SHost:
                             return credits * denom * 1000
         except Exception:  # noqa: BLE001 — never-500; fall back to the G2S meter
             pass
-        # 2) Plain G2S cabinet (or SAS leg dark): the G2S_cabinet meter fold.
+        # 2) Plain G2S cabinet (or SAS leg dark): the G2S_cabinet meter
+        # fold, all three credit types (§5.9: "The credit meter displayed
+        # to the player is the total of the three types of credits").
+        return sum(self._g2s_credit_buckets_mc(assoc))
+
+    #: The cabinet's three credit meters (§5.9, Table 5.37), in the order
+    #: every amount triple in this file is written: cashable, promotional,
+    #: non-cashable.
+    CREDIT_METERS = ("playerCashableAmt", "playerPromoAmt",
+                     "playerNonCashAmt")
+
+    def _g2s_credit_buckets_mc(self, assoc):
+        """What a G2S cabinet's own three credit meters read, in millicents,
+        as (cashable, promotional, non-cashable). 0 for one that has not
+        been reported. Never raises.
+
+        Until v0.3.21 the hub looked at the cashable meter alone. A machine
+        holding only restricted or promotional credit, which the hub itself
+        puts there (a restricted ticket is authorized as non-cashable, and
+        a wallet push can carry it), read as empty: the tournament CLEAR
+        stage passed it as an empty glass and funded the stake on top, the
+        machine wagered the leftover first (§5.9: non-cashable, then
+        promotional, then cashable), the wins went to the cashable meter
+        and the finish swept them to the House. The figure shown on the
+        machine's own screen under-read by the same amount."""
+        out = [0, 0, 0]
         try:
             with assoc.lock:
                 meters = dict(assoc.meters)
-            for key, val in meters.items():
-                if key.endswith("playerCashableAmt"):
-                    try:
-                        return int(val)
-                    except (TypeError, ValueError):
-                        return 0
         except Exception:  # noqa: BLE001 — never-500 read
-            pass
-        return 0
+            return (0, 0, 0)
+        for i, name in enumerate(self.CREDIT_METERS):
+            val = meters.get(f"G2S_cabinet/1/G2S_{name}")
+            if val is None:
+                for key, v in meters.items():
+                    if key.endswith(name):
+                        val = v
+                        break
+            try:
+                out[i] = max(0, int(val))
+            except (TypeError, ValueError):
+                out[i] = 0
+        return tuple(out)
 
     def _glass_data_cashout(self, egm_id, assoc, uid):
         """cashout view: machine credits + the carded player's wallet + the
@@ -11795,8 +11955,10 @@ class G2SHost:
         its tracker — on the no-answer timeout this parks seat["clear"]
         itself); False = not-yet, stay at armStage="clear". Mutates the
         LOCAL seat copy only; the scoped read is one enqueue per arm,
-        confirmed by ANY meterInfo landing after the ask
-        (assoc.meters_at)."""
+        confirmed by the machine's ANSWER to a read of the cabinet's
+        meters that was asked for after the arm (assoc.meters_at: a
+        periodic push, an end-of-day set or an answer about another
+        class no longer counts — see EgmAssociation.meter_reads)."""
         if seat.get("kind") != "g2s":
             return True
         with self.assoc_lock:
@@ -12144,8 +12306,9 @@ class G2SHost:
             initiateRequest watDirection=G2S_fromEgm — hostControl owns
             both directions). No button, no standing arm, no glass pin:
             "house" rides the WAT record itself and the House is
-            credited at commitTransfer ACTUALS. The ask is the
-            playerCashableAmt fold — the 07-21 meter tracer PROVED that
+            credited at commitTransfer ACTUALS. The ask is the fold of
+            the three credit meters (cashable, promotional, non-cashable)
+            — the 07-21 meter tracer PROVED the cashable
             meter genuine millicents (the AVP's own G2S_wat cumulative
             meters reconcile to the hub ledger to the millicent), so
             the ask is trustworthy; commit ACTUALS stay the ledger
@@ -13822,7 +13985,8 @@ class G2SHost:
                     elif gp_id in denom_stale:
                         # denoms alone became mutable state (2026-07-22):
                         # a stale-denomsAt known device re-reads denoms,
-                        # never the (genuinely static) profile.
+                        # not the profile (that is read again when the
+                        # device's theme or paytable changes).
                         self.enqueue_get_game_denoms(assoc, gp_id)
 
         log.info("[%s] 🔄 gamePlay rescan — inventory re-harvest + status "
@@ -13840,7 +14004,9 @@ class G2SHost:
         outside the join-sweep inventory (gamePlay/129 on a 119-device
         harvest). So the events themselves are the refresh trigger:
           * event from a KNOWN device  -> one scoped getGamePlayStatus
-            re-read (the toggled-at-the-machine case; single cheap read).
+            re-read (the toggled-at-the-machine case; single cheap read),
+            plus its profile and denominations when the event says the
+            device's configuration changed (G2S_GPE005 / G2S_GPE006).
           * event from an UNKNOWN device -> automatic full rescan
             (refresh_game_play_status: descriptor re-harvest + the trio
             for new titles — the install case), debounced to one per
@@ -13874,6 +14040,15 @@ class G2SHost:
             play_cycle = code.startswith("G2S_GPE1") and code[8:].isdigit()
             if not play_cycle:
                 self.enqueue_get_game_play_status(assoc, dev)
+            # G2S_GPE005 / G2S_GPE006: the device's configuration was
+            # changed by a host or at the machine's own menu. §6.23.6 and
+            # §6.23.7: a host may "trigger a re-discovery of the device by
+            # issuing getGamePlayStatus, getGamePlayProfile, and
+            # getGameDenoms". The status alone was read, so a changed
+            # paytable or maximum wager stayed as first read.
+            if code in ("G2S_GPE005", "G2S_GPE006"):
+                self._reread_game_profile(
+                    assoc, dev, f"{code} says its configuration changed")
             # GPE201 = Active Denominations Changed (§6.23.22) — fired when
             # the EGM APPLIES a setActiveDenoms (possibly long after our
             # send, §6.15 deferred-apply) AND when the operator flips denoms
@@ -14005,6 +14180,17 @@ class G2SHost:
         second a door icon stops it ever reaching idle."""
         dev = str(device_id)
         denoms = sorted({int(d) for d in (denoms or [])})
+        with assoc.lock:
+            partial = (assoc.game_play.get(dev) or {}).get("denomsPartial")
+        if partial:
+            # setActiveDenoms replaces the whole set (§6.15), and part of
+            # what this game supports is not in the list the change was
+            # picked from: anything active there would be switched off.
+            return {"ok": False,
+                    "error": "this game reports a range of denominations "
+                             f"the hub could not list ({partial}); a "
+                             "change would switch off whatever is active "
+                             "in it, so none is sent"}
         with assoc.lock:
             cur = assoc.denom_ceremony
             # The stale-window must cover the mode-entry's own TTL, or the guard
@@ -14491,6 +14677,11 @@ class G2SHost:
                 a, "gamePlay", dev,
                 f'<g2s:setGamePlayState g2s:enable="{on}"{text}/>',
                 str(sid), "30000")
+            if not enable and g2s_true(((a.game_play.get(dev) or {}).get(
+                    "profile") or {}).get("requiredForPlay")):
+                log.warning("🎰 [%s] dev=%s is requiredForPlay: with it "
+                            "disabled the machine disables itself as a "
+                            "whole (Table 6.6, §6.23.1)", a.egm_id, dev)
             # Per-device tracking in the G2S-21 store. The nested record is
             # REPLACED wholesale on every transition (never mutated in
             # place): snapshot()'s per-device copies are shallow, so the
@@ -14621,14 +14812,14 @@ class G2SHost:
         Returns (data, raised-flag-names) for the caller's logging."""
         data = {
             "configurationId": attr(el, "configurationId") or "0",
-            "hostEnabled": attr(el, "hostEnabled") or "true",
-            "egmEnabled": attr(el, "egmEnabled") or "true",
+            "hostEnabled": g2s_bool(attr(el, "hostEnabled"), "true"),
+            "egmEnabled": g2s_bool(attr(el, "egmEnabled"), "true"),
             "noteValueInEscrow": attr(el, "noteValueInEscrow") or "0",
             "statusAt": now_iso(),
             "statusSource": source,
         }
         for f in self.NOTE_ACCEPTOR_FLAGS:
-            data[f] = attr(el, f) or "false"
+            data[f] = g2s_bool(attr(el, f))
         raised = [f for f in self.NOTE_ACCEPTOR_FLAGS if data[f] == "true"]
         with assoc.lock:
             assoc.note_acceptor["status"] = data
@@ -14649,6 +14840,12 @@ class G2SHost:
     CABINET_STATUS_FLAGS = (
         "logicDoorOpen", "auxDoorOpen", "cabinetDoorOpen",
         "serviceLampOn", "hostLocked")
+    #: Every cabinetStatus attribute the document types as boolean
+    #: (Table 3.3).
+    CABINET_STATUS_BOOLEANS = (
+        "egmEnabled", "hostEnabled", "enableGamePlay", "enableMoneyIn",
+        "enableMoneyOut", "hostLocked", "serviceLampOn", "logicDoorOpen",
+        "auxDoorOpen", "cabinetDoorOpen", "hardMetersDisconnected")
 
     def _fold_game_play_status(self, assoc, el, dev, source):
         """Fold a gamePlayStatus (§6.11) element into assoc.game_play[dev] —
@@ -14669,10 +14866,10 @@ class G2SHost:
         data = {
             "themeId": attr(el, "themeId"),
             "paytableId": attr(el, "paytableId"),
-            "hostEnabled": attr(el, "hostEnabled") or "true",
-            "egmEnabled": attr(el, "egmEnabled") or "true",
-            "generalTilt": attr(el, "generalTilt") or "false",
-            "reelTilt": attr(el, "reelTilt") or "false",
+            "hostEnabled": g2s_bool(attr(el, "hostEnabled"), "true"),
+            "egmEnabled": g2s_bool(attr(el, "egmEnabled"), "true"),
+            "generalTilt": g2s_bool(attr(el, "generalTilt")),
+            "reelTilt": g2s_bool(attr(el, "reelTilt")),
             "statusAt": now_iso(),
         }
         cfg = attr(el, "configurationId")
@@ -14685,6 +14882,7 @@ class G2SHost:
             was = (gp.get("egmEnabled"), gp.get("hostEnabled"),
                    gp.get("themeId"), gp.get("paytableId"))
             gp.update(data)
+            stale = self._game_profile_outdated(gp)
             assoc.game_play_as_of = now_iso()
             now_t = (data["egmEnabled"], data["hostEnabled"],
                      data["themeId"], data["paytableId"])
@@ -14697,7 +14895,61 @@ class G2SHost:
                      moved[0][1], moved[1][1],
                      str(moved[0][2])[:24], str(moved[1][2])[:24])
             self._schedule_game_play_persist(assoc)
+        if stale:
+            self._reread_game_profile(assoc, dev, stale)
         return moved
+
+    #: One re-read of a game device's profile and denominations per device
+    #: in this many seconds, however many times the machine says it changed.
+    GP_REREAD_DEBOUNCE_SEC = 30
+
+    @staticmethod
+    def _game_profile_outdated(gp):
+        """MUST be called holding assoc.lock, after a status was folded
+        into `gp`. If the profile held for the device describes another
+        theme or paytable than the device now reports, it is dropped and
+        the reason returned; otherwise None.
+
+        The profile holds option selections that "can be set locally at
+        the EGM or remotely via a configuration server" (§6.13), theme,
+        paytable and maximum wager among them (Table 6.79). It was kept
+        for the life of the device id: after a paytable change the Games
+        page showed the new paytable's name with the old one's payback
+        percentage, maximum wager and win levels, and nothing corrected
+        it (an IGT AVP changed theme and paytable under existing device
+        ids across two memory clears)."""
+        prof = gp.get("profile")
+        if not isinstance(prof, dict):
+            return None
+        for k in ("themeId", "paytableId"):
+            if gp.get(k) and prof.get(k) and gp[k] != prof[k]:
+                pair = [k, gp[k], prof[k]]
+                if gp.get("profileDisagrees") == pair:
+                    # read again since, and the machine's profile still
+                    # names the other one: it is the machine's answer
+                    return None
+                gp["profileDisagrees"] = pair
+                gp.pop("profile", None)
+                return (f"its {k} is now {gp[k]}, the profile held was "
+                        f"for {prof[k]}")
+        return None
+
+    def _reread_game_profile(self, assoc, dev, why):
+        """Ask again for one game device's profile and denominations (the
+        re-discovery §6.23.6 and §6.23.7 describe), once per device per
+        GP_REREAD_DEBOUNCE_SEC. Runs outside assoc.lock."""
+        dev = str(dev)
+        now = time.time()
+        with assoc.lock:
+            last = assoc.gp_reread_at.get(dev, 0.0)
+            if now - last < self.GP_REREAD_DEBOUNCE_SEC:
+                return False
+            assoc.gp_reread_at[dev] = now
+        log.info("🎰 [%s] gamePlay dev=%s — %s; reading its profile and "
+                 "denominations again", assoc.egm_id, dev, why)
+        self.enqueue_get_game_play_profile(assoc, dev)
+        self.enqueue_get_game_denoms(assoc, dev)
+        return True
 
     def _fold_cabinet_status(self, assoc, el, source):
         """Fold ONE cabinetStatus element (§3.9 Table 3.3 — every attribute
@@ -14722,6 +14974,12 @@ class G2SHost:
         data.setdefault("egmEnabled", "true")
         for f in self.CABINET_STATUS_FLAGS:
             data.setdefault(f, "false")
+        # the attributes Table 3.3 types as boolean, in one spelling (1 and
+        # 0 are as legal as true and false; everything that reads these,
+        # the setCabinetState verdict included, compares the two words)
+        for f in self.CABINET_STATUS_BOOLEANS:
+            if f in data:
+                data[f] = g2s_bool(data[f], data[f])
         data["statusAt"] = now_iso()
         data["statusSource"] = source
         with assoc.lock:
@@ -14796,10 +15054,10 @@ class G2SHost:
         snapshot()'s shallow copies stay consistent."""
         data = {
             "configurationId": attr(el, "configurationId") or "0",
-            "egmEnabled": attr(el, "egmEnabled") or "true",
-            "hostEnabled": attr(el, "hostEnabled") or "true",
-            "hostLocked": attr(el, "hostLocked") or "false",
-            "cashOutToWat": attr(el, "cashOutToWat") or "false",
+            "egmEnabled": g2s_bool(attr(el, "egmEnabled"), "true"),
+            "hostEnabled": g2s_bool(attr(el, "hostEnabled"), "true"),
+            "hostLocked": g2s_bool(attr(el, "hostLocked")),
+            "cashOutToWat": g2s_bool(attr(el, "cashOutToWat")),
             "keyPairId": attr(el, "keyPairId") or "1",
             "statusAt": now_iso(), "statusSource": source,
         }
@@ -15135,12 +15393,22 @@ class G2SHost:
         step accepts the EGM-stated amounts verbatim (the fromEgm branch
         of _wat_decide_authorization — accountId rides the record, no
         glass pin involved), and the account is credited at commitTransfer
-        with ACTUALS. Ask = the playerCashableAmt meter read; reduceAmts
+        with ACTUALS. Ask = the three credit meters as read, each as its
+        own type; reduceAmts
         lets the EGM trim, and a meter lagging LOW under-asks — the sweep
         detail carries the asked amount so a remainder is visible, and
         the record's commit actuals are the ledger truth either way.
         Errors as dicts at 200 (the addCredits posture)."""
-        mc = self._machine_credits_mc(assoc)
+        # All three credit types are asked for, each as its own meter
+        # reads (§5.9: transfers "will cause credits to be added to, or
+        # removed from, any of the three meters as specified in those
+        # commands"). The ask was the cashable meter alone, so a pull
+        # left restricted and promotional credit on the machine, and a
+        # machine holding nothing else was answered "nothing on the
+        # glass". Each type is credited to the account as the type it is
+        # (the commit's actuals, by bucket).
+        cash, promo, non_cash = self._g2s_credit_buckets_mc(assoc)
+        mc = cash + promo + non_cash
         if mc <= 0:
             return {"ok": False, "error": "nothing on the glass — the "
                                           "credit meter reads 0"}
@@ -15149,13 +15417,18 @@ class G2SHost:
             return {"ok": False, "error": f"no such account {acct!r}"}
         rid, rec = self.wat_store.new_request(
             assoc.egm_id, self.default_wat_device(assoc), acct,
-            "G2S_payCredit", mc, 0, 0, direction="G2S_fromEgm")
+            "G2S_payCredit", cash, promo, non_cash,
+            direction="G2S_fromEgm")
         self._wat_mirror(assoc, rec)
         self.enqueue_initiate_request(assoc, rec)
         log.info("🏦 [%s] HOST PULL — asking %s off the glass to %r as "
-                 "requestId=%d (fromEgm; credits land at commitTransfer "
-                 "actuals)", assoc.egm_id, denom_dollars(mc), acct, rid)
+                 "requestId=%d (fromEgm; cashable %s, promotional %s, "
+                 "non-cashable %s; credits land at commitTransfer "
+                 "actuals)", assoc.egm_id, denom_dollars(mc), acct, rid,
+                 denom_dollars(cash), denom_dollars(promo),
+                 denom_dollars(non_cash))
         return {"requestId": rid, "accountId": acct, "askedMc": mc,
+                "askedBucketsMc": [cash, promo, non_cash],
                 "transferState": "requested"}
 
     def cancel_wat_request(self, assoc, request_id=None, txn_id=None):
@@ -16940,8 +17213,21 @@ class G2SHost:
                    '</g2s:getMeterInfo>')
             inner, cid = self.build_inner_request(
                 a, "meters", "1", cmd, str(sid), "30000")
+            # which devices this read asked about and when, so that its
+            # answer can be told from any other meterInfo (builders run
+            # holding a.lock)
+            reads = getattr(a, "meter_reads", None)
+            if reads is not None:
+                reads[str(sid)] = {"deviceClass": str(device_class),
+                                   "deviceId": str(device_id),
+                                   "askedAt": time.time()}
+                while len(reads) > self.METER_READS_KEPT:
+                    reads.pop(next(iter(reads)))
             return inner, f"getMeterInfo(cid={cid})"
         self._enqueue(assoc, build, epoch=epoch)
+
+    #: getMeterInfo requests remembered per machine while unanswered.
+    METER_READS_KEPT = 64
 
     def enqueue_meter_info_ack(self, assoc, req):
         """Ack an EGM-pushed meterInfo (spec §5.20). An EOD subscription
@@ -16966,7 +17252,15 @@ class G2SHost:
         the meterInfo handler and the eventReport meterList fold. Returns
         the folded meter count; `changed` (optional list) collects up to a
         handful of (key, old, new) actual value changes for the GR-02
-        digest log line."""
+        digest log line.
+
+        Only DEVICE meters are folded. A meterInfo may also carry
+        wagerMeters, gameDenomMeters and currencyMeters (Table 5.11), which
+        break a device's figures down by wager category, denomination or
+        currency under the SAME meter names (Tables 5.16-5.18). Folded
+        under the device's key they overwrote its totals with one
+        category's or one denomination's line, whichever came last. They
+        are left out; nothing in the hub reads a breakdown."""
         # A periodic push folds ~2,100 meters ahead of the synchronous
         # g2sAck, so collect lock-free in document order (duplicate keys
         # preserved — last write wins, as before) and take assoc.lock ONCE
@@ -16980,6 +17274,8 @@ class G2SHost:
                 dc = attr(grp, "deviceClass")
                 if dc is None:
                     collect(grp)
+                    continue
+                if localname(grp.tag) in METER_BREAKDOWN_GROUPS:
                     continue
                 prefix = f"{dc}/{attr(grp, 'deviceId')}/"
                 for m in grp.iter():
@@ -17172,8 +17468,8 @@ class G2SHost:
                             "nobody's carded")
         # Case-folded like option_values_equal — an EGM may legally spell
         # the xs:boolean True/TRUE.
-        if str(reply["remoteCredit"]).strip().lower() != "true" and \
-                str(reply["remoteHandpay"]).strip().lower() != "true":
+        if not g2s_true(reply["remoteCredit"]) and \
+                not g2s_true(reply["remoteHandpay"]):
             # Advisory, NOT a refusal (2026-07-29): the request's flags are
             # a snapshot; the EGM judges against its current options, and a
             # lockup that arrived with both false has keyed off clean on the
@@ -18051,6 +18347,7 @@ class G2SHost:
         if result.get("ok"):
             result["before"] = before
             result["target"] = dict(targets)
+            result["changed"] = dict(changes)   # what was actually sent
             result["verify"] = ("automatic — on the applied status the host "
                                 "re-reads the handpay options and stamps the "
                                 "change record verified/verifyFailed; watch "
@@ -18292,9 +18589,10 @@ class G2SHost:
             log.info("💰 [%s] join: remote handpay key-off already armed — "
                      "nothing to push", assoc.egm_id)
         elif v.get("ok"):
-            log.info("💰 [%s] join: RE-ARMED remote handpay key-off (params "
+            log.info("💰 [%s] join: RE-ARMED remote handpay key-off (sent "
                      "%s) — the machine was carrying false, which is what "
-                     "a RAM clear looks like", assoc.egm_id, v.get("target"))
+                     "a RAM clear looks like", assoc.egm_id,
+                     v.get("changed") or v.get("target"))
         else:
             log.warning("💰 [%s] join: remote key-off re-assert FAILED — %s",
                         assoc.egm_id, v.get("error"))
@@ -20304,7 +20602,10 @@ class G2SHost:
             # Response to enterCommConfigMode/getCommConfigModeStatus (spec §8.9).
             # When config mode is ON and we are mid-cycle, fire setCommChange.
             el = req["commandEl"]
-            enabled = (attr(el, "enabled") or "").lower() == "true"
+            # enabled="1" is the same answer as enabled="true" (Table 8.4:
+            # boolean). Read as off, the machine was in the mode with play
+            # stopped while the ownership change waited at "entering".
+            enabled = g2s_true(attr(el, "enabled"))
             cfg = attr(el, "configurationId")
             log.info("[%s] commConfigModeStatus enabled=%s configId=%s (stage=%s)",
                      assoc.egm_id, enabled, cfg, assoc.commconfig_stage)
@@ -20566,8 +20867,17 @@ class G2SHost:
         elif cmd == "cabinetProfile" and stype == "G2S_response":
             el = req["commandEl"]
             data = {k.rsplit('}', 1)[-1]: v for k, v in el.attrib.items()}
+            note = currency_scale_note(data.get("currencyId"))
             with assoc.lock:
                 assoc.cabinet["profile"] = data
+                if note:
+                    assoc.cabinet["currencyNote"] = note
+                else:
+                    assoc.cabinet.pop("currencyNote", None)
+            if note:
+                log.warning("💱 [%s] %s (the hub reads every amount as "
+                            "having two decimal places, §3.2)",
+                            assoc.egm_id, note)
             log.info("[%s] cabinetProfile currency=%s locale=%s machineNum=%s "
                      "timeZone=%s", assoc.egm_id, data.get("currencyId"),
                      data.get("localeId"), data.get("machineNum"),
@@ -20628,11 +20938,20 @@ class G2SHost:
             with assoc.lock:
                 assoc.last_meter_report = now_iso()
                 assoc.last_meter_report_type = info_type
-                # freshness stamp for the tournament CLEAR gate: ANY landed
-                # meterInfo (on-demand answer, periodic push, EOD) is a
-                # fresh reading — an empty delivery still proves the EGM
-                # answered after the ask
-                assoc.meters_at = time.time()
+                # freshness stamp for the tournament CLEAR gate: only the
+                # ANSWER to a read of ours that covered the cabinet counts,
+                # found by the sessionId it echoes, and it is stamped with
+                # when that read was asked. An empty answer still proves
+                # the machine answered that question. The last part of an
+                # answer sent in several is the one that settles it.
+                asked = None
+                if stype == "G2S_response" and not req.get("sessionMore"):
+                    asked = (getattr(assoc, "meter_reads", None)
+                             or {}).pop(str(req["sessionId"]), None)
+                if asked and asked.get("deviceClass") in ("G2S_cabinet",
+                                                          "G2S_all"):
+                    assoc.meters_at = max(assoc.meters_at,
+                                          asked.get("askedAt") or 0.0)
                 total_known = len(assoc.meters)
             # GR-02: DIGEST line — the 2,142-meter periodic push repeats
             # every 60s and its full body only reaches the wire log at
@@ -20699,10 +21018,10 @@ class G2SHost:
             data = {
                 "themeId": attr(el, "themeId"),
                 "paytableId": attr(el, "paytableId"),
-                "hostEnabled": attr(el, "hostEnabled") or "true",
-                "egmEnabled": attr(el, "egmEnabled") or "true",
-                "generalTilt": attr(el, "generalTilt") or "false",
-                "reelTilt": attr(el, "reelTilt") or "false",
+                "hostEnabled": g2s_bool(attr(el, "hostEnabled"), "true"),
+                "egmEnabled": g2s_bool(attr(el, "egmEnabled"), "true"),
+                "generalTilt": g2s_bool(attr(el, "generalTilt")),
+                "reelTilt": g2s_bool(attr(el, "reelTilt")),
                 "configurationId": attr(el, "configurationId") or "0",
                 "statusAt": now_iso(),
             }
@@ -20717,6 +21036,7 @@ class G2SHost:
             with assoc.lock:
                 gp = assoc.game_play.setdefault(dev, {})
                 gp.update(data)
+                stale = self._game_profile_outdated(gp)
                 assoc.game_play_as_of = now_iso()  # GR-28: live-parse stamp
                 sc = gp.get("stateChange") or {}
                 if sc.get("result") in ("sent", "acked") and \
@@ -20745,6 +21065,8 @@ class G2SHost:
                      data["hostEnabled"], data["egmEnabled"],
                      data["generalTilt"], data["reelTilt"])
             self._schedule_game_play_persist(assoc)  # GR-28 (debounced)
+            if stale:
+                self._reread_game_profile(assoc, dev, stale)
 
         elif cmd == "gamePlayProfile" and stype == "G2S_response":
             # Response to getGamePlayProfile (spec §6.13, Tables 6.6-6.11).
@@ -20775,9 +21097,14 @@ class G2SHost:
                 "themeId": attr(el, "themeId"),
                 "paytableId": attr(el, "paytableId"),
                 "maxWagerCredits": attr(el, "maxWagerCredits") or "1",
-                "progAllowed": attr(el, "progAllowed") or "false",
-                "secondaryAllowed": attr(el, "secondaryAllowed") or "false",
-                "centralAllowed": attr(el, "centralAllowed") or "false",
+                "progAllowed": g2s_bool(attr(el, "progAllowed")),
+                "secondaryAllowed": g2s_bool(attr(el, "secondaryAllowed")),
+                "centralAllowed": g2s_bool(attr(el, "centralAllowed")),
+                # Table 6.6: with this true "the EGM MUST be disabled if
+                # either egmEnabled or hostEnabled is set to false": turning
+                # this one title off turns the whole machine off. Kept so
+                # the Games page can say so before the tap.
+                "requiredForPlay": g2s_bool(attr(el, "requiredForPlay")),
                 "wagerCategories": wager_cats,
                 "winLevels": win_levels,
                 "profileAt": now_iso(),
@@ -20814,26 +21141,37 @@ class G2SHost:
             # reports egmEnabled=false in gamePlayStatus (§6.2.2), not a fault.
             el = req["commandEl"]
             dev = req["deviceId"]
-            denoms, ranges = [], []
+            singles, ranges = [], []
             for child in el:
                 tag = localname(child.tag)
                 if tag == "gameDenom":
-                    denoms.append({
+                    singles.append({
                         "denomId": attr(child, "denomId"),
-                        "active": attr(child, "active") or "false"})
+                        "active": g2s_bool(attr(child, "active"))})
                 elif tag == "gameRange":
                     ranges.append({
                         "denomMin": attr(child, "denomMin"),
                         "denomMax": attr(child, "denomMax"),
                         "denomInterval": attr(child, "denomInterval") or "1000",
-                        "active": attr(child, "active") or "false"})
+                        "active": g2s_bool(attr(child, "active"))})
+            # A range "can substitute for a series of denomIds in all cases
+            # where a list of denomIds can be used" (§6.3), and the
+            # document's own gameDenomList examples answer with one. Each
+            # is listed out so the denominations in it are denominations
+            # like any other. Ranges were kept aside and read by nothing:
+            # the Games page had no chip for them, an active range counted
+            # as nothing active, and a change sent the singles alone, which
+            # (setActiveDenoms replaces the set, §6.15) switched off every
+            # active denomination in the range.
+            denoms, partial = expand_game_denoms(singles, ranges)
             active = [d["denomId"] for d in denoms
-                      if d["active"].lower() == "true" and d["denomId"]]
+                      if d["active"] == "true" and d["denomId"]]
             verdict = None
             with assoc.lock:
                 gp = assoc.game_play.setdefault(dev, {})
                 gp["denoms"] = denoms
                 gp["denomRanges"] = ranges
+                gp["denomsPartial"] = partial
                 gp["activeDenoms"] = active
                 gp["denomsAt"] = now_iso()
                 assoc.game_play_as_of = now_iso()  # GR-28: live-parse stamp
@@ -20896,6 +21234,11 @@ class G2SHost:
                      len(denoms), len(ranges), ",".join(active),
                      "" if active else
                      " — 0 active is legal (egmEnabled=false per §6.2.2)")
+            if partial:
+                log.warning("🎰 [%s] gameDenomList dev=%s — a range in it "
+                            "could not be listed out (%s); a denomination "
+                            "change for this game is refused until it can",
+                            assoc.egm_id, dev, partial)
 
         elif cmd == "noteAcceptorStatus" and stype == "G2S_response":
             # Response to BOTH getNoteAcceptorStatus and setNoteAcceptorState
@@ -20937,7 +21280,7 @@ class G2SHost:
                 "configurationId": attr(el, "configurationId") or "0",
                 "restartStatus": attr(el, "restartStatus") or "true",
                 "useDefaultConfig": attr(el, "useDefaultConfig") or "false",
-                "requiredForPlay": attr(el, "requiredForPlay") or "false",
+                "requiredForPlay": g2s_bool(attr(el, "requiredForPlay")),
                 "noMessageTimer": attr(el, "noMessageTimer") or "0",
                 "minLogEntries": attr(el, "minLogEntries") or "35",
                 "noteEnabled": attr(el, "noteEnabled"),
@@ -20945,7 +21288,7 @@ class G2SHost:
                 "profileAt": now_iso(),
             }
             active = [n["denom"] for n in notes
-                      if (n["noteActive"] or "").lower() == "true"]
+                      if g2s_true(n["noteActive"])]
             with assoc.lock:
                 na = assoc.note_acceptor
                 na["profile"] = profile
@@ -21095,8 +21438,8 @@ class G2SHost:
                             assoc.handpay_options = params
                         # Case-folded like option_values_equal — an EGM may
                         # legally spell the xs:boolean True/TRUE.
-                        rc = (params.get("G2S_enabledRemoteCredit")
-                              or "").strip().lower()
+                        rc = g2s_bool(
+                            params.get("G2S_enabledRemoteCredit"), "")
                         log.info("💰 [%s] handpay options synced (%d params) "
                                  "— remote key-off to credits %s", assoc.egm_id,
                                  len(params),
@@ -21151,8 +21494,7 @@ class G2SHost:
                                     params[pid] = (val.text or "").strip()
                     if notes or params:
                         active = [n["denom"] for n in notes
-                                  if (n["noteActive"] or "").lower()
-                                  == "true"]
+                                  if g2s_true(n["noteActive"])]
                         with assoc.lock:
                             na = assoc.note_acceptor
                             if notes:
@@ -21320,7 +21662,7 @@ class G2SHost:
             # We record it so /api/status can show whether the EGM is sitting
             # in configuration mode with game play locked out.
             el = req["commandEl"]
-            enabled = (attr(el, "enabled") or "").lower() == "true"
+            enabled = g2s_true(attr(el, "enabled"))     # "1" too (Table 9.4)
             with assoc.lock:
                 assoc.optionconfig_mode = enabled
                 assoc.optionconfig_mode_at = now_iso()
@@ -21486,8 +21828,7 @@ class G2SHost:
             # false — this response is what turns ticket printing ON.
             el = req["commandEl"]
             egm_list_id = attr(el, "validationListId") or "0"
-            expired = (attr(el, "valIdListExpired") or "false").lower() \
-                == "true"
+            expired = g2s_true(attr(el, "valIdListExpired"))
             try:
                 num = int(attr(el, "numValidationIds") or "0")
             except ValueError:
@@ -22746,7 +23087,7 @@ class G2SHost:
                      data.get("maxPendingBonus", "(absent)"),
                      data.get("timeToLive", "(absent)"),
                      data.get("idReaderId", "(absent)"))
-            if data.get("requiredForPlay") == "true":
+            if g2s_true(data.get("requiredForPlay")):
                 log.warning("🎁⚠️ [%s] bonusProfile requiredForPlay=TRUE — "
                             "the EGM may DISABLE PLAY when the bonus host "
                             "goes quiet longer than noMessageTimer=%s ms "

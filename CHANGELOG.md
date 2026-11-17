@@ -1,5 +1,47 @@
 # Changelog
 
+## v0.3.21
+Fourth batch from the G2S audit: meters and game play. Eight items.
+- **The credit on a machine is all three kinds of credit.** A machine
+  keeps cashable, promotional and restricted credit on separate meters,
+  and what the player sees is the total. The hub looked at the cashable
+  meter alone. A machine holding only restricted or promotional credit
+  read as empty: the tournament's clear step passed it and put the stake
+  on top, and the figure on the machine's own screen under-read. A pull
+  now asks for each kind and credits each as what it is. This is for
+  machines whose money moves over G2S; a machine with a SAS link is
+  unchanged.
+- **A denomination range is read as the denominations in it.** A machine
+  may list its denominations as a range (1¢ to 5¢, say) instead of one by
+  one. The hub kept ranges aside and showed nothing for them, and a
+  denomination change sent only the single entries, which switched off
+  every active denomination in the range. A range the hub cannot list is
+  said, and a change for that game is refused.
+- **An empty machine is confirmed by the answer to the hub's own
+  question.** Before funding a tournament seat the hub asks the machine
+  for its credit meters. Any meter report arriving afterwards was taken
+  as the answer, including a routine report sent before the question and
+  an answer about other meters.
+- **Breakdown meters no longer replace a device's totals.** A meter
+  report can also carry figures per wager category, per denomination and
+  per currency under the same names as the totals. They were stored over
+  the totals. They are now left out.
+- **A game whose paytable or settings change is read again.** The hub
+  read a game's profile once and kept it for good. After a change at the
+  machine the Games page showed the new paytable with the old payback
+  and maximum bet.
+- **Yes/no values written 1 and 0 are understood**, as well as true and
+  false, everywhere the hub reads one. A machine that writes them that
+  way could be left in a configuration mode, have every denomination
+  shown as off, and be sent the same handpay settings at every join.
+- The Games page says on the Disable button when turning that game off
+  turns the whole machine off.
+- A machine whose currency does not have two decimal places (yen, for
+  one) gets a note on its tile saying its amounts are off and by how
+  much; the hub does not rescale them, and does not put that currency's
+  sign in front of them.
+- The join's log line for the handpay settings names what was sent.
+
 ## v0.3.20
 Third batch from the G2S audit: configuration changes. Eight items.
 - **A machine is not left in a configuration mode.** While a machine is
