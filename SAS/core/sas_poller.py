@@ -70,7 +70,7 @@ from .sas_meters import (           # noqa: F401 (SAS_POLL_FLOOR re-export)
     SAS_POLL_FLOOR, MeterSnapshot, decode_response, sweep_snapshot,
 )
 # Two-step handpay reset-to-credits (AJ bench fact: method select MUST
-# precede the reset). Poll numbers are TODO(bench) — see the module.
+# precede the reset). SAS 6.02 §14.2 and §7.9 — see the module.
 from .sas_handpay_reset import (
     RESET_METHOD_CREDIT_METER, HandpayResetResult,
     reset_handpay_to_credits as _reset_handpay_to_credits,
@@ -95,9 +95,10 @@ DEFAULT_METERS: List[MeterSpec] = [
 @dataclass
 class HandpayInfo:
     """One LP 0x1B "Send Handpay Information" response, captured when the poller
-    services an exception 0x51. The record byte layout is NOT yet adjudicated on
-    real hardware — we hand back the RAW bytes for capture and never fabricate
-    an amount. `empty` is True when the machine returns an all-zero record:
+    services an exception 0x51. The record is SAS 6.02 Table 7.8: progressive
+    group, level, amount (5 BCD), partial pay (2 BCD), reset ID, ten unused
+    bytes. This poller hands back the RAW bytes and decodes nothing itself.
+    `empty` is True when the machine returns an all-zero record:
     per §7.8.1 that means every queued handpay record has already been reported
     and acknowledged (queue drained)."""
     address: int
@@ -425,11 +426,11 @@ class SASPoller:
                                  sleep: Callable[[float], None] = time.sleep,
                                  confirm_polls: int = 5) -> HandpayResetResult:
         """Two-step handpay reset-to-credits (core/sas_handpay_reset.py):
-        select reset method (0xA8, REQUIRE ack) -> remote reset (0x94) ->
-        confirm via the believed 0x52 'handpay was reset' exception. The
-        reset is never sent unless the method selection was acked — AJ's
-        bench fact ("send the byte prior to reset") is the whole feature.
-        Poll numbers are TODO(bench); the Montana guide does not cite them.
+        enable the reset method (0xA8, REQUIRE code 00) -> remote reset
+        (0x94; code 00 is the result) -> watch for exception 52 'handpay
+        was reset'. The reset is never sent unless the method was enabled —
+        AJ's bench fact ("send the byte prior to reset") is the whole
+        feature. SAS 6.02 §14.2 and §7.9.
 
         This is the SMIB-bridge entry point (BRIDGE_DESIGN.md §5.4 action
         `reset_handpay`, bench-gated): call it on an authorized fob tap /
@@ -440,11 +441,18 @@ class SASPoller:
         Exceptions drained during the confirm window still dispatch through
         on_event/on_typed_event; a pending long-poll result (e.g. ROM
         signature) arriving in that window is captured, not lost. Paced at
-        SAS_POLL_FLOOR; inject a no-op sleep only in mock tests."""
+        SAS_POLL_FLOOR; inject a no-op sleep only in mock tests.
+
+        A 0x51 that arrives in that window is answered with long poll 1B
+        like any other (§7.8.1: exception 52 "is not sent until the
+        corresponding 1B long poll has been received, responded to and
+        acknowledged"). Until v0.3.15 it was dispatched and left, so the
+        machine was not free to send the 52 this window is waiting for."""
+        self._handpay_empty_this_cycle = False
         result = _reset_handpay_to_credits(
             self.transport, self.address, self.protocol, method=method,
             pace=pace, sleep=sleep, confirm_polls=confirm_polls,
-            on_exception=self._dispatch_event,
+            on_exception=self._dispatch_and_service,
             on_frame=self._handle_long_poll_result)
         self._safe(self.on_handpay_reset, self.address, result)
         return result
@@ -468,10 +476,10 @@ class SASPoller:
         self._safe(self.on_typed_event, self.address, info)
 
     def _dispatch_and_service(self, code: int) -> None:
-        """Dispatch an exception, then service it if it is interactive. Only
-        the POLL paths (_general_poll/_drain_fifo) call this — the operator
-        reset flow calls _dispatch_event directly, so a 0x51 seen during a
-        reset confirm window is never double-serviced with a stray 1B read."""
+        """Dispatch an exception, then service it if it is interactive: a
+        0x51 is answered with long poll 1B. Called from the poll paths
+        (_general_poll/_drain_fifo) and from the handpay reset's watch for
+        exception 52."""
         self._dispatch_event(code)
         if (code == HANDPAY_INFO_PENDING and self.service_handpay
                 and not self._handpay_empty_this_cycle):

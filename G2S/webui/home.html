@@ -1858,13 +1858,17 @@ function sasCmdChip(lb){
   if(T==="handpay_reset") return chip("🔑 "+v, lb.ok===true?"ok":"warn");
   if(T==="aft_register")  return chip("🎫 "+v, lb.ok===true?"ok":"warn");
   if(T==="aft_transfer")  return chip("🪙 "+v, lb.ok===true?"ok":"warn");
-  // "ack"/"sent" both mean the frame went out; an errored send carries
-  // result:"error: …" (truthy!) and must render warn, never a green ok.
+  // Since v0.3.15 the satellite says ok:true only when the machine
+  // acknowledged the lock or unlock, and ok:false with the reason (nack,
+  // busy, silent) when it did not. An older satellite sends no ok at all:
+  // there "ack"/"sent" both meant the frame went out, and an errored send
+  // carries result:"error: …" (truthy!) which must render warn.
   const sentOk=s=>!!s&&!/^error/i.test(String(s));
+  const lockOk=lb.ok===undefined?sentOk(lb.result):lb.ok===true;
   if(T==="sas_disable")   return chip("🔒 "+String(lb.result||"sent"),
-                                      sentOk(lb.result)?"ok":"warn");
+                                      lockOk?"ok":"warn");
   if(T==="sas_enable")    return chip("🔓 "+String(lb.result||"sent"),
-                                      sentOk(lb.result)?"ok":"warn");
+                                      lockOk?"ok":"warn");
   if(T==="set_validation_id") return chip("🎟️ "+v, lb.ok===true?"ok":"warn");
   if(T==="legacy_bonus"||!T)
     return chip("🎁 "+String(lb.result||"sent"), lb.result==="ack"?"ok":"warn");

@@ -34,10 +34,12 @@ machine AND its answer arrived intact, an address-0 poll goes out first —
 the same one the poller already uses to ACK an exception (nothing answers
 address 0, so it costs one byte and no wait).
 
-A repeat is left alone when the previous answer did NOT arrive intact
-(nothing, a bad CRC, a NACK, a busy). Then the repeat really is the implied
-NACK the spec describes and the machine should send its answer again;
-ACKing there would tell it to throw away something we never received.
+A repeat is left alone when the previous answer did NOT arrive (nothing,
+or a bad CRC). Then the repeat really is the implied NACK the spec
+describes and the machine should send its answer again; ACKing there would
+tell it to throw away something we never received. A busy response and a
+NACK byte DID arrive, whole, and the poll that follows them is a new
+attempt: those are ACKed first (poll_answered, v0.3.15).
 
 Since 2026-11-17 (audit batch 4) the same guard keeps the rest of the
 host-side link rules, for the same reason — they belong under every caller:
@@ -130,6 +132,36 @@ def answer_intact(resp: bytes, address: int, command) -> bool:
     return sas_crc(resp[:-2]) == int.from_bytes(resp[-2:], "little")
 
 
+def is_busy(resp: bytes, address: int) -> bool:
+    """The gaming machine busy response of §4.1: the address followed by a
+    00 command code. "Upon receiving a gaming machine busy response, the
+    host aborts the long poll attempt and reinserts the long poll into its
+    transmit queue for transmission at a later time." """
+    return len(resp or b"") == 2 and resp[0] == address and resp[1] == 0x00
+
+
+def poll_answered(resp: bytes, address: int, command) -> bool:
+    """True when the machine gave a COMPLETE answer of any kind, so that
+    the same poll sent again is a new attempt and not a request to repeat:
+    an intact answer (answer_intact), the busy response, or the NACK byte
+    of Table 7.4b (address | 0x80).
+
+    Busy and NACK carry nothing the machine has to keep, and both arrived
+    whole. The host's next move is to send the poll AGAIN, later (§4.1) or
+    at once (a NACK means the poll did not validate). Sent with nothing
+    between, that second poll is by §3.2 an implied NACK: a machine that
+    counts re-sends its busy or its NACK without looking at the poll, and
+    ignores the third. So these are acknowledged before the retry like any
+    other answer. Until v0.3.15 they were not, and a retry after busy
+    could not succeed against a machine that keeps the count."""
+    if answer_intact(resp, address, command):
+        return True
+    if command is None or not resp:
+        return False
+    return is_busy(resp, address) or (len(resp) == 1
+                                      and resp[0] == (address | 0x80))
+
+
 NACK_SENDS = 3    # §3.2: the poll, the implied NACK, and the final NACK
 
 
@@ -162,7 +194,11 @@ def transact_reread(transport, frame: bytes, sends: int = NACK_SENDS):
     for sent in range(1, max(1, sends) + 1):
         resp = transport.transact(frame)
         heard = heard or bool(resp)
-        if key is None or answer_intact(resp, *key):
+        # A busy machine is not asked again here (§4.1: the host "aborts
+        # the long poll attempt" and comes back later); that is the
+        # caller's "later".
+        if key is None or answer_intact(resp, *key) \
+                or is_busy(resp, key[0]):
             break
     return resp, heard, sent
 
@@ -289,7 +325,7 @@ class ImpliedAckTransport:
         address, command = key
         self._last_end[address] = self._clock()
         self._last_frame = bytes(frame)
-        self._last_intact = resp is not None and answer_intact(resp, *key)
+        self._last_intact = resp is not None and poll_answered(resp, *key)
         if command is None and resp and len(resp) == 1 \
                 and resp[0] in PRIORITY_EXCEPTIONS:
             self._priority_from = address
@@ -304,7 +340,7 @@ class ImpliedAckTransport:
     def transact(self, frame: bytes, *args, **kwargs) -> bytes:
         key = self._before(frame)
         resp = self._inner.transact(frame, *args, **kwargs)
-        if key is not None and answer_intact(resp, *key):
+        if key is not None and poll_answered(resp, *key):
             self._answered = key
         self._after(frame, key, resp)
         return resp

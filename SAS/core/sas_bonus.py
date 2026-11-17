@@ -7,14 +7,14 @@ in this project): frame `01 8A 00 00 00 10 00 E8 26` credited 10 credits
 address byte, and the 0x1A current-credits meter read back 0x10 BCD. No AFT
 registration is required for legacy bonusing (§13 is independent of §8).
 
-Layout (Type S; §13.3 is outside our on-disk spec excerpt — field order
-adjudicated against marcrdavis/ArduinoTITO-PlayerTracking's LegacyBonus(),
-a read-only oracle proven on real WMS iron, then live-proven here):
+Layout (type S, SAS 6.02 Table 13.3; first worked out against
+marcrdavis/ArduinoTITO-PlayerTracking's LegacyBonus() before the document
+was to hand, then live-proven here):
 
     [address][8A][amount 4 BCD, MSB first, in CREDITS][tax status][CRC lo hi]
 
-Tax status byte (believed values from the full spec; only 0x00 bench-proven):
-    00 = deductible (standard)   01 = non-deductible   02 = wager match
+Tax status byte (Table 13.3; only 00 has been sent to a machine here):
+    00 = deductible   01 = non-deductible   02 = wager match
 
 ACK/NACK per spec §2.2.2.2 (Type S that carries no data request): the
 machine ACKs by transmitting its bare address byte, NACKs with address|0x80,

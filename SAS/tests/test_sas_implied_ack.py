@@ -237,8 +237,6 @@ class TestWhenTheRepeatIsARealNack:
         b"",                                        # silence
         GOOD_1F[:-1] + bytes([GOOD_1F[-1] ^ 0xFF]),  # damaged CRC
         GOOD_1F[:5],                                # cut short
-        bytes([0x81]),                              # NACK: address | 0x80
-        bytes([0x01, 0x00]),                        # busy
         GOOD_2F,                                    # an answer to another poll
     ])
     def test_no_ack_before_the_retry(self, lost):
@@ -247,6 +245,21 @@ class TestWhenTheRepeatIsARealNack:
         assert port.transact(ASK_1F) == GOOD_1F
         assert _frames(port) == [ASK_1F, ASK_1F]
         assert port.acks_sent == 0
+
+    @pytest.mark.parametrize("whole", [
+        bytes([0x81]),                              # NACK: address | 0x80
+        bytes([0x01, 0x00]),                        # busy (§4.1)
+    ])
+    def test_a_busy_or_a_nack_is_acknowledged_before_the_retry(self, whole):
+        """Both arrived whole and carry nothing the machine must keep. The
+        poll after them is a NEW attempt; sent with nothing between it is
+        an implied NACK, and a machine that counts re-sends its busy and
+        then ignores the third (v0.3.15)."""
+        port = _guarded(whole, GOOD_1F)
+        port.transact(ASK_1F)
+        assert port.transact(ASK_1F) == GOOD_1F
+        assert _frames(port) == [ASK_1F, ACK_POLL, ASK_1F]
+        assert port.acks_sent == 1
 
     def test_three_tries_at_a_lost_answer_stay_three_bare_polls(self):
         port = _guarded(b"", b"", b"")
