@@ -6,6 +6,8 @@ machine. No hardware, no real time.
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.sas_protocol import SASProtocol, sas_crc
@@ -307,6 +309,32 @@ class TestSASPoller:
         poller2 = SASPoller(port2, address=0x11)
         poller2.poll_once()
         assert poller2.state.chirps == 1 and poller2.state.online is False
+
+    @pytest.mark.parametrize("address,meaning", [
+        (0x51, "handpay is pending"), (0x52, "handpay was reset"),
+        (0x57, "system validation request"), (0x20, "general tilt"),
+        (0x7E, "game has started")])
+    def test_any_table_a1_code_at_its_own_address_is_an_exception(
+            self, address, meaning):
+        """Audit item 44. A machine set to address 81 (0x51) answers a
+        general poll with the one byte 0x51 for "handpay is pending". The
+        chirp test used to ask the naming tables, which left most of Table
+        A-1 out, so that byte was counted as a missed poll: no 1B read and
+        no banner. It asks the whole table now (v0.3.13). Two such bytes
+        together are still a chirp."""
+        machine = ScriptedMachine(address=address)
+        machine.queue(address)
+        events = []
+        poller = SASPoller(MockSASSerialPort(machine), address=address,
+                           on_event=lambda a, c, n: events.append(c))
+        poller.poll_once()
+        assert events == [address], meaning
+        assert poller.state.chirps == 0 and poller.state.online is True
+        deaf = SASPoller(MockSASSerialPort(self._deaf(address=address,
+                                                      burst=2)),
+                         address=address)
+        deaf.poll_once()
+        assert deaf.state.chirps == 1 and deaf.state.online is False
 
     def test_callback_exception_does_not_kill_loop(self):
         machine = ScriptedMachine(address=1)

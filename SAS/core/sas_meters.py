@@ -755,7 +755,8 @@ def decode_response(command: int, data: bytes):
 class MeterSnapshot:
     """Everything the §4.4 accounting polls report, in credit units
     (1 credit = 1 cent, §4.2). Fields left None = machine didn't answer that
-    poll (per §2.7.4 an unsupported poll gets dead silence, which is normal
+    poll (an unsupported poll gets dead silence, guide §2.7.4 and SAS 6.02
+    §4.4: the machine "must ignore the long poll and not NACK it"; normal
     — real games implement subsets)."""
     address: int
     taken_at: float = 0.0                       # time.monotonic()
@@ -791,7 +792,7 @@ def sweep_snapshot(transport, address: int,
                    ) -> MeterSnapshot:
     """Issue the SNAPSHOT_POLLS against one machine and return a
     MeterSnapshot. Silence or a bad CRC on any poll leaves those fields None
-    (unsupported commands legitimately get no response, §2.7.4).
+    (unsupported commands legitimately get no response, SAS 6.02 §4.4).
 
     Works against any transport with .transact(bytes)->bytes
     (SASSerialPort or MockSASSerialPort). Long polls also serve as the
@@ -802,7 +803,7 @@ def sweep_snapshot(transport, address: int,
     (SAS_POLL_FLOOR; the 40 ms rate is RTE/ticketing-only), so `sleep(pace)`
     runs between consecutive polls. This matters doubly here: an over-polled
     machine's dropped/busy response is silence, and this sweep by design
-    reads silence as "unsupported command" (§2.7.4) — so an over-rate sweep
+    reads silence as "unsupported command" (SAS 6.02 §4.4), so an over-rate sweep
     would non-deterministically poison the snapshot with phantom Nones.
     Inject a no-op `sleep` in mock tests to keep them fast.
     TODO(bench): if bench timing proves a real BB2E tolerates tighter

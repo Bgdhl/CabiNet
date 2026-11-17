@@ -125,7 +125,7 @@ if "tournament_names" not in _hub_store_mod.HOST_SETTING_KEYS:
 # the MINOR bump per the repo's version rule). Surfaced in engine_meta() ->
 # /api/status ["_engine"]["version"]; bump this and add a CHANGELOG.md
 # section on every commit with a user-visible change.
-CABINET_VERSION = "0.3.16"
+CABINET_VERSION = "0.3.17"
 
 WSDL_NS = "http://www.gamingstandards.com/wsdl/g2s/v1.0"
 SCHEMA_NS = "http://www.gamingstandards.com/g2s/schemas/v1.0.3"
@@ -5994,6 +5994,15 @@ class G2SHost:
                                          0xFF),
                 "inHouseEnabled": in_house if isinstance(in_house, bool)
                                   else None,
+                # "zero": the satellite sends transfers with a registration
+                # key of all zeros, which need no registration (SAS 6.02
+                # §8.1). "machine": this machine refused those and is sent
+                # its own key. None: a satellite older than v0.3.17, which
+                # always sends the key. The hub registers a machine at
+                # join in every case.
+                "keyMode": af.get("keyMode")
+                           if af.get("keyMode") in ("zero", "machine")
+                           else None,
             }
         # machine-info (denom code + identity), one-shot from the satellite's
         # 0x1F read. Attacker-typed like everything here — clamped to a fixed
@@ -6389,6 +6398,15 @@ class G2SHost:
                 # NOT registered but the operator asset is readable — the one
                 # case the hub can self-register. Enqueue once per (backed-off)
                 # cooldown, and only if no aft_register is already queued.
+                # This runs whatever key the satellite sends (aft.keyMode).
+                # A transfer with the key of all zeros needs no
+                # registration, but a machine that refuses the zeros is
+                # sent its own key, and for a refusal by any code but 88
+                # or 89 the satellite only has a key to offer when the
+                # machine is registered already. Registering at join, as
+                # always, is what keeps that second chance there after a
+                # RAM clear. (v0.3.17 skipped this for keyMode "zero" for
+                # one trial build; the owner asked, and it came back.)
                 # (sasEnabled false skips the trigger entirely: a parked
                 # satellite would only answer with an honest sas_disabled
                 # rejection, so queueing is pure churn.)

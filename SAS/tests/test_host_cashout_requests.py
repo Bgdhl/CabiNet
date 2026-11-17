@@ -137,12 +137,13 @@ class TestAnArmedRequestWeCannotTake:
         assert "told to cash out another way" in record["detail"]
         assert machine.declined == 1
 
-    def test_an_unregistered_machine_cannot_even_be_declined(self):
+    def test_a_machine_with_no_asset_number_cannot_even_be_declined(self):
         """With no asset number no 72 can be built. The machine falls back
-        by itself, as it always did."""
+        by itself, as it always did. (Until v0.3.17 the same went for any
+        machine that was not registered; see test_audit_remainder.py.)"""
         machine, port, poller, host, requests = _rig(
             credits=2500, cashout_enabled=True)
-        host.auto_register = lambda: (False, None, "no asset number")
+        host.prepare_transfer = lambda: (False, None, "no asset number")
         machine.press_cashout()
         poller.poll_once()
         record = _answer(host, requests, armed=True)

@@ -35,11 +35,18 @@ SYNC_RETRY_SEC while there is unsynced state. The transport-owning poll
 thread NEVER blocks on sync — its HTTP calls carry a short timeout and
 every failure path is immediate.
 
+The four calls the poll thread does make (mint, issued, authorize, commit)
+run on a helper thread while the poll thread keeps polling the machine
+(_ask and while_waiting, below). A machine that is not being polled takes
+the link for down: it hands an escrowed ticket back, or treats the cash-out
+as denied (SAS 6.02 §4.3, and the notes in §15.8 and §15.11).
+
 Stdlib only (http.client + json + threading), same as the rest of core/.
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 import http.client
 import json
 import logging
@@ -72,14 +79,24 @@ def derive_fallback_sid(smib_id: str) -> int:
 
 DEFAULT_TIMEOUT_SEC = 2.5     # ceiling for one WHOLE call: connect, send,
 #                               answer, and the one re-dial of a stale
-#                               connection, together. These calls run on the
-#                               poll thread with nothing going to the
-#                               machine meanwhile, and a machine that hears
-#                               no poll for five seconds takes the link for
-#                               down (SAS 6.02 §4.3): it hands the ticket
-#                               back, or refuses the cash-out. Until v0.3.16
-#                               this was a timeout on EACH socket step, so
-#                               one call could run to five seconds and more.
+#                               connection, together. The machine allows
+#                               ten seconds for a validation number and
+#                               thirty for a ticket decision (SAS 6.02
+#                               §15.8, §15.11); this is how long the player
+#                               stands there before the fallback. Until
+#                               v0.3.16 it was a timeout on EACH socket
+#                               step, so one call could run to five seconds
+#                               and more, with the machine not polled.
+WAIT_SLICE_SEC = 0.2          # how long the poll thread waits on a hub
+#                               answer before it polls the machine again:
+#                               the document's ordinary polling rate
+#                               (§2.3.3). A hub on the same network answers
+#                               well inside one slice, so in the normal case
+#                               nothing extra goes to the machine.
+WAIT_GRACE_SEC = 1.0          # past the call's own limit, the poll thread
+#                               stops waiting for it. The call's limit is
+#                               enforced on its sockets; this is for what
+#                               that cannot reach (a name lookup that hangs).
 SYNC_RETRY_SEC = 60.0         # dirty-state retry cadence
 SYNC_HEARTBEAT_SEC = 1800.0   # clean-state full re-push (heals a hub whose
 #                               db was reset/quarantined while we were idle)
@@ -231,6 +248,17 @@ class HubTicketAuthority:
             self._dirty.set()
         self._sync_wake = threading.Event()
         self._hub_down = False        # edge-logged, never per-call spam
+        # Set by the satellite to a function that sends the machine one
+        # general poll (SASTITOHost.keep_polling). With it set, the four
+        # calls the poll thread makes run on a helper thread and the poll
+        # thread calls this every WAIT_SLICE_SEC until the answer is in
+        # (_ask). None (tests, a local store, the sync thread's own calls):
+        # the call is made in place, as it always was.
+        self.while_waiting = None
+        self.wait_slice = WAIT_SLICE_SEC
+        self.wait_grace = WAIT_GRACE_SEC
+        self._clock = time.monotonic
+        self._caller = None           # the helper thread, made on first use
         log.info("hub ticket authority: %s (fallback sid %02d)",
                  self.base, self.fallback_sid)
         if start_sync_thread:
@@ -283,6 +311,53 @@ class HubTicketAuthority:
             log.warning("hub authority RECOVERED (%s)", self.base)
         return out
 
+    def _ask(self, op: str, payload: Dict) -> Dict:
+        """_post, for the calls the POLL THREAD makes: mint (between long
+        polls 57 and 58), authorize (between 70 and 71), issued and commit.
+        Same result and same exceptions as _post.
+
+        The call runs on a helper thread. The poll thread waits for it one
+        slice at a time and, each time a slice passes with no answer, calls
+        while_waiting() to send the machine a general poll. Until v0.3.17
+        the call was made in place and the machine heard nothing for as long
+        as the hub took, up to the 2.5 s limit. SAS 6.02 §4.3: "A gaming
+        machine must consider the communications link to be down if it is
+        not being actively polled by the host", five seconds without an
+        address byte at the latest; with the link down it returns a ticket
+        in escrow "immediately" (§15.11) and proceeds "as though the system
+        validation had been denied" (§15.8).
+
+        The helper is one thread, so it keeps its own connection to the hub
+        open between calls, and a second call cannot overtake the first.
+        Nothing but HTTP happens on it: the serial port stays with the poll
+        thread.
+
+        concurrent.futures.wait is used, not result(timeout=): a socket
+        timeout inside the call is a TimeoutError too, and must come out as
+        the call's own failure, not be taken for "still waiting"."""
+        hook = self.while_waiting
+        if hook is None:
+            return self._post(op, payload)
+        if self._caller is None:
+            self._caller = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="hub-tito-call")
+        call = self._caller.submit(self._post, op, payload)
+        give_up = self._clock() + self.timeout + self.wait_grace
+        while True:
+            done, _ = concurrent.futures.wait([call], timeout=self.wait_slice)
+            if done:
+                return call.result()        # or raises what _post raised
+            if self._clock() >= give_up:
+                call.cancel()               # not started yet: never sent
+                raise OSError(
+                    f"hub {op} gave no answer within "
+                    f"{self.timeout + self.wait_grace:g} s")
+            try:
+                hook()
+            except Exception:   # noqa: BLE001 — a fault while polling must
+                log.exception(  # not turn a hub answer into a refusal
+                    "polling the machine while waiting on the hub failed")
+
     def _down(self, op: str, e: Exception) -> None:
         if not self._hub_down:
             self._hub_down = True
@@ -303,7 +378,7 @@ class HubTicketAuthority:
     def mint_validation_number(self, amount_cents: int, address: int,
                                system_id: int = 1) -> Dict:
         try:
-            r = self._post("mint", {"smibId": self.smib_id,
+            r = self._ask("mint", {"smibId": self.smib_id,
                                     "address": int(address),
                                     "amountCents": int(amount_cents)})
             return {"validation_number": r["validationNumber"],
@@ -359,7 +434,7 @@ class HubTicketAuthority:
         if isinstance(vt, int) and not isinstance(vt, bool):
             payload["validationType"] = vt
         try:
-            r = self._post("issued", payload)
+            r = self._ask("issued", payload)
         except (OSError, ValueError) as e:
             self._down("issued", e)
             # JOURNAL the raw capture: on a COLLISION print the local store
@@ -395,7 +470,7 @@ class HubTicketAuthority:
         if canonical:
             payload["canonical"] = canonical
         try:
-            r = self._post("authorize", payload)
+            r = self._ask("authorize", payload)
             return {"authorized": bool(r.get("authorized")),
                     "amount_cents": int(r.get("amountCents") or 0),
                     "reason": str(r.get("reason", "")),
@@ -417,7 +492,7 @@ class HubTicketAuthority:
         canonical = self._canonical_from_raw(validation_raw) \
             or str(validation_number)
         try:
-            r = self._post("commit", {
+            r = self._ask("commit", {
                 "smibId": self.smib_id, "address": int(address),
                 "canonical": canonical, "redeemed": bool(redeemed)})
             return r.get("state")

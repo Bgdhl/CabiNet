@@ -16,8 +16,9 @@ parity (termios CMSPAR), which pyserial exposes as PARITY_MARK/PARITY_SPACE:
 
 TIMING — the two hazards the adversarial review caught (both real):
 
-1. INTER-BYTE GAP (SAS spec §2.3.2: max 5 ms between bytes WITHIN a message,
-   both directions; >5 ms => the message is invalid and silently dropped).
+1. INTER-BYTE GAP (SAS 6.02 §2.3.2: max 5 ms between bytes WITHIN a message,
+   both directions; over 5 ms "the message may be considered invalid", and
+   the machines we have seen then say nothing).
    Switching parity mid-frame (write addr byte, drain, reconfigure termios,
    write rest) inserts a gap. LIVE-PROVEN 2026-07-08 on the Zero 2W PL011:
    tcdrain()/flush() sleeps in whole scheduler ticks — ~20 ms per call —

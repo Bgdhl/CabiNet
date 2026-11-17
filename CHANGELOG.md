@@ -1,5 +1,43 @@
 # Changelog
 
+## v0.3.17
+The last four items of the SAS audit. With these it is complete.
+- **The machine is polled while the hub decides on a ticket.** When a
+  ticket goes in, or a cash-out asks for a ticket number, the satellite
+  asks the hub and waits. It sent the machine nothing while it waited. A
+  machine that is not being polled takes the link for down and hands the
+  ticket back, or refuses the cash-out. The satellite now keeps polling
+  through the wait. With a hub that answers at once, as it does on the
+  same network, nothing changes on the wire.
+- **Transfers no longer depend on registering the machine.** The
+  satellite used to register every machine and send the registration key
+  with each transfer, and a machine where the registration would not
+  complete got no transfer at all. The SAS document says registration is
+  for bank debit transfers and that transfers like ours should carry a
+  key of all zeros. They now do, and nothing is registered first. A
+  registered WMS Bluebird 2 was seen to take a push that way.
+- **A machine that refuses the zeros is sent its own key.** Some older
+  machines are said to fail on the zeros. A refused transfer moves
+  nothing, so the satellite sends the same transfer once more with the
+  machine's key (registering the machine first when its answer was "not
+  registered" or "key does not match"). If the key is what made it go
+  through, that machine is sent its key from then on, as before this
+  version. The hub still registers a machine when it joins, as it always
+  has, so the key is there if it is needed; the tile shows AFT as ready
+  as soon as the asset number is known, without waiting for that. A
+  machine with no asset number set is still refused, with the same
+  message.
+- **Every machine event has a name.** 51 event codes showed in the log and
+  on the hub as a bare number, such as "exception 0x7E" for every game
+  start. All of them are named now, with the bill value on each bill
+  event ($2, $50, $100, $200, $500 were missing).
+- Event names no longer carry a "(VERIFY_ON_BENCH)" tag. The tag was
+  showing in the hub's event list, and it cut two names short.
+- A machine set to an address that is also an event code (81 is "handpay
+  pending") has that event read as an event. This was fixed in v0.3.13
+  and is now covered by a test.
+- A transfer's result says which key it carried (`keySent`).
+
 ## v0.3.16
 Seventh and last batch from the SAS audit: meters, denominations and the
 remainder. Twelve smaller items.
