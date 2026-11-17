@@ -82,7 +82,7 @@ from modules.aft.aft_handler import (
     TRANSFER_TYPE_EGM_TO_HOST, TRANSFER_TYPE_WIN_TO_HOST,
     TRANSFER_CODE_FULL_ONLY, TRANSFER_CODE_PARTIAL_OK, TRANSFER_FLAGS_NONE,
     ALL_OF_IT_CENTS, HOST_CASHOUT_CONTROLLABLE, HOST_CASHOUT_ENABLED,
-    HOST_CASHOUT_HARD, ZERO_KEY,
+    HOST_CASHOUT_HARD, KEY_MODE_MACHINE, KeyModeStore,
     make_transaction_id, AFT_ST_IN_HOUSE_ENABLED, AVAIL_XFER_FROM_EGM,
     describe_available_transfers, describe_aft_status)
 
@@ -591,10 +591,10 @@ def answer_cashout_request(aft_host, code, armed, account_id, on_wire=None):
     rec = {"id": f"cashout-{int(time.time() * 1000)}", "type": "aft_cashout",
            "when": time.strftime("%Y-%m-%dT%H:%M:%S"),
            "accountId": account_id if armed else None}
-    # The machine's asset number and a registration key (its own if it is
-    # registered, all zeros if it cannot be), so the 0x72 can be built.
-    # With no asset number nothing can be sent, not even a decline, and
-    # the machine falls back by itself.
+    # The machine's asset number, so the 0x72 can be built (it carries a
+    # registration key of all zeros, or the machine's own if the machine
+    # has refused those). With no asset number nothing can be sent, not
+    # even a decline, and the machine falls back by itself.
     ok_reg, _reg, reg_detail = aft_host.prepare_transfer()
     if not ok_reg:
         logger.warning("🏦 host-cashout request 0x{:02X} cannot be answered"
@@ -679,9 +679,12 @@ def answer_cashout_request(aft_host, code, armed, account_id, on_wire=None):
                  and res.final.cashable_cents is not None else None)
     credited = confirmed if res.ok and confirmed is not None else 0
     rcredited = _restricted_moved(res)
+    # res.request, not req: a machine that refused the key of all zeros
+    # was sent the transfer again under a new id (AFTHost.transfer), and
+    # that id is the one in its history.
     rec.update(ok=res.ok, outcome=res.outcome.value,
-               txnId=req.transaction_id, amountCents=credited,
-               restrictedCents=rcredited,
+               txnId=res.request.transaction_id, amountCents=credited,
+               restrictedCents=rcredited, keySent=aft_host.key_sent,
                detail=(res.detail if credited or rcredited or not res.ok
                        else res.detail + " — amount UNCONFIRMED, NOT "
                        "credited (verify meters)"),
@@ -2011,12 +2014,26 @@ def main():
                        "machine", aft_journal.current["txnId"],
                        aft_journal.current["cents"],
                        aft_journal.current["startedAt"])
+    # Whether this machine has refused a registration key of all zeros
+    # (AFTHost.transfer). Remembered across restarts so it is not sent
+    # them, and does not refuse them, again each time; in memory on a mock
+    # run.
+    aft_key_mode = KeyModeStore(
+        None if args.mock else
+        str(Path(__file__).resolve().parent / "data" / "aft_key_mode.json"))
     aft_host = AFTHost(poller, asset_number=None, registration_key=aft_key,
                        pos_id=aft_pos, sleep=time.sleep,
                        on_cashout_request=on_cashout_request,
-                       journal=aft_journal)
+                       journal=aft_journal, key_mode=aft_key_mode)
     logger.info("AFT register ready: rig key fp {} · POS {}",
                 aft_key.hex()[:12], args.aft_pos)
+    if aft_key_mode.mode == KEY_MODE_MACHINE:
+        logger.info("🏦 AFT: this machine refused a registration key of all "
+                    "zeros (status {}, {}); its transfers carry its own key",
+                    aft_key_mode.status or "?", aft_key_mode.since or "?")
+    else:
+        logger.info("🏦 AFT: transfers carry a registration key of all "
+                    "zeros (SAS 6.02 8.1)")
 
     def apply_hub_settings(enabled, sysval):
         """Apply the C2 report-reply keys. Runs on the REPORTER thread;
@@ -2219,11 +2236,11 @@ def main():
                                    "(bad cents {})", cmd_id, cents)
                     return result
                 result["cents"] = cents
-                # The machine's asset and a registration key first. A
-                # REGISTERED machine short-circuits on one 73/FF and its
-                # asset+key are ADOPTED; one that is not is registered now;
-                # one that cannot be is sent the transfer with a key of all
-                # zeros (SAS 6.02 §8.1; AFTHost.prepare_transfer). Only a
+                # The machine's asset number first: one 73/FF, and the
+                # transfer then carries a registration key of all zeros
+                # (SAS 6.02 §8.1; AFTHost.prepare_transfer). A machine that
+                # has refused the zeros is prepared the old way instead:
+                # registered if it is not, and sent its own key. Only a
                 # machine with no asset number is refused here.
                 ok_reg, reg, reg_detail = aft_host.prepare_transfer()
                 if not ok_reg:
@@ -2253,25 +2270,10 @@ def main():
                 restricted = cmd.get("creditType") == "restricted"
                 result["creditType"] = "restricted" if restricted \
                     else "cashable"
-                # Which registration key the 0x72 carries: the machine's
-                # own once it is registered, all zeros for one that could
-                # not be (prepare_transfer). {"zeroKey": true} sends the
-                # zeros to a REGISTERED machine for this one push: SAS 6.02
-                # §8.1 recommends that key for every in-house transfer, and
-                # this is how to find out what a given machine does with it.
-                # A machine that minds answers status 88 or 89 and no money
-                # moves.
-                force_zero = cmd.get("zeroKey") is True
-                zero_key = force_zero or aft_host.registration_key == ZERO_KEY
-                result["keySent"] = "zero" if zero_key else "machine"
-                if force_zero and reg is not None and reg.registered:
-                    result["experiment"] = "zero key to a registered machine"
                 logger.info("💵 hub command {}: AFT ready ({}) — pushing {}c "
-                            "{}host->EGM ({}){}", cmd_id, reg_detail, cents,
+                            "{}host->EGM ({})", cmd_id, reg_detail, cents,
                             "RESTRICTED PROMOTIONAL " if restricted else "",
-                            "lock-first" if require_lock else "lockless",
-                            ", registration key of all zeros as the command "
-                            "asked" if force_zero else "")
+                            "lock-first" if require_lock else "lockless")
                 req = AFTTransferRequest(
                     transaction_id=make_transaction_id(),
                     transfer_type=TRANSFER_TYPE_HOST_TO_EGM,
@@ -2284,7 +2286,6 @@ def main():
                 res = aft_host.transfer(
                     req, require_lock=require_lock,
                     kind="aft_transfer",
-                    key=ZERO_KEY if force_zero else None,
                     account_id=result.get("accountId"), cmd_id=cmd_id,
                     on_wire=lambda lbl, rq, rp: logger.info(
                         "💵 {} REQ {} | RESP {}", lbl, rq.hex(),
@@ -2343,7 +2344,11 @@ def main():
                 result["ok"] = res.ok
                 result["outcome"] = res.outcome.value
                 result["detail"] = res.detail + detail_extra
-                result["txnId"] = req.transaction_id
+                # res.request, not req: a machine that refused the key of
+                # all zeros was sent the push again under a new id, and
+                # that id is the one the hub must book it under.
+                result["txnId"] = res.request.transaction_id
+                result["keySent"] = aft_host.key_sent
                 result["amountCents"] = confirmed if res.ok else 0
                 result["result"] = "ack" if res.ok else res.outcome.value
                 logger.info("💵 hub command {}: aft push {}c -> {} ({})",
@@ -2438,7 +2443,8 @@ def main():
                 rcredited = _restricted_moved(res)
                 result["ok"] = res.ok
                 result["outcome"] = res.outcome.value
-                result["txnId"] = req.transaction_id
+                result["txnId"] = res.request.transaction_id   # see the push
+                result["keySent"] = aft_host.key_sent
                 result["amountCents"] = credited
                 result["restrictedCents"] = rcredited
                 result["detail"] = (res.detail
@@ -3489,6 +3495,10 @@ def main():
                     # raise 6A; availXfers bit 1 is not.
                     "hostCashoutStatus": ls.host_cashout_status
                                          if ls else None,
+                    # "zero": transfers carry a registration key of all
+                    # zeros and need no registration. "machine": this
+                    # machine refused those and is sent its own key.
+                    "keyMode": aft_host.key_mode.mode,
                     # tri-state on purpose: None = unknown (silent read /
                     # old firmware) — the hub/UI may only act on a REAL
                     # False (never exclude a machine on missing data)

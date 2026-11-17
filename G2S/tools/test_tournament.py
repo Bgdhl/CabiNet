@@ -3078,6 +3078,56 @@ def main():
           {"aft": ea3.get("aft"), "ready": ea3.get("sasCashoutReady")})
 
     # ---------------------------------------------------------------
+    print("— v0.3.17: a satellite that sends transfers with a registration "
+          "key of all zeros (keyMode 'zero', SAS 6.02 8.1) needs no "
+          "registration, so the hub queues none")
+    queued = []
+
+    def _enq(smib, cmd):
+        queued.append(cmd.get("type"))
+        return {"ok": True, "id": "autoreg-test"}
+    d8.sas_enqueue_command = _enq
+    d8._aft_command_queued = lambda smib: False
+    d8._aft_seq = itertools.count(1)
+    d8._aft_autoreg = {}
+    d8.sas_report({"smibId": "smib-mi", "address": "1", "online": True,
+                   "aft": {"registered": False, "asset": 77,
+                           "keyMode": "zero"}}, "10.0.0.9")
+    check("unregistered + keyMode zero: NO aft_register is queued, and the "
+          "mode reaches the status",
+          queued == []
+          and d8.sas_machines["smib-mi/1"]["aft"].get("keyMode") == "zero",
+          (queued, d8.sas_machines["smib-mi/1"].get("aft")))
+    d8.sas_report({"smibId": "smib-mi", "address": "1", "online": True,
+                   "aft": {"registered": False, "asset": 77,
+                           "keyMode": "machine"}}, "10.0.0.9")
+    check("unregistered + keyMode machine (it refused the zeros): the "
+          "registration IS queued, as before",
+          queued == ["aft_register"]
+          and d8.sas_machines["smib-mi/1"]["aft"].get("keyMode")
+          == "machine", queued)
+    queued.clear()
+    d8._aft_autoreg = {}
+    d8.sas_report({"smibId": "smib-mi", "address": "1", "online": True,
+                   "aft": {"registered": False, "asset": 77}}, "10.0.0.9")
+    check("an older satellite (no keyMode) is registered as before and "
+          "its mode reads None",
+          queued == ["aft_register"]
+          and d8.sas_machines["smib-mi/1"]["aft"].get("keyMode") is None,
+          (queued, d8.sas_machines["smib-mi/1"].get("aft")))
+    queued.clear()
+    d8._aft_autoreg = {}
+    d8.sas_report({"smibId": "smib-mi", "address": "1", "online": True,
+                   "aft": {"registered": False, "asset": 77,
+                           "keyMode": "anything else"}}, "10.0.0.9")
+    check("a keyMode that is neither word is dropped (and so registers)",
+          queued == ["aft_register"]
+          and d8.sas_machines["smib-mi/1"]["aft"].get("keyMode") is None,
+          queued)
+    d8.sas_report({"smibId": "smib-mi", "address": "1", "online": True,
+                   "aft": {"registered": False}}, "10.0.0.9")
+
+    # ---------------------------------------------------------------
     print("— D14: denomSuggest carries a hub-side 'since' (epoch s) — "
           "stable across the ~1 s recomputes, reset only on a real flip "
           "(the tile nudge survives page reloads)")

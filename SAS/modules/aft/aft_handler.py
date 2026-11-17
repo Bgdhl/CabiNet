@@ -67,8 +67,11 @@ it (NameError on the host-cashout path); the rebuild is synchronous like the
 rest of the SAS host stack (SBC-friendly, poll-loop-driven).
 """
 
+import dataclasses
 import enum
 import itertools
+import json
+import os
 import time
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
@@ -114,7 +117,8 @@ __all__ = [
     "AFT_ST_CUSTOM_TICKET", "AFT_ST_REGISTERED", "AFT_ST_IN_HOUSE_ENABLED",
     "AFT_ST_BONUS_ENABLED", "AFT_ST_DEBIT_ENABLED", "AFT_ST_ANY_AFT_ENABLED",
     "describe_available_transfers", "describe_aft_status",
-    "AFT_TRANSFER_COMPLETE_EXCEPTION", "ZERO_KEY", "REGISTER_RETRY_SEC",
+    "AFT_TRANSFER_COMPLETE_EXCEPTION", "ZERO_KEY", "KEY_MODE_ZERO",
+    "KEY_MODE_MACHINE", "KEY_REFUSALS", "KeyModeStore",
     "AFTStatus", "AFTRegistration", "AFTGameLockStatus",
     "AFTTransferRequest", "AFTTransferStatusData",
     "cents_to_bcd5", "bcd5_to_cents", "asset_number_bytes",
@@ -235,22 +239,34 @@ _PROTO = SASProtocol()               # stateless; safe to share
 
 REGISTRATION_KEY_LEN = 20            # VERIFY_ON_BENCH
 
-# SAS 6.02 §8.1: "Registration should not be used for in-house and bonus
-# transactions. These transactions should use a registration key of all
-# zeros." Table 8.3a reads that key as "registration not required", and
-# registration itself is "required for debit transfers" (status 88).
+# SAS 6.02 §8.1: "The registration process allows a debit system to
+# associate a gaming machine with a POS terminal. Registration should not be
+# used for in-house and bonus transactions. These transactions should use a
+# registration key of all zeros." Table 8.3a reads that key as "registration
+# not required", and registration itself is "required for debit transfers"
+# (status 88). Every transfer this host sends is in-house.
 #
-# What this code does with it (audit item 17): a machine that registers is
-# sent its key, as it always was, because every machine this has run on
-# works that way and none has been tried the other way. A machine that
-# cannot be registered used to get no transfer at all; it now gets the
-# transfer with this key.
+# So a transfer carries ZERO_KEY (audit item 17). A registered WMS Bluebird
+# 2 took a push that way on 2026-11-17. Until then every transfer here
+# carried the key the machine was registered with, and a machine that could
+# not be registered got no transfer at all.
+#
+# Not every machine follows the document there. The owner has read that
+# some older Bally and Konami games fail on the zeros; none has been seen
+# here, so how they fail is not known. A machine that refuses a zero-key
+# transfer moves nothing, and the same transfer is sent once more with the
+# machine's own key (AFTHost.transfer):
+#   * refused with one of KEY_REFUSALS, the two codes that are about the
+#     key: the machine is registered first if it is not;
+#   * refused with any other code: only if the machine is registered
+#     already, so there is a key to offer.
+# When the key is what made the transfer go through, that machine is sent
+# its key from then on (KeyModeStore): the road every transfer took before.
+# A machine that works with its key therefore keeps working.
 ZERO_KEY = bytes(REGISTRATION_KEY_LEN)
-
-# After a registration that did not complete, how long the transfer path
-# leaves it alone before trying again. The hub keeps asking on its own
-# schedule (the aft_register command) whatever this says.
-REGISTER_RETRY_SEC = 300.0
+KEY_MODE_ZERO = "zero"               # transfers carry ZERO_KEY
+KEY_MODE_MACHINE = "machine"         # ... the key the machine holds
+KEY_REFUSALS = (0x88, 0x89)          # not registered; key does not match
 ASSET_NUMBER_LEN = 4                 # VERIFY_ON_BENCH
 POS_ID_LEN = 4                       # VERIFY_ON_BENCH
 MAX_TRANSACTION_ID_LEN = 20          # VERIFY_ON_BENCH
@@ -1341,6 +1357,58 @@ def judge_open_transfer(rec: Dict,
 # Poller integration
 # --------------------------------------------------------------------------
 
+class KeyModeStore:
+    """Whether this machine has refused a registration key of all zeros.
+
+    Kept on disk so that a machine which insists on its key is not sent
+    the zeros again, and refuses again, after every restart of the
+    satellite. One machine per satellite, so one small file:
+    {"mode": "machine", "status": "0x89", "since": "..."}. No file, or one
+    that cannot be read, means the zeros have not been refused.
+
+    path=None keeps it in memory (mock and test runs). To have a machine
+    tried with the zeros again, delete the file and restart the satellite.
+    """
+
+    def __init__(self, path: Optional[str] = None):
+        self.path = path
+        self.mode = KEY_MODE_ZERO
+        self.status: Optional[str] = None     # the refusal, "0x88"/"0x89"
+        self.since: Optional[str] = None
+        if path:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    rec = json.load(f)
+                if isinstance(rec, dict) \
+                        and rec.get("mode") == KEY_MODE_MACHINE:
+                    self.mode = KEY_MODE_MACHINE
+                    self.status = rec.get("status") \
+                        if isinstance(rec.get("status"), str) else None
+                    self.since = rec.get("since") \
+                        if isinstance(rec.get("since"), str) else None
+            except (OSError, ValueError):
+                pass
+
+    def remember_refusal(self, status: int) -> None:
+        """The machine answered a zero-key transfer with `status`."""
+        self.mode = KEY_MODE_MACHINE
+        self.status = f"0x{status:02X}"
+        self.since = time.strftime("%Y-%m-%dT%H:%M:%S")
+        if not self.path:
+            return
+        tmp = self.path + ".tmp"
+        try:
+            os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"mode": self.mode, "status": self.status,
+                           "since": self.since}, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.path)
+        except OSError:
+            pass        # in memory for this run; asked again after a restart
+
+
 class AFTHost:
     """Wires AFT into a SASPoller without modifying it (the SASTITOHost
     pattern): operator-triggered transfers run through the poller's
@@ -1352,8 +1420,9 @@ class AFTHost:
     per-machine identity: asset_number (4 wire bytes) + registration_key
     (20 bytes) + pos_id (4 wire bytes). `rig_key` is the key this host
     registers a machine with, fixed at construction. `registration_key` is
-    the key its transfers carry: the machine's own once it is registered,
-    all zeros for a machine that could not be (prepare_transfer)."""
+    the key its transfers carry: all zeros (ZERO_KEY), or the machine's own
+    for a machine that has refused the zeros (prepare_transfer, transfer).
+    `key_mode` remembers which."""
 
     def __init__(self, poller, asset_number: Optional[bytes] = None,
                  registration_key: bytes = b"",
@@ -1365,7 +1434,8 @@ class AFTHost:
                  pace: float = SAS_POLL_FLOOR,
                  sleep: Callable[[float], None] = time.sleep,
                  journal: Optional[OpenTransferJournal] = None,
-                 clock: Callable[[], float] = time.monotonic):
+                 clock: Callable[[], float] = time.monotonic,
+                 key_mode: Optional["KeyModeStore"] = None):
         # asset_number is OPTIONAL (None) so the runner can build one AFTHost
         # purely for registration — auto_register() READS the machine's real
         # asset and never leaves this None for a transfer. A non-None asset
@@ -1380,8 +1450,8 @@ class AFTHost:
         self.rig_key = registration_key
         self.registration_key = registration_key
         self.pos_id = pos_id
-        self._register_again_at = 0.0  # prepare_transfer's next registration
-        self._unregistered_why = ""    # ... and why the last one failed
+        self.key_mode = key_mode if key_mode is not None else KeyModeStore()
+        self._registered_seen = False  # prepare_transfer's last 73/FF
         self.on_transfer = on_transfer
         self.on_cashout_request = on_cashout_request
         self.pace = pace
@@ -1460,50 +1530,37 @@ class AFTHost:
         number and a registration key. Returns (ok, registration, detail).
         Call it before every transfer(); a False means nothing can be sent.
 
-        A machine that is registered, or registers now: exactly what
-        auto_register does, poll for poll, and the transfer carries the
-        machine's key.
+        The transfer carries a key of all zeros (audit item 17). SAS 6.02
+        §8.1 asks for that key on every in-house transfer ("registration
+        not required", Table 8.3a); registration is "required for debit
+        transfers", which this host never sends. So nothing is registered
+        here: one 73/FF is read for the machine's asset number, which the
+        machine checks on every 0x72 (status 93), with 7B and 74 as the
+        other places to find it. No asset from any poll is a False.
 
-        A machine that cannot be registered (audit item 17): the transfer
-        goes with a key of all zeros. SAS 6.02 §8.1 asks for that key on
-        every in-house transfer ("registration not required", Table 8.3a);
-        registration is "required for debit transfers", which this host
-        never sends. Until v0.3.17 such a machine got no transfer at all.
-        One that insists on registration answers the transfer with status
-        88 or 89 and no money moves.
-
-        The asset number is still needed: the machine checks it on every
-        0x72 (status 93). No asset from any poll is still a False.
-
-        A registration that did not complete is tried again from here no
-        sooner than REGISTER_RETRY_SEC later, so a machine that never
-        registers does not spend three polls on it before every transfer."""
+        A machine that has refused the zeros before (key_mode, see
+        transfer) is sent its own key, by the road every transfer took
+        until v0.3.17: exactly what auto_register does, poll for poll."""
+        if self.key_mode.mode == KEY_MODE_MACHINE:
+            return self.auto_register()
         p = self.poller
         reg = _read_registration(p.transport, p.address, p.protocol)
-        if reg is not None and reg.registered:
-            self._adopt(reg)
-            self._register_again_at = 0.0
-            return True, reg, "already registered"
-        self.sleep(self.pace)
+        self._registered_seen = bool(reg is not None and reg.registered)
+        if reg is None or not any(reg.asset_number):
+            self.sleep(self.pace)
         asset = self.read_asset(reg=reg)
         if asset is None:
             return False, reg, "machine reports no asset number"
-        if self.clock() >= self._register_again_at:
-            ok, final, detail = aft_register(
-                p.transport, p.address, asset, self.rig_key, self.pos_id,
-                p.protocol, pace=self.pace, sleep=self.sleep)
-            if ok and final is not None:
-                self._adopt(final)
-                self._register_again_at = 0.0
-                return ok, final, detail
-            reg = final if final is not None else reg
-            self._unregistered_why = detail
-            self._register_again_at = self.clock() + REGISTER_RETRY_SEC
         self.asset_number = asset
         self.registration_key = ZERO_KEY
-        return True, reg, (
-            f"not registered ({self._unregistered_why}); sending with a "
-            "registration key of all zeros")
+        return True, reg, "registration key of all zeros"
+
+    @property
+    def key_sent(self) -> str:
+        """Which key the last transfer was built with: "zero" or
+        "machine"."""
+        return (KEY_MODE_ZERO if self.registration_key == ZERO_KEY
+                else KEY_MODE_MACHINE)
 
     def _adopt(self, reg: Optional[AFTRegistration]) -> None:
         """Adopt the authoritative key + asset (+ POS) from a register/
@@ -1605,20 +1662,77 @@ class AFTHost:
                  on_wire: Optional[Callable[[str, bytes, bytes], None]] = None,
                  kind: str = "aft_transfer",
                  account_id: Optional[str] = None,
-                 cmd_id: Optional[str] = None,
-                 key: Optional[bytes] = None) -> AFTTransferResult:
+                 cmd_id: Optional[str] = None) -> AFTTransferResult:
         """Run one transfer. kind / account_id / cmd_id are what the caller
         will need to report its END if that comes later than this call
         (they are written down with it — see open_transfer.py).
 
-        `key` sends this one transfer with that registration key instead of
-        the one prepare_transfer settled on, and leaves the latter as it
-        is. It exists for one experiment: ZERO_KEY to a machine that IS
-        registered, which SAS 6.02 §8.1 recommends for every in-house
-        transfer and which had not been tried on any machine."""
+        A machine that refuses a transfer sent with the key of all zeros
+        has moved nothing (every refusal is a final "transfer failed"
+        status), so THE SAME TRANSFER IS SENT ONCE MORE with the machine's
+        own key, under a new transaction id:
+
+          * refused 88 ("not registered") or 89 ("registration key does
+            not match"): those are about the key. It is remembered for the
+            machine at once (key_mode), and the machine is registered
+            first if it is not. If it cannot be registered either, the
+            refusal is returned with that added.
+          * refused with any other code: we cannot tell whether the zeros
+            were the reason (how the machines that mind them answer is not
+            known), so the key is tried only when the machine is already
+            registered, and it is remembered only if the key is what made
+            the machine take the transfer. If the machine refuses again,
+            that is its answer to the transfer, and the zeros stay in use.
+
+        The result returned is the second transfer's whenever one was
+        sent; its `request` carries the id that reached the machine, and
+        its detail says what happened. A transfer sent with the machine's
+        key in the first place is never sent twice."""
+        result = self._transfer_once(request, require_lock, on_wire, kind,
+                                     account_id, cmd_id)
+        status = result.final.status if result.final is not None else None
+        if (self.registration_key != ZERO_KEY or status is None
+                or result.outcome is not AFTOutcome.REFUSED):
+            return result
+        about_key = status in KEY_REFUSALS
+        if not about_key and not self._registered_seen:
+            return result               # no key to offer without registering
+        said = ("the machine refused the transfer with a registration key "
+                f"of all zeros (status 0x{status:02X})")
+        if about_key:
+            self.key_mode.remember_refusal(status)
+        self.sleep(self.pace)
+        ok, _reg, why = self.auto_register()
+        if not ok:
+            if not about_key:
+                return result           # its registration went; as it was
+            return dataclasses.replace(
+                result, detail=f"{said} and could not be registered: {why}")
+        self.sleep(self.pace)
+        again = self._transfer_once(
+            dataclasses.replace(request,
+                                transaction_id=make_transaction_id()),
+            require_lock, on_wire, kind, account_id, cmd_id)
+        took = again.outcome in (AFTOutcome.COMPLETED, AFTOutcome.PARTIAL,
+                                 AFTOutcome.UNCONFIRMED,
+                                 AFTOutcome.ROLLED_BACK)
+        if about_key or took:
+            if took:
+                self.key_mode.remember_refusal(status)
+            return dataclasses.replace(
+                again, detail=f"{said}; sent again with the machine's own "
+                              f"key: {again.detail}")
+        # Refused with its own key as well: the key was not the reason.
+        return dataclasses.replace(
+            again, detail=f"{again.detail} (refused with a registration "
+                          f"key of all zeros as well, status 0x{status:02X})")
+
+    def _transfer_once(self, request: AFTTransferRequest,
+                       require_lock: bool, on_wire, kind: str,
+                       account_id: Optional[str],
+                       cmd_id: Optional[str]) -> AFTTransferResult:
+        """One transfer cycle with the key prepare_transfer settled on."""
         p = self.poller
-        if key is not None and len(key) != REGISTRATION_KEY_LEN:
-            raise ValueError("registration key is exactly 20 bytes")
         if self.asset_number is None:
             # Built for registration only, never READ/adopted an asset.
             # build_aft_transfer_poll would len(None) -> TypeError; refuse
@@ -1666,7 +1780,7 @@ class AFTHost:
         # did, and service_open() will find out.
         result = aft_transfer(
             p.transport, p.address, request, self.asset_number,
-            self.registration_key if key is None else key, p.protocol,
+            self.registration_key, p.protocol,
             pace=self.pace, sleep=self.sleep, require_lock=require_lock,
             on_exception=p._dispatch_event,
             on_frame=p._handle_long_poll_result, on_wire=on_wire)

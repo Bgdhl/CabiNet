@@ -4,8 +4,9 @@ names its item.
 
   item 38 (the rest)  the machine is polled while the hub answers a ticket
                       call
-  item 17             an in-house transfer to a machine that cannot be
-                      registered goes with a registration key of all zeros
+  item 17             an in-house transfer carries a registration key of
+                      all zeros and needs no registered machine; a machine
+                      that refuses the zeros is sent its own key
 """
 
 import json
@@ -27,9 +28,11 @@ from core.sas_tito_host import (
     REDEEM_AUTHORIZE_CASHABLE, RedemptionOutcome, SASTITOHost,
     SYSTEM_VALIDATION_REQUEST_EXCEPTION, TICKET_INSERTED_EXCEPTION,
     VALIDATION_APPROVE)
+import sas_host
 from modules.aft.aft_handler import (
-    AFTHost, AFTOutcome, AFTStatus, AFTTransferRequest, REGISTER_RETRY_SEC,
-    TRANSFER_TYPE_EGM_TO_HOST, TRANSFER_TYPE_HOST_TO_EGM, ZERO_KEY)
+    AFTHost, AFTOutcome, AFTStatus, AFTTransferRequest, KEY_MODE_MACHINE,
+    KEY_MODE_ZERO, KeyModeStore, TRANSFER_TYPE_EGM_TO_HOST,
+    TRANSFER_TYPE_HOST_TO_EGM, TRANSFER_TYPE_WIN_TO_HOST, ZERO_KEY)
 from transport.serial.sas_serial import MockSASSerialPort
 
 from by_the_book import ByTheBookAFTMachine
@@ -348,30 +351,31 @@ class TestTheCallItself:
 # ---------------------------------------------------------------------------
 # Item 17 — an in-house transfer does not need a registered machine
 #
-# SAS 6.02 §8.1: "Registration should not be used for in-house and bonus
-# transactions. These transactions should use a registration key of all
-# zeros." Table 8.3a: registration key, "0 = registration not required".
-# Status 88: "Gaming machine not registered (required for debit
-# transfers)".
+# SAS 6.02 §8.1: "The registration process allows a debit system to
+# associate a gaming machine with a POS terminal. Registration should not be
+# used for in-house and bonus transactions. These transactions should use a
+# registration key of all zeros." Table 8.3a: registration key, "0 =
+# registration not required". Status 88: "Gaming machine not registered
+# (required for debit transfers)".
 #
-# Every machine this has run on registers and is sent its key, and that is
-# left exactly as it was. What changes is the machine that cannot be
-# registered: it used to get no transfer at all.
+# Until v0.3.17 every transfer was preceded by a registration and carried
+# the key the machine was registered with; a machine that could not be
+# registered got no transfer. A registered WMS Bluebird 2 took a push with
+# the zeros on 2026-11-17.
 # ---------------------------------------------------------------------------
 
 RIG_KEY = b"CasinoNet-AFT-rig001"
 POS = b"\x01\x00\x00\x00"
 
 
-def _aft(**machine_kw):
+def _aft(key_mode=None, **machine_kw):
     machine_kw.setdefault("complete_in", 2)
     machine = ByTheBookAFTMachine(**machine_kw)
     port = ImpliedAckTransport(MockSASSerialPort(machine))
     poller = SASPoller(port, address=1, meters=[])
-    clock = [1000.0]
     host = AFTHost(poller, None, RIG_KEY, POS, sleep=NO_SLEEP,
-                   clock=lambda: clock[0])
-    return machine, port, host, clock
+                   key_mode=key_mode)
+    return machine, port, host
 
 
 def _long_polls(port):
@@ -382,269 +386,337 @@ def _long_polls(port):
             for f, _w in port.sent_frames if len(f) > 3]
 
 
-def _push(host, cents=500, lock=True):
+def _request(cents=500, pull=False):
+    _request.n += 1
+    return AFTTransferRequest(
+        transaction_id=f"TEST{_request.n:06d}",
+        transfer_type=(TRANSFER_TYPE_EGM_TO_HOST if pull
+                       else TRANSFER_TYPE_HOST_TO_EGM),
+        cashable_cents=cents)
+
+
+_request.n = 0
+
+
+def _push(host, cents=500, pull=False):
     ok, _reg, detail = host.prepare_transfer()
     assert ok, detail
-    return host.transfer(AFTTransferRequest(
-        transaction_id=f"T{len(host.poller.transport.sent_frames):06d}",
-        transfer_type=TRANSFER_TYPE_HOST_TO_EGM, cashable_cents=cents),
-        require_lock=lock), detail
+    return host.transfer(_request(cents, pull)), detail
 
 
-class TestARegisteredMachineIsSentWhatItAlwaysWas:
-    def test_poll_for_poll(self):
-        """The Bluebird's road, pinned: one 73/FF to prepare, one more at
-        the start of the transfer, the lock, the transfer with the
-        machine's own key. Nothing here may change without a machine being
-        tried on it."""
-        machine, port, host, _clock = _aft(credits=0)
+class TestATransferCarriesAKeyOfAllZeros:
+    def test_to_a_registered_machine(self):
+        """What the Bluebird was seen to take. One 73/FF for the asset
+        number, the lock, the transfer. No second 73: with no key there is
+        no registration to check."""
+        machine, port, host = _aft(credits=0)
         result, detail = _push(host)
         assert result.outcome is AFTOutcome.COMPLETED
-        assert detail == "already registered"
-        assert _long_polls(port)[:4] == [
-            (0x73, 0xFF), (0x73, 0xFF), (0x74, 0x00), (0x72, 0x00)]
-        assert machine.keys_seen == [machine.key] and any(machine.key)
-        assert machine.credits == 500
-
-    def test_a_machine_that_registers_on_the_spot(self):
-        """After a RAM clear: not registered, asset number set. It is
-        registered with the rig key and the transfer carries that key."""
-        machine, port, host, _clock = _aft(credits=0, registered=False)
-        result, detail = _push(host)
-        assert result.outcome is AFTOutcome.COMPLETED
-        assert detail == "registered"
-        assert _long_polls(port)[:6] == [
-            (0x73, 0xFF), (0x73, 0x00), (0x73, 0x01),
+        assert detail == "registration key of all zeros"
+        assert _long_polls(port)[:3] == [
             (0x73, 0xFF), (0x74, 0x00), (0x72, 0x00)]
-        assert machine.registered and machine.key == RIG_KEY
-        assert machine.keys_seen == [RIG_KEY]
-
-
-class TestAMachineThatCannotBeRegistered:
-    def test_the_transfer_goes_with_a_key_of_all_zeros(self):
-        """Before: "cannot push — registration refused", and nothing was
-        sent, to a machine that by the document needs no registration."""
-        machine, port, host, _clock = _aft(
-            credits=0, registered=False, registers=False)
-        result, detail = _push(host)
-        assert result.outcome is AFTOutcome.COMPLETED
-        assert machine.credits == 500
         assert machine.keys_seen == [ZERO_KEY]
-        assert detail.startswith("not registered (registration refused "
-                                 "(status 0x80)")
-        assert detail.endswith("sending with a registration key of all zeros")
-        # no 73 inside the transfer itself: there is no key to check
-        after_register = _long_polls(port)[3:]
-        assert after_register[:2] == [(0x74, 0x00), (0x72, 0x00)]
+        assert machine.credits == 500
+        assert host.key_sent == "zero" and host.key_mode.mode == KEY_MODE_ZERO
 
-    def test_a_pull_too(self):
-        machine, port, host, _clock = _aft(
-            credits=2500, registered=False, registers=False)
-        ok, _reg, _detail = host.prepare_transfer()
-        assert ok
-        result = host.transfer(AFTTransferRequest(
-            transaction_id="PULL0001",
-            transfer_type=TRANSFER_TYPE_EGM_TO_HOST, cashable_cents=2500))
+    def test_a_pull(self):
+        machine, port, host = _aft(credits=2500)
+        result, _detail = _push(host, cents=2500, pull=True)
         assert result.outcome is AFTOutcome.COMPLETED
         assert machine.credits == 0 and machine.keys_seen == [ZERO_KEY]
 
-    def test_a_machine_that_never_answers_73(self):
-        """It may have no registration at all. Its asset number comes from
-        the 74 answer."""
-        machine, port, host, _clock = _aft(credits=0, registered=False)
-        machine.deaf.add(0x73)
-        result, detail = _push(host)
+    def test_to_a_machine_that_is_not_registered_and_nothing_registers_it(
+            self):
+        """Before: registered first, every time. After a RAM clear that is
+        three polls of 73 the document says an in-house transfer does not
+        need."""
+        machine, port, host = _aft(credits=0, registered=False)
+        result, _detail = _push(host)
         assert result.outcome is AFTOutcome.COMPLETED
         assert machine.credits == 500 and machine.keys_seen == [ZERO_KEY]
-        assert "silence on registration initialize (73/00)" in detail
+        assert machine.registered is False
+        assert not [1 for c, code in _long_polls(port)
+                    if c == 0x73 and code != 0xFF]
 
-    def test_one_that_insists_on_registration_refuses_and_nothing_moves(
-            self):
-        """Not what the document describes, but if one exists: status 88,
-        no credits, and the result says so."""
-        machine, port, host, _clock = _aft(
-            credits=0, registered=False, registers=False,
-            needs_registration=True)
+    def test_to_a_machine_that_cannot_be_registered(self):
+        """Before: "cannot push — registration refused", and nothing was
+        sent."""
+        machine, port, host = _aft(credits=0, registered=False,
+                                   registers=False)
         result, _detail = _push(host)
-        assert result.outcome is AFTOutcome.REFUSED
-        assert result.final.status == AFTStatus.GAMING_MACHINE_NOT_REGISTERED
-        assert "GAMING_MACHINE_NOT_REGISTERED" in result.detail
-        assert machine.credits == 0
+        assert result.outcome is AFTOutcome.COMPLETED
+        assert machine.credits == 500 and machine.keys_seen == [ZERO_KEY]
+
+    def test_to_a_machine_that_never_answers_73(self):
+        """It may have no registration at all. Its asset number comes from
+        the 74 answer."""
+        machine, port, host = _aft(credits=0, registered=False)
+        machine.deaf.add(0x73)
+        result, _detail = _push(host)
+        assert result.outcome is AFTOutcome.COMPLETED
+        assert machine.credits == 500 and machine.keys_seen == [ZERO_KEY]
 
     def test_no_asset_number_is_still_a_refusal(self):
         """The machine checks the asset number on every 72 (status 93), so
         with none there is nothing to send."""
-        machine, port, host, _clock = _aft(credits=0, registered=False)
+        machine, port, host = _aft(credits=0, registered=False)
         machine.asset = bytes(4)
         ok, _reg, detail = host.prepare_transfer()
         assert (ok, detail) == (False, "machine reports no asset number")
         assert not [1 for c, _code in _long_polls(port) if c == 0x72]
 
-    def test_registration_is_not_tried_before_every_transfer(self):
-        """Three polls of 73 ahead of each transfer, on a machine that will
-        never register, would also sit inside the eight seconds a machine
-        gives a cash-out request."""
-        machine, port, host, clock = _aft(
-            credits=0, registered=False, registers=False)
-
-        def tries():
-            return len([1 for c, code in _long_polls(port)
-                        if c == 0x73 and code in (0x00, 0x01)])
-        _push(host)
-        assert tries() == 2
-        clock[0] += REGISTER_RETRY_SEC - 1
+    def test_a_refusal_for_another_reason_stays_the_machines_answer(self):
+        """A win cash-out with no win waiting is refused 8B whatever the
+        key. On a registered machine the key is tried once, the machine
+        refuses again, and that is the result: the zeros stay in use and
+        nothing is remembered."""
+        machine, port, host = _aft(credits=100)
+        ok, _reg, _detail = host.prepare_transfer()
+        assert ok
+        result = host.transfer(AFTTransferRequest(
+            transaction_id="WIN0000001",
+            transfer_type=TRANSFER_TYPE_WIN_TO_HOST, cashable_cents=100))
+        assert result.outcome is AFTOutcome.REFUSED
+        assert result.final.status == AFTStatus.NO_WON_CREDITS_AVAILABLE
+        assert machine.keys_seen == [ZERO_KEY, machine.key]
+        assert host.key_mode.mode == KEY_MODE_ZERO
+        assert result.detail.endswith(
+            "(refused with a registration key of all zeros as well, status "
+            "0x8B)")
+        # and the next transfer starts with the zeros again
         result, detail = _push(host)
-        assert result.outcome is AFTOutcome.COMPLETED and tries() == 2
-        assert "registration refused" in detail      # the reason is kept
-        clock[0] += 2
-        _push(host)
-        assert tries() == 4
-        assert machine.credits == 1500
-        assert machine.keys_seen == [ZERO_KEY] * 3
+        assert result.outcome is AFTOutcome.COMPLETED
+        assert detail == "registration key of all zeros"
+        assert machine.keys_seen[-1] == ZERO_KEY
 
-    def test_registered_later_it_is_sent_its_key_again(self):
-        """The hub keeps asking for a registration (the aft_register
-        command, which is auto_register). When one takes, transfers go
-        back to carrying the machine's key, and the registration itself
-        was made with the rig key, not with the zeros."""
-        machine, port, host, _clock = _aft(
-            credits=0, registered=False, registers=False)
+    def test_on_an_unregistered_machine_such_a_refusal_is_not_retried(self):
+        """There is no key to offer, and registering a machine because it
+        refused a transfer for some other reason is not ours to do."""
+        machine, port, host = _aft(credits=100, registered=False)
+        ok, _reg, _detail = host.prepare_transfer()
+        assert ok
+        result = host.transfer(AFTTransferRequest(
+            transaction_id="WIN0000002",
+            transfer_type=TRANSFER_TYPE_WIN_TO_HOST, cashable_cents=100))
+        assert result.outcome is AFTOutcome.REFUSED
+        assert machine.keys_seen == [ZERO_KEY]
+        assert machine.registered is False
+        assert not [1 for c, code in _long_polls(port)
+                    if c == 0x73 and code != 0xFF]
+
+
+class TestAMachineThatRefusesTheZeros:
+    """Not what the document describes. If one exists, it answers 88 or 89,
+    nothing moves, and it is sent the same transfer again with its key."""
+
+    def test_registered_it_gets_the_transfer_with_its_own_key(self):
+        machine, port, host = _aft(credits=0, needs_registration=True)
+        result, _detail = _push(host)
+        assert result.outcome is AFTOutcome.COMPLETED
+        assert machine.credits == 500          # once, not twice
+        assert machine.keys_seen == [ZERO_KEY, machine.key]
+        assert result.detail == (
+            "the machine refused the transfer with a registration key of "
+            "all zeros (status 0x89); sent again with the machine's own "
+            "key: full transfer successful")
+        # two cycles on the machine, the second under a new id, and the
+        # result names the one that moved the credits
+        assert len(machine.started) == 2
+        assert machine.started[0] != machine.started[1]
+        assert result.request.transaction_id == machine.started[1]
+        assert host.key_sent == "machine"
+
+    def test_one_that_refuses_them_in_a_way_of_its_own(self):
+        """How the older Bally and Konami games that are said to fail on
+        the zeros answer is not known. Whatever failure code a registered
+        machine gives, its key is tried, and when the key is what made the
+        transfer go through the machine is sent its key from then on."""
+        machine, port, host = _aft(credits=0, zero_key_status=0x82)
+        result, _detail = _push(host)
+        assert result.outcome is AFTOutcome.COMPLETED
+        assert machine.credits == 500
+        assert machine.keys_seen == [ZERO_KEY, machine.key]
+        assert "status 0x82" in result.detail
+        assert "sent again with the machine's own key" in result.detail
+        assert result.request.transaction_id == machine.started[1]
+        assert (host.key_mode.mode, host.key_mode.status) == (
+            KEY_MODE_MACHINE, "0x82")
+        result, detail = _push(host)
+        assert detail == "already registered" and machine.credits == 1000
+        assert machine.keys_seen == [ZERO_KEY, machine.key, machine.key]
+
+    def test_it_is_remembered_and_the_next_transfer_takes_the_old_road(self):
+        """Poll for poll what every transfer was until v0.3.17: 73/FF to
+        prepare, 73/FF at the start of the transfer, the lock, the
+        transfer with the machine's key. No zeros a second time."""
+        machine, port, host = _aft(credits=0, needs_registration=True)
         _push(host)
-        assert host.registration_key == ZERO_KEY
-        machine.registers = True
-        ok, _reg, detail = host.auto_register()
-        assert ok and detail == "registered"
-        assert machine.key == RIG_KEY
+        assert host.key_mode.mode == KEY_MODE_MACHINE
+        assert host.key_mode.status == "0x89"
+        before = len(_long_polls(port))
         result, detail = _push(host)
         assert result.outcome is AFTOutcome.COMPLETED
         assert detail == "already registered"
-        assert machine.keys_seen == [ZERO_KEY, RIG_KEY]
+        assert _long_polls(port)[before:before + 4] == [
+            (0x73, 0xFF), (0x73, 0xFF), (0x74, 0x00), (0x72, 0x00)]
+        assert machine.keys_seen == [ZERO_KEY, machine.key, machine.key]
+        assert machine.credits == 1000
 
-
-    def test_the_transfer_paths_own_retry_registers_with_the_rig_key(self):
-        """Once the wait is over the transfer path tries the registration
-        again by itself. The key it offers is the rig key, not the zeros
-        the last transfer carried (a machine refuses a key of zero: "the
-        final registration key must be non-zero", §8.1)."""
-        machine, port, host, clock = _aft(
-            credits=0, registered=False, registers=False)
-        _push(host)
-        machine.registers = True
-        clock[0] += REGISTER_RETRY_SEC + 1
-        result, detail = _push(host)
+    def test_not_registered_it_is_registered_and_then_sent_the_transfer(
+            self):
+        machine, port, host = _aft(credits=0, registered=False,
+                                   needs_registration=True)
+        result, _detail = _push(host)
         assert result.outcome is AFTOutcome.COMPLETED
-        assert detail == "registered"
+        assert "status 0x88" in result.detail
         assert machine.registered and machine.key == RIG_KEY
         assert machine.keys_seen == [ZERO_KEY, RIG_KEY]
+        assert machine.credits == 500
 
+    def test_one_that_cannot_be_registered_either_is_refused(self):
+        """Where every unregistered machine stood before. The result is the
+        machine's refusal, with why nothing more could be done."""
+        machine, port, host = _aft(credits=0, registered=False,
+                                   registers=False, needs_registration=True)
+        result, _detail = _push(host)
+        assert result.outcome is AFTOutcome.REFUSED
+        assert result.final.status == AFTStatus.GAMING_MACHINE_NOT_REGISTERED
+        assert result.detail.startswith(
+            "the machine refused the transfer with a registration key of "
+            "all zeros (status 0x88) and could not be registered: "
+            "registration refused")
+        assert machine.credits == 0 and machine.keys_seen == [ZERO_KEY]
+        # and from now on it is prepared the old way, which says so before
+        # anything is sent
+        ok, _reg, detail = host.prepare_transfer()
+        assert ok is False and "registration refused" in detail
 
-class TestTheZeroKeyExperiment:
-    """SAS 6.02 §8.1 recommends a key of all zeros for every in-house
-    transfer. The satellite sends a registered machine its own key, because
-    that is what has been seen to work. transfer(key=ZERO_KEY) sends one
-    transfer the other way, to find out what a machine does with it."""
-
-    def test_a_machine_that_follows_the_document_takes_it(self):
-        machine, port, host, _clock = _aft(credits=0)
+    def test_a_refusal_of_its_own_key_is_not_sent_again(self):
+        """The second chance is for the zeros only. A machine in the old
+        mode that answers 89 to its own key (the key changed under us) is
+        refused once and that is the result."""
+        machine, port, host = _aft(credits=0, needs_registration=True)
+        _push(host)                                  # now in the old mode
         ok, _reg, _detail = host.prepare_transfer()
-        assert ok and host.registration_key == machine.key
-        before = len(_long_polls(port))
-        result = host.transfer(AFTTransferRequest(
-            transaction_id="ZERO0001",
-            transfer_type=TRANSFER_TYPE_HOST_TO_EGM, cashable_cents=100),
-            key=ZERO_KEY)
-        assert result.outcome is AFTOutcome.COMPLETED
-        assert machine.credits == 100 and machine.keys_seen == [ZERO_KEY]
-        # with no key to check, the transfer does not read 73 first
-        assert _long_polls(port)[before:before + 2] == [
-            (0x74, 0x00), (0x72, 0x00)]
-        # and the key the host holds for this machine is untouched
-        assert host.registration_key == machine.key
-
-    def test_a_machine_that_minds_refuses_and_the_next_push_is_normal(self):
-        machine, port, host, _clock = _aft(credits=0, needs_registration=True)
-        host.prepare_transfer()
-        result = host.transfer(AFTTransferRequest(
-            transaction_id="ZERO0002",
-            transfer_type=TRANSFER_TYPE_HOST_TO_EGM, cashable_cents=100),
-            key=ZERO_KEY)
+        assert ok and host.key_sent == "machine"
+        machine.key = bytes(reversed(machine.key))   # no longer what we hold
+        started = len(machine.started)
+        result = host.transfer(_request())
         assert result.outcome is AFTOutcome.REFUSED
         assert result.final.status == \
             AFTStatus.REGISTRATION_KEY_DOES_NOT_MATCH
-        assert machine.credits == 0
-        result, detail = _push(host, cents=100)
+        assert len(machine.started) == started + 1
+        assert "sent again" not in result.detail
+
+    def test_a_pull_is_sent_again_too(self):
+        machine, port, host = _aft(credits=2500, needs_registration=True)
+        result, _detail = _push(host, cents=2500, pull=True)
         assert result.outcome is AFTOutcome.COMPLETED
-        assert detail == "already registered" and machine.credits == 100
+        assert machine.credits == 0
         assert machine.keys_seen == [ZERO_KEY, machine.key]
 
-    def test_a_key_of_the_wrong_length_is_a_bug(self):
-        machine, port, host, _clock = _aft(credits=0)
-        host.prepare_transfer()
-        with pytest.raises(ValueError, match="exactly 20 bytes"):
-            host.transfer(AFTTransferRequest(
-                transaction_id="ZERO0003",
-                transfer_type=TRANSFER_TYPE_HOST_TO_EGM, cashable_cents=100),
-                key=b"\x00")
-
-    def test_the_hub_command(self):
-        """{"zeroKey": true} on the push command: the record says which key
-        went and that it was the experiment. A push without it says
-        "machine"."""
-        from test_sas_host_commands import _run_scripted
-        served = {"n": 0}
-
-        def script(i, reports):
-            if any(isinstance(r.get("aft"), dict) for r in reports):
-                served["n"] += 1
-                if served["n"] == 1:
-                    return {"commands": [
-                        {"id": "zero-1", "type": "aft_transfer", "cents": 100,
-                         "zeroKey": True}]}
-                if served["n"] == 40:
-                    return {"commands": [
-                        {"id": "plain-1", "type": "aft_transfer",
-                         "cents": 200}]}
-            return {}
-
-        run = _run_scripted(
-            "zerokeypush",
-            lambda: ByTheBookAFTMachine(credits=0, complete_in=2),
-            script, max_polls=400)
-        zero, plain = run["by_id"]["zero-1"], run["by_id"]["plain-1"]
-        assert (zero["ok"], zero["outcome"], zero["keySent"]) == (
-            True, "completed", "zero")
-        assert zero["experiment"] == "zero key to a registered machine"
-        assert (plain["ok"], plain["keySent"]) == (True, "machine")
-        assert "experiment" not in plain
-        machine = run["machine"]
-        assert machine.keys_seen == [ZERO_KEY, machine.key]
-        assert machine.credits == 300
+    def test_a_cash_out_request_is_answered_inside_the_one_call(self):
+        """The player pressed CASH OUT and the machine is waiting (eight
+        seconds, §8.7). The refusal, the second transfer and the credit to
+        the wallet all happen in the one answer, and the record carries the
+        id of the transfer that moved the credits."""
+        machine, port, host = _aft(credits=2500, needs_registration=True,
+                                   cashout_enabled=True)
+        requests = []
+        host.on_cashout_request = lambda a, code: requests.append(code)
+        machine.press_cashout()
+        host.poller.poll_once()
+        assert requests == [0x6A]
+        record = sas_host.answer_cashout_request(host, 0x6A, True, "p1")
+        assert (record["ok"], record["outcome"], record["amountCents"]) == (
+            True, "completed", 2500)
+        assert record["keySent"] == "machine"
+        assert record["txnId"] == machine.started[-1]
+        assert machine.credits == 0 and machine.ticketed == []
 
 
-class TestTheWholeSatelliteOnAnUnregisteredMachine:
-    def test_a_push_from_the_hub_lands(self):
-        from test_sas_host_commands import _run_scripted
-        served = {"done": False}
+class TestWhatIsRememberedAboutAMachine:
+    def test_it_survives_a_restart(self, tmp_path):
+        path = str(tmp_path / "aft_key_mode.json")
+        machine, port, host = _aft(key_mode=KeyModeStore(path), credits=0,
+                                   needs_registration=True)
+        _push(host)
+        again = KeyModeStore(path)
+        assert (again.mode, again.status) == (KEY_MODE_MACHINE, "0x89")
+        assert again.since
+        # a new satellite process on the same machine: no zeros this time
+        machine2, port2, host2 = _aft(key_mode=again, credits=0,
+                                      needs_registration=True)
+        result, _detail = _push(host2)
+        assert result.outcome is AFTOutcome.COMPLETED
+        assert machine2.keys_seen == [machine2.key]
 
-        def script(i, reports):
-            if not served["done"] and any(
-                    isinstance(r.get("aft"), dict) for r in reports):
-                served["done"] = True
-                return {"commands": [{"id": "push-1", "type": "aft_transfer",
-                                      "cents": 700, "accountId": "p1"}]}
-            return {}
+    def test_no_file_or_a_bad_one_means_the_zeros(self, tmp_path):
+        assert KeyModeStore(str(tmp_path / "none.json")).mode == KEY_MODE_ZERO
+        bad = tmp_path / "bad.json"
+        bad.write_text("{not json")
+        assert KeyModeStore(str(bad)).mode == KEY_MODE_ZERO
+        odd = tmp_path / "odd.json"
+        odd.write_text('{"mode": "something else"}')
+        assert KeyModeStore(str(odd)).mode == KEY_MODE_ZERO
 
-        run = _run_scripted(
-            "unregpush",
-            lambda: ByTheBookAFTMachine(credits=0, registered=False,
-                                        registers=False, complete_in=2),
-            script, max_polls=300)
+    def test_a_machine_that_takes_the_zeros_leaves_no_file(self, tmp_path):
+        path = tmp_path / "aft_key_mode.json"
+        machine, port, host = _aft(key_mode=KeyModeStore(str(path)),
+                                   credits=0)
+        _push(host)
+        assert not path.exists()
+
+
+def _run_push(key, **machine_kw):
+    from test_sas_host_commands import _run_scripted
+    served = {"done": False}
+
+    def script(i, reports):
+        if not served["done"] and any(
+                isinstance(r.get("aft"), dict) for r in reports):
+            served["done"] = True
+            return {"commands": [{"id": "push-1", "type": "aft_transfer",
+                                  "cents": 700, "accountId": "p1"}]}
+        return {}
+
+    return _run_scripted(
+        key, lambda: ByTheBookAFTMachine(credits=0, complete_in=2,
+                                         **machine_kw),
+        script, max_polls=300)
+
+
+def _key_modes(run):
+    return [r["aft"].get("keyMode") for r in run["reports"]
+            if isinstance(r.get("aft"), dict)]
+
+
+class TestTheWholeSatellite:
+    def test_a_push_to_a_machine_that_cannot_be_registered(self):
+        run = _run_push("unregpush", registered=False, registers=False)
         record = run["by_id"]["push-1"]
-        assert (record["ok"], record["outcome"]) == (True, "completed")
-        assert record["keySent"] == "zero" and "experiment" not in record
+        assert (record["ok"], record["outcome"], record["keySent"]) == (
+            True, "completed", "zero")
         assert run["machine"].credits == 700
         assert run["machine"].keys_seen[-1] == ZERO_KEY
-        # the report still says what the machine is: not registered
+        # the report says what the machine is, and which key it is sent
         assert any(isinstance(r.get("aft"), dict)
                    and r["aft"].get("registered") is False
                    for r in run["reports"])
+        assert set(_key_modes(run)) == {"zero"}
+
+    def test_a_push_to_a_machine_that_refuses_the_zeros(self):
+        run = _run_push("minds", needs_registration=True)
+        record = run["by_id"]["push-1"]
+        machine = run["machine"]
+        assert (record["ok"], record["outcome"], record["keySent"]) == (
+            True, "completed", "machine")
+        assert record["amountCents"] == 700 and machine.credits == 700
+        assert "with a registration key of all zeros" in record["detail"]
+        # the hub books the push under the id of the transfer that moved
+        # the credits, not the one that was refused
+        assert record["txnId"] == machine.started[-1]
+        assert machine.keys_seen == [ZERO_KEY, machine.key]
+        # the status block that carries keyMode runs every 30 seconds, so
+        # this short run only sees the mode it started in
+        assert _key_modes(run)[0] == "zero"

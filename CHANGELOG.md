@@ -9,13 +9,22 @@ The last four items of the SAS audit. With these it is complete.
   ticket back, or refuses the cash-out. The satellite now keeps polling
   through the wait. With a hub that answers at once, as it does on the
   same network, nothing changes on the wire.
-- **A machine that cannot be registered can still take a transfer.** The
-  satellite registers each machine for transfers and sends the machine's
-  registration key with every one; that is unchanged. A machine where the
-  registration would not complete used to get no transfer at all. It now
-  gets the transfer with a key of all zeros, which is what the SAS
-  document asks for on a transfer of this kind. A machine with no asset
-  number set is still refused, with the same message.
+- **Transfers no longer depend on registering the machine.** The
+  satellite used to register every machine and send the registration key
+  with each transfer, and a machine where the registration would not
+  complete got no transfer at all. The SAS document says registration is
+  for bank debit transfers and that transfers like ours should carry a
+  key of all zeros. They now do, and nothing is registered first. A
+  registered WMS Bluebird 2 was seen to take a push that way.
+- **A machine that refuses the zeros is sent its own key.** Some older
+  machines are said to fail on the zeros. A refused transfer moves
+  nothing, so the satellite sends the same transfer once more with the
+  machine's key (registering the machine first when its answer was "not
+  registered" or "key does not match"). If the key is what made it go
+  through, that machine is sent its key from then on, as before this
+  version. The hub's tile shows AFT as ready for a machine that needs no
+  registration, and the hub only registers the ones that do. A machine
+  with no asset number set is still refused, with the same message.
 - **Every machine event has a name.** 51 event codes showed in the log and
   on the hub as a bare number, such as "exception 0x7E" for every game
   start. All of them are named now, with the bill value on each bill
@@ -25,10 +34,7 @@ The last four items of the SAS audit. With these it is complete.
 - A machine set to an address that is also an event code (81 is "handpay
   pending") has that event read as an event. This was fixed in v0.3.13
   and is now covered by a test.
-- For trying a machine out: a push sent through the hub's command API
-  with `"zeroKey": true` carries the all-zero key even to a registered
-  machine, and its result says which key went. Nothing on the pages uses
-  it.
+- A transfer's result says which key it carried (`keySent`).
 
 ## v0.3.16
 Seventh and last batch from the SAS audit: meters, denominations and the

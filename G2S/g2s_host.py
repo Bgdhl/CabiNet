@@ -5994,6 +5994,14 @@ class G2SHost:
                                          0xFF),
                 "inHouseEnabled": in_house if isinstance(in_house, bool)
                                   else None,
+                # "zero": the satellite sends transfers with a registration
+                # key of all zeros, so the machine needs no registration
+                # (SAS 6.02 §8.1). "machine": this machine refused those
+                # and is sent its own key. None: a satellite older than
+                # v0.3.17, which registers every machine.
+                "keyMode": af.get("keyMode")
+                           if af.get("keyMode") in ("zero", "machine")
+                           else None,
             }
         # machine-info (denom code + identity), one-shot from the satellite's
         # 0x1F read. Attacker-typed like everything here — clamped to a fixed
@@ -6384,6 +6392,14 @@ class G2SHost:
                 # A good registration: clear the dedup so it is neither
                 # re-enqueued nor (the upsert already handled) clobbered; a
                 # later RAM clear re-arms the trigger from scratch.
+                self._aft_autoreg.pop(key, None)
+            elif aft.get("keyMode") == "zero":
+                # The satellite sends this machine's transfers with a
+                # registration key of all zeros, which needs no
+                # registration (SAS 6.02 §8.1: "Registration should not be
+                # used for in-house and bonus transactions"). Nothing to
+                # queue. If the machine ever refuses the zeros the
+                # satellite registers it itself and reports "machine".
                 self._aft_autoreg.pop(key, None)
             elif asset and sas_enabled:
                 # NOT registered but the operator asset is readable — the one
@@ -25222,21 +25238,6 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                         {"ok": False, "error": "lock must be a boolean"}),
                         "application/json", soap=False)
                 cmd["lock"] = lock
-            # Optional zeroKey:true sends this one push with a registration
-            # key of all zeros even to a registered machine. SAS 6.02 §8.1
-            # recommends that key for every in-house transfer; the satellite
-            # sends the machine's own key to a registered machine because
-            # that is what has been proven. This is the way to find out
-            # what a machine does with the zeros (it refuses with status 88
-            # or 89 if it minds, and no money moves). Raw endpoint only.
-            zero_key = req.get("zeroKey")
-            if zero_key is not None:
-                if not isinstance(zero_key, bool):
-                    return self._send(400, json.dumps(
-                        {"ok": False, "error": "zeroKey must be a boolean"}),
-                        "application/json", soap=False)
-                if zero_key:
-                    cmd["zeroKey"] = True
             # R1 funding parity: optional funding account. Money moves at
             # SETTLE time (debit-on-confirm of the echoed accountId), so
             # this is only a COURTESY pre-check — refuse a push a player

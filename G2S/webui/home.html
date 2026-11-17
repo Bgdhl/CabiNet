@@ -1837,11 +1837,15 @@ function denomMismatchChip(m, key){
   }
   return "";
 }
-/* SAS tile chips: AFT registration state + the last hub-command verdict.
-   m.aft = {registered, statusCode, asset, posId, keyFp} from /api/status. */
+/* SAS tile chips: AFT state + the last hub-command verdict.
+   m.aft = {registered, statusCode, asset, posId, keyFp, keyMode} from
+   /api/status. keyMode "zero" (satellite v0.3.17 on): transfers carry a
+   registration key of all zeros and the machine needs no registration, only
+   its asset number. "machine", or absent on an older satellite: the machine
+   has to be registered, and the hub registers it. */
 function sasAftChip(m){
   const a=m.aft; if(!a) return "";
-  if(a.registered){
+  if(a.registered || (a.keyMode==="zero" && a.asset)){
     // registered but the machine config has in-house transfers OFF (the
     // RAM-clear state) — registration survives, pushes refuse. Say so:
     // this is also why the machine is missing from the Wallet picker.

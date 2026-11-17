@@ -511,14 +511,18 @@ class ByTheBookAFTMachine(ByTheBookMachine):
     A key of all zeros is "registration not required" (Table 8.3a) and an
     in-house transfer with it is taken, registered or not. A machine made
     with needs_registration=True does not follow the document there: it
-    answers a zero key 88 until it is registered and 89 after."""
+    answers a zero key 88 until it is registered and 89 after. One made
+    with zero_key_status=NN answers a zero key with that code instead,
+    whatever its registration: a machine that minds the zeros and says so
+    in a way of its own."""
 
     def __init__(self, credits=0, honours_cancel=False, complete_after=None,
                  hears_initiate=True, restricted=0, complete_in=None,
                  cashout_controllable=False, cashout_enabled=False,
                  cashout_hard=False, registered=True, registers=True,
-                 needs_registration=False, **kw):
+                 needs_registration=False, zero_key_status=None, **kw):
         super().__init__(**kw)
+        self.zero_key_status = zero_key_status
         self.registered = registered
         self.registers = registers
         self.needs_registration = needs_registration
@@ -749,6 +753,8 @@ class ByTheBookAFTMachine(ByTheBookMachine):
             if not self.registered:
                 return 0x88
             return None if key == self.key else 0x89
+        if self.zero_key_status is not None:
+            return self.zero_key_status
         if self.needs_registration:
             return 0x89 if self.registered else 0x88
         return None
