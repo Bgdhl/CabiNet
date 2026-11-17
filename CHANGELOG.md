@@ -22,9 +22,11 @@ The last four items of the SAS audit. With these it is complete.
   machine's key (registering the machine first when its answer was "not
   registered" or "key does not match"). If the key is what made it go
   through, that machine is sent its key from then on, as before this
-  version. The hub's tile shows AFT as ready for a machine that needs no
-  registration, and the hub only registers the ones that do. A machine
-  with no asset number set is still refused, with the same message.
+  version. The hub still registers a machine when it joins, as it always
+  has, so the key is there if it is needed; the tile shows AFT as ready
+  as soon as the asset number is known, without waiting for that. A
+  machine with no asset number set is still refused, with the same
+  message.
 - **Every machine event has a name.** 51 event codes showed in the log and
   on the hub as a bare number, such as "exception 0x7E" for every game
   start. All of them are named now, with the bill value on each bill

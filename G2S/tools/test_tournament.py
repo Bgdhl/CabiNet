@@ -3078,9 +3078,10 @@ def main():
           {"aft": ea3.get("aft"), "ready": ea3.get("sasCashoutReady")})
 
     # ---------------------------------------------------------------
-    print("— v0.3.17: a satellite that sends transfers with a registration "
-          "key of all zeros (keyMode 'zero', SAS 6.02 8.1) needs no "
-          "registration, so the hub queues none")
+    print("— v0.3.17: the satellite says which registration key its "
+          "transfers carry (keyMode). The hub registers an unregistered "
+          "machine at join whichever it is, as it always has: a machine "
+          "that refuses the zeros can only be offered a key it has")
     queued = []
 
     def _enq(smib, cmd):
@@ -3093,11 +3094,13 @@ def main():
     d8.sas_report({"smibId": "smib-mi", "address": "1", "online": True,
                    "aft": {"registered": False, "asset": 77,
                            "keyMode": "zero"}}, "10.0.0.9")
-    check("unregistered + keyMode zero: NO aft_register is queued, and the "
-          "mode reaches the status",
-          queued == []
+    check("unregistered + keyMode zero: the registration IS queued, and "
+          "the mode reaches the status",
+          queued == ["aft_register"]
           and d8.sas_machines["smib-mi/1"]["aft"].get("keyMode") == "zero",
           (queued, d8.sas_machines["smib-mi/1"].get("aft")))
+    queued.clear()
+    d8._aft_autoreg = {}
     d8.sas_report({"smibId": "smib-mi", "address": "1", "online": True,
                    "aft": {"registered": False, "asset": 77,
                            "keyMode": "machine"}}, "10.0.0.9")

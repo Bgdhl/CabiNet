@@ -1534,7 +1534,10 @@ class AFTHost:
         §8.1 asks for that key on every in-house transfer ("registration
         not required", Table 8.3a); registration is "required for debit
         transfers", which this host never sends. So nothing is registered
-        here: one 73/FF is read for the machine's asset number, which the
+        here (the hub still asks for a registration when a machine joins,
+        the aft_register command, so that a key is there for a machine
+        that turns out to want one; a transfer does not wait for it): one
+        73/FF is read for the machine's asset number, which the
         machine checks on every 0x72 (status 93), with 7B and 74 as the
         other places to find it. No asset from any poll is a False.
 

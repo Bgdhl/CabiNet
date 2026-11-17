@@ -5995,10 +5995,11 @@ class G2SHost:
                 "inHouseEnabled": in_house if isinstance(in_house, bool)
                                   else None,
                 # "zero": the satellite sends transfers with a registration
-                # key of all zeros, so the machine needs no registration
-                # (SAS 6.02 §8.1). "machine": this machine refused those
-                # and is sent its own key. None: a satellite older than
-                # v0.3.17, which registers every machine.
+                # key of all zeros, which need no registration (SAS 6.02
+                # §8.1). "machine": this machine refused those and is sent
+                # its own key. None: a satellite older than v0.3.17, which
+                # always sends the key. The hub registers a machine at
+                # join in every case.
                 "keyMode": af.get("keyMode")
                            if af.get("keyMode") in ("zero", "machine")
                            else None,
@@ -6393,18 +6394,19 @@ class G2SHost:
                 # re-enqueued nor (the upsert already handled) clobbered; a
                 # later RAM clear re-arms the trigger from scratch.
                 self._aft_autoreg.pop(key, None)
-            elif aft.get("keyMode") == "zero":
-                # The satellite sends this machine's transfers with a
-                # registration key of all zeros, which needs no
-                # registration (SAS 6.02 §8.1: "Registration should not be
-                # used for in-house and bonus transactions"). Nothing to
-                # queue. If the machine ever refuses the zeros the
-                # satellite registers it itself and reports "machine".
-                self._aft_autoreg.pop(key, None)
             elif asset and sas_enabled:
                 # NOT registered but the operator asset is readable — the one
                 # case the hub can self-register. Enqueue once per (backed-off)
                 # cooldown, and only if no aft_register is already queued.
+                # This runs whatever key the satellite sends (aft.keyMode).
+                # A transfer with the key of all zeros needs no
+                # registration, but a machine that refuses the zeros is
+                # sent its own key, and for a refusal by any code but 88
+                # or 89 the satellite only has a key to offer when the
+                # machine is registered already. Registering at join, as
+                # always, is what keeps that second chance there after a
+                # RAM clear. (v0.3.17 skipped this for keyMode "zero" for
+                # one trial build; the owner asked, and it came back.)
                 # (sasEnabled false skips the trigger entirely: a parked
                 # satellite would only answer with an honest sas_disabled
                 # rejection, so queueing is pure churn.)

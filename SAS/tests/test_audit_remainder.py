@@ -438,6 +438,22 @@ class TestATransferCarriesAKeyOfAllZeros:
         assert not [1 for c, code in _long_polls(port)
                     if c == 0x73 and code != 0xFF]
 
+    def test_registering_a_machine_does_not_change_what_its_transfers_carry(
+            self):
+        """The hub asks for a registration when a machine joins
+        (aft_register, which is auto_register). The machine is registered
+        with the rig key, so a key is there if it ever wants one, and its
+        transfers go on carrying the zeros."""
+        machine, port, host = _aft(credits=0, registered=False)
+        ok, _reg, detail = host.auto_register()
+        assert ok and detail == "registered"
+        assert machine.registered and machine.key == RIG_KEY
+        result, detail = _push(host)
+        assert result.outcome is AFTOutcome.COMPLETED
+        assert detail == "registration key of all zeros"
+        assert machine.keys_seen == [ZERO_KEY]
+        assert host.key_mode.mode == KEY_MODE_ZERO
+
     def test_to_a_machine_that_cannot_be_registered(self):
         """Before: "cannot push — registration refused", and nothing was
         sent."""

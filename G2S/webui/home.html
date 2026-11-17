@@ -1840,9 +1840,10 @@ function denomMismatchChip(m, key){
 /* SAS tile chips: AFT state + the last hub-command verdict.
    m.aft = {registered, statusCode, asset, posId, keyFp, keyMode} from
    /api/status. keyMode "zero" (satellite v0.3.17 on): transfers carry a
-   registration key of all zeros and the machine needs no registration, only
-   its asset number. "machine", or absent on an older satellite: the machine
-   has to be registered, and the hub registers it. */
+   registration key of all zeros, so they work on a machine that is not
+   registered yet as long as its asset number is set. "machine", or absent
+   on an older satellite: transfers carry the machine's key and need it
+   registered. The hub registers a machine at join either way. */
 function sasAftChip(m){
   const a=m.aft; if(!a) return "";
   if(a.registered || (a.keyMode==="zero" && a.asset)){
