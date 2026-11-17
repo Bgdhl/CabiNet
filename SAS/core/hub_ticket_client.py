@@ -70,9 +70,16 @@ def derive_fallback_sid(smib_id: str) -> int:
     """Stable per-satellite fallback system ID in 02..09."""
     return FALLBACK_SYSTEM_ID + (zlib.crc32(str(smib_id).encode()) % 8)
 
-DEFAULT_TIMEOUT_SEC = 2.5     # per-call ceiling; the EGM holds the ticket
-#                               in escrow far longer, but the poll loop
-#                               should never stall behind a dead hub
+DEFAULT_TIMEOUT_SEC = 2.5     # ceiling for one WHOLE call: connect, send,
+#                               answer, and the one re-dial of a stale
+#                               connection, together. These calls run on the
+#                               poll thread with nothing going to the
+#                               machine meanwhile, and a machine that hears
+#                               no poll for five seconds takes the link for
+#                               down (SAS 6.02 §4.3): it hands the ticket
+#                               back, or refuses the cash-out. Until v0.3.16
+#                               this was a timeout on EACH socket step, so
+#                               one call could run to five seconds and more.
 SYNC_RETRY_SEC = 60.0         # dirty-state retry cadence
 SYNC_HEARTBEAT_SEC = 1800.0   # clean-state full re-push (heals a hub whose
 #                               db was reset/quarantined while we were idle)
@@ -100,6 +107,7 @@ class KeepAliveHTTPClient:
         self._netloc = u.netloc
         self._base_path = u.path or "/"
         self.timeout = timeout
+        self._clock = time.monotonic   # the whole-call deadline's clock
         self._tls = threading.local()
 
     def _drop(self) -> None:
@@ -130,15 +138,34 @@ class KeepAliveHTTPClient:
         retry, so a healthy hub never looks down at the first sporadic op."""
         path = self._base_path + path_suffix
         headers = {"Content-Type": "application/json"}
+        # ONE deadline for the whole call. Every socket step below gets
+        # only what is left of it (see DEFAULT_TIMEOUT_SEC).
+        deadline = self._clock() + self.timeout
+
+        def left():
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                raise OSError(f"hub call ran past its {self.timeout:g} s "
+                              "limit")
+            return remaining
+
+        def give(conn):
+            sock = getattr(conn, "sock", None)
+            if sock is not None:
+                sock.settimeout(left())
+
         for attempt in (0, 1):
             conn = getattr(self._tls, "conn", None)
             reused = conn is not None
-            if conn is None:
-                conn = self._conn_cls(self._netloc, timeout=self.timeout)
-                self._tls.conn = conn
             try:
+                if conn is None:
+                    conn = self._conn_cls(self._netloc, timeout=left())
+                    self._tls.conn = conn
+                give(conn)
                 conn.request("POST", path, body=body, headers=headers)
+                give(conn)
                 resp = conn.getresponse()
+                give(conn)
                 data = resp.read()      # drain fully before any reuse
             except Exception as e:
                 self._drop()

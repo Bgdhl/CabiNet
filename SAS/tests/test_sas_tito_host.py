@@ -682,7 +682,11 @@ class TestPollerIntegration:
         assert r1.ok and r2.ok
         assert r1.sequence != b"\x00\x00\x01"    # not the replayable constant
         assert r1.sequence != r2.sequence        # re-seed -> fresh space
-        assert r1.sequence == (1_783_900_000 & 0xFFFFFF).to_bytes(3, "big")
+        # a 3-byte BINARY field: least significant byte first (SAS 6.02
+        # §2.2.3). It went out most significant first until v0.3.16.
+        assert r1.sequence == (1_783_900_000 & 0xFFFFFF).to_bytes(3, "little")
+        assert int.from_bytes(r2.sequence, "little") \
+            - int.from_bytes(r1.sequence, "little") == 777   # and it rises
         # an EXPLICIT bench sequence still wins verbatim
         tito2 = SASTITOHost(SASPoller(MockSASSerialPort(TITOMachine()),
                                       address=1),

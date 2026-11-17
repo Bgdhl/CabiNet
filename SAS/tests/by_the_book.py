@@ -614,8 +614,8 @@ class ByTheBookAFTMachine(ByTheBookMachine):
 
     def _long(self, raw):
         command = raw[1]
-        if command not in (0x72, 0x73, 0x74):
-            return super()._long(raw)
+        if command not in (0x72, 0x73, 0x74) or command in self.deaf:
+            return super()._long(raw)       # (which keeps `deaf` deaf)
         if len(raw) < 4 or sas_crc(raw[:-2]).to_bytes(2, "little") != raw[-2:]:
             return b""
         if command == 0x73:

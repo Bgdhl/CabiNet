@@ -62,6 +62,8 @@ from dataclasses import dataclass, replace
 from typing import Callable, Optional
 
 from .sas_protocol import SASProtocol
+import zlib
+
 from .sas_implied_ack import transact_reread
 from .sas_wait import await_exception
 from .sas_meters import (
@@ -790,6 +792,16 @@ def capture_printed_ticket(transport, address: int, store: TicketStore,
                     address, "3D")
 
 
+def validation_machine_id(smib_id: str, address: int) -> bytes:
+    """A validation ID for long poll 4C that is this machine's own: the
+    3 wire bytes (binary, least significant first) of a number worked out
+    from the satellite's id and the machine's SAS address. Stable, so a
+    re-seed after a RAM clear gives the machine the same ID; never zero,
+    which long poll 4C reads as "tell me the current ID"."""
+    n = zlib.crc32(f"{smib_id}/{int(address)}".encode("utf-8")) & 0xFFFFFF
+    return (n or 1).to_bytes(3, "little")
+
+
 def _persist_4d(store, rec, address, note="") -> TicketCaptureResult:
     """Store a 0x4D record — if its type says it is a ticket."""
     kind, label = validation_kind(rec.validation_type)
@@ -803,10 +815,18 @@ def _persist_4d(store, rec, address, note="") -> TicketCaptureResult:
         note = f" · {label}{note}"
     elif kind == "unknown":
         note = f" · {label}; stored as a cash ticket{note}"
+    # The issue time is OURS (the store stamps it), not the date in the
+    # record. That date is the machine's own clock, which nothing here sets
+    # or checks, and which is wrong after a RAM clear or with a dead clock
+    # battery. The hub works ticket expiry from the issue time: a ticket
+    # stamped with a date years back counts as long expired and is removed
+    # at the next reap, leaving fresh paper the hub does not know (SAS 6.02
+    # audit, item 22). The machine's date is kept beside it for the record.
+    extra = {"validationType": rec.validation_type}
+    if rec.when:
+        extra["machineTime"] = rec.when.isoformat()
     out = _persist(store, rec.validation_number, rec.amount_cents, address,
-                   "4D", ticket_number=rec.ticket_number_le,
-                   issued_at=rec.when.isoformat() if rec.when else None,
-                   extra={"validationType": rec.validation_type})
+                   "4D", ticket_number=rec.ticket_number_le, extra=extra)
     return replace(out, detail=out.detail + note,
                    validation_type=rec.validation_type)
 
@@ -1350,9 +1370,17 @@ class SASTITOHost:
                  system_id: int = DEFAULT_SYSTEM_ID,
                  payload_style: str = DEFAULT_PAYLOAD_STYLE,
                  pace: float = SAS_POLL_FLOOR,
-                 sleep: Callable[[float], None] = time.sleep):
+                 sleep: Callable[[float], None] = time.sleep,
+                 machine_id: Optional[bytes] = None):
         self.poller = poller
         self.store = store
+        # The 3 wire bytes of this machine's validation ID for long poll 4C
+        # (validation_machine_id). None keeps the old one, the same on every
+        # machine: 00 00 <system id>.
+        if machine_id is not None and (len(machine_id) != 3
+                                       or not any(machine_id)):
+            raise ValueError("the validation machine ID is 3 bytes, not zero")
+        self.machine_id = machine_id
         self.auto_redeem = auto_redeem
         self.auto_service = auto_service
         self.on_ticket_issued = on_ticket_issued
@@ -1503,9 +1531,17 @@ class SASTITOHost:
         validation numbers and print without the host — the whole point of
         enhanced vs. system validation. Cooldown-gated: a 0x3F still queued for
         a poll or two after a successful seed must not re-fire 0x4C and reset
-        the starting sequence. The 3-byte ID is derived from system_id so the
-        EGM's 0x4D barcodes carry our system-ID namespace (byte order is a
-        guide gap — VERIFY_ON_BENCH against the first real 0x4D capture).
+        the starting sequence.
+
+        The two fields (SAS 6.02 Table 15.6a) are 3-byte BINARY, so they go
+        least significant byte first (§2.2.3). The machine ID is this
+        machine's own (`machine_id`, from validation_machine_id): the
+        document asks that IDs be allocated so that validation numbers stay
+        unique, and a secure enhanced number is computed from the ID and
+        the sequence alone. It says nothing about a "system ID namespace";
+        in a secure enhanced number the system ID is always 00. Until
+        v0.3.16 every machine was given the same ID (00 00 <system id>),
+        so two machines were kept apart only by when they were seeded.
 
         REPLAY GUARD (2026-07-12): the enhanced vn is a DETERMINISTIC function
         of (validation ID, sequence) — re-seeding a RAM-cleared EGM with the
@@ -1515,18 +1551,22 @@ class SASTITOHost:
         starting sequence is now derived from wall-clock seconds instead, so
         every re-seed starts in fresh number space. Wraps every ~194 days
         (3-byte space); the hub's collision re-issue is the backstop. An
-        explicitly-passed non-default seed_sequence still wins (bench use)."""
+        explicitly-passed non-default seed_sequence still wins (bench use).
+        That value is sent least significant byte first, like any binary
+        field; until v0.3.16 it went most significant first, so what the
+        machine took as its starting sequence was the clock value with its
+        bytes reversed, which jumps about instead of rising."""
         now = time.monotonic()
         if not force and (now - self._last_seed_at) < self._seed_cooldown:
             return None
         self._last_seed_at = now
-        vid = bytes([0, 0, self.system_id & 0xFF])
+        vid = self.machine_id or bytes([0, 0, self.system_id & 0xFF])
         seq = self._seed_seq
         if seq == b"\x00\x00\x01":
             # replay guard: fresh number space per seed (see docstring); the
             # EGM echoes the accepted sequence in the ValidationIdResult the
             # on_validation_seeded callback logs, so the value is journaled.
-            seq = (int(time.time()) & 0xFFFFFF).to_bytes(3, "big")
+            seq = (int(time.time()) & 0xFFFFFF).to_bytes(3, "little")
         result = self.configure_validation_id(vid, seq)
         self.poller._safe(self.on_validation_seeded, self.poller.address,
                           result)

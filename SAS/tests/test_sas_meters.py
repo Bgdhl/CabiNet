@@ -138,8 +138,12 @@ class TestPollBuilders:
         frame = build_selected_meters_poll_6f(1, 0, [0x0024])
         body = bytes.fromhex("016f0400002400")   # len = 2 + 1 code * 2 = 4
         assert frame == body + crc_le(body)
+        # twelve codes, the most Table 7.21a allows (length 1A); thirteen
+        # is refused. Until v0.3.16 the builder stopped at eleven.
+        twelve = build_selected_meters_poll_6f(1, 0, list(range(12)))
+        assert twelve[2] == 0x1A
         with pytest.raises(ValueError):
-            build_selected_meters_poll_6f(1, 0, list(range(12)))
+            build_selected_meters_poll_6f(1, 0, list(range(13)))
 
 
 class TestSingleMeterParsers:
@@ -149,9 +153,10 @@ class TestSingleMeterParsers:
             parse_single_meter(b"\x00\x00\x00")
 
     def test_single_meter_command_coverage(self):
-        """§4.4.2-.22: every lone 4-byte-BCD meter the guide documents."""
+        """§4.4.2-.22: every lone 4-byte-BCD meter the guide documents,
+        and 0x14, the total jackpot meter of SAS 6.02 Table B-1."""
         assert set(SINGLE_METER_COMMANDS) == {
-            0x10, 0x11, 0x12, 0x13, 0x15, 0x16, 0x17, 0x1A, 0x20,
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x1A, 0x20,
             0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x46}
 
     def test_composite_0f(self):

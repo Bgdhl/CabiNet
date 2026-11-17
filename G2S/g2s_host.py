@@ -125,7 +125,7 @@ if "tournament_names" not in _hub_store_mod.HOST_SETTING_KEYS:
 # the MINOR bump per the repo's version rule). Surfaced in engine_meta() ->
 # /api/status ["_engine"]["version"]; bump this and add a CHANGELOG.md
 # section on every commit with a user-visible change.
-CABINET_VERSION = "0.3.15"
+CABINET_VERSION = "0.3.16"
 
 WSDL_NS = "http://www.gamingstandards.com/wsdl/g2s/v1.0"
 SCHEMA_NS = "http://www.gamingstandards.com/g2s/schemas/v1.0.3"
@@ -6049,6 +6049,12 @@ class G2SHost:
                                  and 1 <= c <= 0x3F and float(c).is_integer()]
             entry["machineInfo"] = {
                 "denomCode": _mbi(mi.get("denomCode"), 0xFF),
+                # the satellite's reading of that code in SAS Table C-4
+                # (whole cents; None for the sub-cent codes and on an older
+                # satellite). Information only: the suggestion below works
+                # from the hub's own table, and money from the operator's
+                # setting.
+                "denomCodeCents": _mbi(mi.get("denomCodeCents"), 500000),
                 "playerDenoms": player_denoms,
                 "currentPlayerDenom": _mbi(mi.get("currentPlayerDenom"), 0x3F),
                 "denomsAt": _ms(mi.get("denomsAt"), 32),
@@ -9293,25 +9299,34 @@ class G2SHost:
             return 1, True
         return denom, False
 
-    # SAS Table C-4 (denomination code -> cents), BENCH-VERIFIED ROWS ONLY.
-    # The table itself is off-disk (the 6.01 PDF is an excerpt that stops
-    # before Appendix C — re-checked 2026-07-22), so every row here must come
-    # from a REAL machine whose denomination is independently known: a bench
-    # cabinet or a forum member's support bundle. Never add a row from memory
-    # or another implementation — a wrong row would put a confidently-wrong
-    # suggestion in front of the operator. Codes not in this dict surface as
-    # state="unverified" (raw code shown, operator sets denom manually).
+    # SAS Table C-4 (denomination code -> cents), from SAS 6.02 Appendix C:
+    # every code whose value is a whole number of cents. The five codes for
+    # fractions of a cent (1B-1F) are left out; this hub's denomination
+    # setting is whole cents, so those surface as state="unverified" (raw
+    # code shown, operator sets the denomination by hand), as does any code
+    # the document reserves.
+    #
+    # Until v0.3.16 this held ONE row, the Bluebird 2's code 01, under a
+    # rule of bench-verified rows only, because the table was not to hand
+    # (the document on disk then stopped before Appendix C). It is now, and
+    # the satellite's copy (SAS/core/sas_protocol.DENOM_CODE_CENTS) was
+    # checked against it row by row. So a 25-cent machine is offered "25"
+    # to confirm instead of a bare code. It is still only OFFERED: the
+    # denomination law below stands (read-to-suggest, operator-confirm).
+    #
     # NOTE the accounting denom is CONFIGURATION (set up at RAM clear), not
     # machine identity — and on a MULTI-denom setup it is REQUIRED to be the
     # minimum denom, in practice $0.01 (AJ 2026-07-22), so every multi-denom
     # cabinet reads code 0x01. Non-0x01 codes come from single-denom (or
-    # higher-minimum) configurations — mostly forum support bundles, not this
-    # bench. A row is verified by knowing the configured denom independently
-    # of the code it produces. (The cabinet's HARD mechanical meters may run
-    # at the HIGHEST denom on most titles — never reconcile wire meters
-    # against a photo of the hard meters.)
+    # higher-minimum) configurations. (The cabinet's HARD mechanical meters
+    # may run at the HIGHEST denom on most titles — never reconcile wire
+    # meters against a photo of the hard meters.)
     SAS_C4_DENOM_CENTS = {
-        0x01: 1,     # $0.01 — BB2, multi-denom accounting min, live read 2026-07-22
+        0x01: 1, 0x02: 5, 0x03: 10, 0x04: 25, 0x05: 50, 0x06: 100,
+        0x07: 500, 0x08: 1000, 0x09: 2000, 0x0A: 10000, 0x0B: 20,
+        0x0C: 200, 0x0D: 250, 0x0E: 2500, 0x0F: 5000, 0x10: 20000,
+        0x11: 25000, 0x12: 50000, 0x13: 100000, 0x14: 200000,
+        0x15: 250000, 0x16: 500000, 0x17: 2, 0x18: 3, 0x19: 15, 0x1A: 40,
     }
 
     @classmethod
@@ -9320,10 +9335,10 @@ class G2SHost:
         read-to-suggest + operator-confirm; _sas_denom_cents stays the only
         money seam). Returns a fresh dict {code, cents, state} or None when
         the satellite hasn't reported a machineInfo/denomCode. States:
-          confirm    — verified C-4 row, operator denom unset: offer it
-          match      — verified row agrees with the operator's setting
-          mismatch   — verified row DISAGREES: someone's wrong, wave a flag
-          unverified — code has no bench-verified row yet: show it raw
+          confirm    — a C-4 row, operator denom unset: offer it
+          match      — the row agrees with the operator's setting
+          mismatch   — the row DISAGREES: someone's wrong, wave a flag
+          unverified — no whole-cent row for this code: show it raw
         None (key absent on /api/status) doubles as the UI's feature/older-hub
         detect — the suggestion row renders nothing when absent."""
         mi = entry.get("machineInfo")

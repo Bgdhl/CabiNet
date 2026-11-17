@@ -29,10 +29,9 @@ Known guide ambiguities, flagged rather than guessed:
     asset number or house ID") — exposed as raw bytes.
     TODO(bench): confirm byte order against the machine's own asset-number
     config screen before treating it as an integer key.
-  * 0x1F denomination code (byte 8): "binary format" — the code->coin-value
-    table is in the full SAS spec (not the guide), so the raw code is exposed
-    un-translated. TODO(bench): add the cited denom table from the real SAS
-    spec; do NOT guess it. The accounting denom is CONFIGURATION (set up at
+  * 0x1F denomination code (byte 8): "binary format". Its value is SAS
+    6.02 Table C-4, held in sas_protocol.DENOM_CODE_CENTS and read with
+    denom_code_cents(). The accounting denom is CONFIGURATION (set up at
     RAM clear), not machine identity — and a MULTI-denom setup is REQUIRED to
     account at its minimum denom, in practice $0.01 (AJ 2026-07-22), so every
     multi-denom cabinet reads code 0x01; other codes come from single-denom /
@@ -161,15 +160,18 @@ def parse_selected_game_number(data: bytes) -> Optional[int]:
 
 def parse_enabled_game_numbers(data: bytes) -> List[Optional[int]]:
     """§4.5.6 (0x56): length (1B), number of games (1B binary), then 2-byte
-    game numbers. Decoded as BCD — see the BCD-vs-ASCII TODO(bench)."""
+    game numbers. Decoded as BCD — see the BCD-vs-ASCII TODO(bench).
+    Bytes after the last game number are ignored (SAS 6.02 §2.2.3); fewer
+    than the count calls for is still an error."""
     if len(data) < 2:
         raise ValueError("56 response too short")
     declared, count = data[0], data[1]
     if declared != len(data) - 1:
         raise ValueError(f"56 length byte {declared} != {len(data) - 1}")
-    if len(data) - 2 != 2 * count:
-        raise ValueError(f"56 game count {count} != payload of {len(data) - 2} bytes")
-    return [bcd_to_int(data[i:i + 2]) for i in range(2, len(data), 2)]
+    if len(data) - 2 < 2 * count:
+        raise ValueError(f"56 game count {count} needs {2 * count} bytes, "
+                         f"payload has {len(data) - 2}")
+    return [bcd_to_int(data[i:i + 2]) for i in range(2, 2 + 2 * count, 2)]
 
 
 def build_extended_validation_status_poll(address: int,
@@ -229,9 +231,11 @@ class ExtendedValidationStatus:
 
 def parse_extended_validation_status(data: bytes) -> ExtendedValidationStatus:
     """§4.4.26 (0x7B): length (1B), asset number (4B), status bits (2B),
-    cashable-ticket expiration (2B), restricted-ticket expiration (2B)."""
-    if len(data) != 11:
-        raise ValueError(f"7B: expected 11 data bytes, got {len(data)}")
+    cashable-ticket expiration (2B), restricted-ticket expiration (2B).
+    Anything after those is ignored (SAS 6.02 §2.2.3)."""
+    if len(data) < 11:
+        raise ValueError(f"7B: expected at least 11 data bytes, got "
+                         f"{len(data)}")
     declared = data[0]
     if declared != len(data) - 1:
         raise ValueError(f"7B length byte {declared} != {len(data) - 1}")

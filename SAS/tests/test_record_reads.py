@@ -376,7 +376,7 @@ class TestOnlyATicketIsStored:
         assert result.validation_type == vtype
         assert result.detail == "ticket recorded via 4D"
         assert store.get(VN)["state"] == ISSUED
-        assert store.get(VN)["extra"] == {"validationType": vtype}
+        assert store.get(VN)["extra"]["validationType"] == vtype
 
     @pytest.mark.parametrize("vtype", sorted(PLAYABLE_ONLY_TICKET_TYPES))
     def test_a_playable_only_ticket_is_still_a_ticket(self, tmp_path, vtype):
@@ -391,7 +391,7 @@ class TestOnlyATicketIsStored:
         assert "restricted" in result.detail
         assert store.get(VN)["state"] == ISSUED
         assert store.get(VN)["amountCents"] == AMOUNT
-        assert store.get(VN)["extra"] == {"validationType": vtype}
+        assert store.get(VN)["extra"]["validationType"] == vtype
 
     @pytest.mark.parametrize("vtype", NOT_TICKETS)
     def test_anything_else_in_the_buffer_is_not(self, tmp_path, vtype):

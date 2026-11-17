@@ -35,6 +35,7 @@ __all__ = [
     "MeterSnapshot", "GameMeters", "LastBill", "EnabledFeatures",
     "ValidationMeters", "CashoutTicketInfo", "ValidationRecord",
     "build_meter_poll", "build_rom_signature_poll",
+    "build_enabled_features_poll",
     "build_game_meters_poll", "build_game_config_poll",
     "build_selected_meters_poll_2f", "build_selected_meters_poll_6f",
     "build_validation_meters_poll", "build_enhanced_validation_info_poll",
@@ -138,8 +139,12 @@ RECEIVE_VALIDATION_NUMBER = 0x58
 TYPE_R_POLLS = frozenset({
     0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A,
     0x1E, 0x1F, 0x20, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x46,
-    0x48, 0x51, 0x54, 0x55, 0x56, 0x3D, 0x57, 0x7E, 0xA0, 0xB1, 0xB2,
+    0x48, 0x51, 0x54, 0x55, 0x56, 0x3D, 0x57, 0x7E, 0xB1, 0xB2,
 })
+# 0xA0 (send enabled features) was in this table until v0.3.16. It is type
+# M: [addr][A0][game number 2 BCD][CRC] (SAS 6.02 Table 7.14a). Sent bare,
+# a machine is left waiting for the rest of the frame. Use
+# build_enabled_features_poll.
 
 _PROTO = SASProtocol()          # stateless; safe to share
 
@@ -156,6 +161,14 @@ def build_meter_poll(address: int, command: int) -> bytes:
             f"0x{command:02X} is not a guide-documented type R poll; "
             "use its dedicated builder (it carries data + CRC)")
     return _PROTO.build_short_poll(address, command)
+
+
+def build_enabled_features_poll(address: int, game_number: int = 0) -> bytes:
+    """Long poll A0, send enabled features (SAS 6.02 Table 7.14a):
+    [addr][A0][game number 2 BCD][CRC]. Game 0000 is the gaming machine."""
+    if not 0 <= game_number <= 9999:
+        raise ValueError("game number is 0000-9999")
+    return _crc_frame(bytes([address, 0xA0]) + int_to_bcd(game_number, 2))
 
 
 def build_rom_signature_poll(address: int, seed: bytes) -> bytes:
@@ -213,7 +226,9 @@ def build_selected_meters_poll_2f(address: int, game_number: int,
 def build_selected_meters_poll_6f(address: int, game_number: int,
                                   meter_codes: List[int]) -> bytes:
     """§4.4.25 (0x6F): [addr][6F][len][game# 2-byte BCD][code lo][code hi]...
-    [crc]. Meter codes are TWO bytes each; max 11; game 0000 = whole machine.
+    [crc]. Meter codes are TWO bytes each; game 0000 = whole machine. Up to
+    12 codes (SAS 6.02 Table 7.21a: one requested code "plus a maximum of
+    11 additional", length up to 1A); this stopped at 11 until v0.3.16.
 
     TODO(bench): the guide says only "meter code ... binary format" for the
     2-byte code; we transmit it LSB-first to match SAS's convention for
@@ -224,8 +239,8 @@ def build_selected_meters_poll_6f(address: int, game_number: int,
     round-trip regardless — interop still needs the order confirmed against
     the full SAS spec / a live machine.
     """
-    if not 1 <= len(meter_codes) <= 11:
-        raise ValueError("6F takes 1..11 meter codes")
+    if not 1 <= len(meter_codes) <= 12:
+        raise ValueError("6F takes 1..12 meter codes")
     body = bytes([address, 0x6F, 2 + 2 * len(meter_codes)])
     body += int_to_bcd(game_number, 2)
     for code in meter_codes:
@@ -255,9 +270,9 @@ def build_set_validation_id_poll(address: int, validation_id: bytes,
     as raw wire bytes ("binary format") — set validation_id to b'\\x00'*3 to
     READ the current ID/sequence instead of setting them.
 
-    TODO(bench): byte order of the 3-byte binary fields is not specified in
-    the guide; keep them as opaque bytes until the full SAS spec / a live
-    machine settles it.
+    Both are 3-byte binary fields (SAS 6.02 Table 15.6a), so by §2.2.3 the
+    least significant byte goes first. This builder takes the wire bytes as
+    given; the caller packs them.
     """
     if len(validation_id) != 3 or len(sequence) != 3:
         raise ValueError("validation ID and sequence are 3 bytes each")
@@ -315,6 +330,7 @@ SINGLE_METER_COMMANDS: Dict[int, str] = {
     0x11: "coin_in",
     0x12: "coin_out",
     0x13: "total_drop",
+    0x14: "jackpot",                    # total jackpot meter (Table B-1)
     0x15: "games_played",
     0x16: "games_won",
     0x17: "games_lost",
@@ -434,6 +450,8 @@ class EnabledFeatures:
     # milliseconds". Older machines that support 40 ms "are not guaranteed
     # to set this bit"; see supports_fast_polling.
     polling_40ms: bool = False
+    # Features3 bit 1: multiple SAS progressive win reporting (long poll 87)
+    multi_progressive_wins: bool = False
 
     @property
     def supports_fast_polling(self) -> bool:
@@ -469,6 +487,7 @@ def parse_enabled_features(data: bytes) -> EnabledFeatures:
         aft=bool(msb & 0x40),
         multi_denom_extensions=bool(msb & 0x80),
         polling_40ms=bool(data[4] & 0x01),
+        multi_progressive_wins=bool(data[4] & 0x02),
     )
 
 
@@ -506,7 +525,11 @@ def parse_selected_meters_6f(data: bytes) -> Dict[str, object]:
     [meter code 2B][size 1B][value size-byte BCD]. Self-describing thanks to
     the per-meter size byte. Returns {'game_number': n,
     'meters': {code: value}}. Meter-code byte order: see
-    build_selected_meters_poll_6f's TODO(bench)."""
+    build_selected_meters_poll_6f's TODO(bench).
+
+    A size byte of 00 means the machine does not keep that meter (SAS 6.02
+    Table 7.21b); its value is None. It was 0 until v0.3.16, and §7.1 says
+    why that will not do: a zero is a reading."""
     if len(data) < 3:
         raise ValueError("6F response too short")
     declared = data[0]
@@ -523,7 +546,7 @@ def parse_selected_meters_6f(data: bytes) -> Dict[str, object]:
         i += 3
         if i + size > len(data):
             raise ValueError("6F meter value overruns frame")
-        meters[code] = bcd_to_int(data[i:i + size])
+        meters[code] = bcd_to_int(data[i:i + size]) if size else None
         i += size
     return {"game_number": game_number, "meters": meters}
 
