@@ -20,6 +20,11 @@ does what the document says an EGM does in the uncommon cases:
   * it writes & < " inside an attribute as entity references (§1.11);
   * a host that answers G2S_MSX003 makes it start again with commsOnLine,
     and its inbound queue can be full (G2S_MSX006, §1.18.11);
+  * it enters a configuration mode only once it is idle, which can be
+    after it answered the request, and stays out of play until told to
+    leave (§8.7, §9.7); it refuses a set that changes a parameter it marks
+    canModRemote=false (G2S_OCX015, §9.15); its unsolicited commHostList
+    carries only the hosts that changed (§8.13);
   * an error answer carries the request's sessionId and no command
     (§1.18.3.3), a long list comes in several commands with sessionMore
     (§1.18.3.2), and it looks for sessionRetry on an answer it has had
@@ -1276,6 +1281,539 @@ def item_42_a_request_past_its_time_to_live():
           a.stale_requests)
 
 
+# ---------------------------------------------------------------------------
+# batch 3: configuration modes, option permissions, the ownership claim
+# ---------------------------------------------------------------------------
+
+def sent_since(host, mark):
+    return [c for _l, x in host.sent[mark:] for c in commands(x)]
+
+
+def names(cmds):
+    return [name for _c, name, _a, _e in cmds]
+
+
+def online(egm):
+    egm.assoc.comms_state = "onLine"        # the handshake had completed
+    return egm
+
+
+def answer_to(egm, cls, command, body, device="1"):
+    """The EGM's RESPONSE to the newest request of that name from the host
+    (same sessionId, as §1.18.3.2 requires)."""
+    sid = [s for s, r in egm.assoc.sent_requests.items()
+           if r["command"] == command][-1]
+    egm.cid += 1
+    ts = gh.now_iso()
+    return egm._deliver(
+        f'<g2s:g2sMessage xmlns:g2s="{gh.SCHEMA_NS}">'
+        f'<g2s:g2sBody g2s:egmId="{egm.egm_id}" g2s:hostId="1" '
+        f'g2s:dateTimeSent="{ts}"><g2s:{cls} g2s:deviceId="{device}" '
+        f'g2s:commandId="{egm.cid}" g2s:sessionType="G2S_response" '
+        f'g2s:sessionId="{sid}" g2s:timeToLive="0" g2s:dateTime="{ts}">'
+        f'{body}</g2s:{cls}></g2s:g2sBody></g2s:g2sMessage>'), sid
+
+
+def event(egm, code, cls="G2S_optionConfig"):
+    egm.event_id = getattr(egm, "event_id", 5000) + 1
+    return egm.send(
+        "eventHandler",
+        f'<g2s:eventReport g2s:deviceClass="{cls}" g2s:deviceId="1" '
+        f'g2s:eventCode="{code}" g2s:eventId="{egm.event_id}" '
+        f'g2s:eventDateTime="{egm.stamp()}" g2s:transactionId="0"/>')
+
+
+def mode_status(on):
+    return f'<g2s:optionConfigModeStatus g2s:enabled="{str(on).lower()}"/>'
+
+
+def exits(cmds, which="enterOptionConfigMode"):
+    return [a for _c, name, a, _e in cmds
+            if name == which and a.get("enable") == "false"]
+
+
+def items_5_and_8_a_machine_left_in_a_config_mode():
+    print("— audit item 5: a denomination change whose write is never "
+          "answered (§9.7: in the mode \"the EGM MUST NOT allow game play\")")
+    host = make_host()
+    egm = online(joined(host, "BTB_ceremony"))
+    a = egm.assoc
+    host.start_denom_ceremony(a, "1", [1000, 5000])
+    drain(host, a)
+    mark = len(host.sent)
+    answer_to(egm, "optionConfig", "enterOptionConfigMode", mode_status(True),
+              device="1")
+    got = names(sent_since(host, mark))
+    check("the mode opens and the write goes out",
+          a.denom_ceremony["stage"] == "writing"
+          and "setActiveDenoms" in got, got)
+    # the machine acknowledges the write and says no more
+    mark = len(host.sent)
+    host.sweep_config_modes(now=time.time() + gh.CEREMONY_WRITE_DEADLINE_SEC
+                            - 5)
+    drain(host, a)
+    check("inside the deadline nothing is done",
+          a.denom_ceremony["stage"] == "writing"
+          and not exits(sent_since(host, mark)))
+    host.sweep_config_modes(now=time.time() + gh.CEREMONY_WRITE_DEADLINE_SEC
+                            + 1)
+    drain(host, a)
+    check("past it, the exit is sent (it never was: the machine stayed "
+          "locked until someone posted the exit by hand)",
+          a.denom_ceremony["stage"] == "exiting"
+          and len(exits(sent_since(host, mark))) == 1,
+          (a.denom_ceremony, names(sent_since(host, mark))))
+
+    print("— an exit the machine does not take is sent again")
+    exit_sid = [s for s, r in a.sent_requests.items()
+                if r["command"] == "enterOptionConfigMode"
+                and r["attrs"].get("enable") == "false"][-1]
+    egm.refuse("optionConfig", exit_sid, "G2S_APX011", device="1")
+    check("an error answering the exit does not end the matter",
+          a.denom_ceremony["stage"] == "exiting", a.denom_ceremony)
+    mark = len(host.sent)
+    host.sweep_config_modes(now=time.time() + 5)
+    drain(host, a)
+    check("not again within %d s" % gh.MODE_EXIT_RESEND_SEC,
+          not exits(sent_since(host, mark)))
+    a.mode_exit_sent["optionConfig"] -= gh.MODE_EXIT_RESEND_SEC + 1
+    host.sweep_config_modes()
+    drain(host, a)
+    again = sent_since(host, mark)
+    check("after that it goes again, with the mode asked for alongside",
+          len(exits(again)) == 1
+          and "getOptionConfigModeStatus" in names(again), names(again))
+    answer_to(egm, "optionConfig", "getOptionConfigModeStatus",
+              mode_status(False))
+    check("and when the machine says the mode is off, the change is closed",
+          a.denom_ceremony["stage"] == "done", a.denom_ceremony)
+
+    print("— a machine that never leaves: the hub says so and keeps it "
+          "visible")
+    host.start_denom_ceremony(a, "1", [1000])
+    drain(host, a)
+    answer_to(egm, "optionConfig", "enterOptionConfigMode", mode_status(True))
+    host.sweep_config_modes(now=time.time() + gh.CEREMONY_WRITE_DEADLINE_SEC
+                            + 1)
+    for _ in range(gh.CEREMONY_EXIT_TRIES + 2):
+        a.mode_exit_sent["optionConfig"] = 0
+        host.sweep_config_modes()
+    drain(host, a)
+    check("after %d exits the change is marked stuck, not forgotten"
+          % gh.CEREMONY_EXIT_TRIES, a.denom_ceremony["stage"] == "stuck",
+          a.denom_ceremony)
+
+    print("— audit item 8: a machine that enters the mode LATER than it "
+          "answered (§9.7 lets it wait for zero credits and an idle "
+          "cabinet)")
+    host = make_host()
+    egm = online(joined(host, "BTB_late"))
+    a = egm.assoc
+    host.start_denom_ceremony(a, "1", [1000])
+    drain(host, a)
+    _got, enter_sid = answer_to(egm, "optionConfig", "enterOptionConfigMode",
+                                mode_status(False))
+    check("\"not yet\" leaves the change waiting",
+          a.denom_ceremony["stage"] == "entering")
+    mark = len(host.sent)
+    event(egm, "G2S_OCE101")
+    got = names(sent_since(host, mark))
+    check("the event that says it HAS entered opens the change (nothing "
+          "looked at it: the machine sat in the mode, the hub still "
+          "waiting)", a.denom_ceremony["stage"] == "writing"
+          and "setActiveDenoms" in got, (a.denom_ceremony["stage"], got))
+
+    print("— a mode that nothing on the hub is driving")
+    host = make_host()
+    egm = online(joined(host, "BTB_orphan"))
+    a = egm.assoc
+    mark = len(host.sent)
+    event(egm, "G2S_OCE101")
+    check("the machine enters option-config mode with no change in flight "
+          "(a hub restart forgot it, or the request had been given up on): "
+          "the exit is sent", len(exits(sent_since(host, mark))) == 1,
+          names(sent_since(host, mark)))
+    mark = len(host.sent)
+    host.enqueue_get_option_config_mode_status(a)
+    drain(host, a)
+    answer_to(egm, "optionConfig", "getOptionConfigModeStatus",
+              mode_status(True))
+    check("a second report straight after does not send a second exit",
+          not exits(sent_since(host, mark)))
+    event(egm, "G2S_OCE102")
+
+    print("— a mode entered by hand through the API is left to the person "
+          "who entered it")
+    host.enqueue_enter_option_config_mode(a, enable=True, manual=True)
+    drain(host, a)
+    a.mode_exit_sent.clear()
+    mark = len(host.sent)
+    answer_to(egm, "optionConfig", "enterOptionConfigMode", mode_status(True))
+    check("no exit is sent for it",
+          not exits(sent_since(host, mark)) and "optionConfig"
+          in a.mode_manual)
+    host.enqueue_enter_option_config_mode(a, enable=False, manual=True)
+    drain(host, a)
+    check("their exit clears the mark", "optionConfig" not in a.mode_manual)
+
+    print("— the commConfig mode likewise (§8.7)")
+    mark = len(host.sent)
+    event(egm, "G2S_CCE101", cls="G2S_commConfig")
+    check("on with no ownership change in flight: the exit is sent",
+          len(exits(sent_since(host, mark), "enterCommConfigMode")) == 1,
+          names(sent_since(host, mark)))
+    a.mode_exit_sent.clear()
+    a.commconfig_stage = "changing"
+    mark = len(host.sent)
+    event(egm, "G2S_CCE101", cls="G2S_commConfig")
+    check("on while a change is being made: left alone",
+          not exits(sent_since(host, mark), "enterCommConfigMode"))
+
+
+HANDPAY_PARAMS = (("G2S_enabledRemoteCredit", "true", "false"),
+                  ("G2S_disabledRemoteCredit", "false", "false"),
+                  ("G2S_enabledRemoteHandpay", "true", "false"),
+                  ("G2S_disabledRemoteHandpay", "false", "false"))
+
+
+def handpay_options(params=HANDPAY_PARAMS, definitions=True, bare=False):
+    """An optionList for G2S_handpay/1: (paramId, canModRemote, value)."""
+    defs = ""
+    if definitions:
+        defs = ("<g2s:optionParameters><g2s:complexParameter "
+                'g2s:paramId="G2S_handpayOptions">' + "".join(
+                    f'<g2s:booleanParameter g2s:paramId="{p}"'
+                    + ("" if bare else f' g2s:canModRemote="{mod}"') + "/>"
+                    for p, mod, _v in params)
+                + "</g2s:complexParameter></g2s:optionParameters>")
+    vals = ('<g2s:optionCurrentValues><g2s:complexValue '
+            'g2s:paramId="G2S_handpayOptions">' + "".join(
+                f'<g2s:booleanValue g2s:paramId="{p}">{v}</g2s:booleanValue>'
+                for p, _m, v in params)
+            + "</g2s:complexValue></g2s:optionCurrentValues>")
+    return ('<g2s:optionList><g2s:deviceOptions g2s:deviceClass="G2S_handpay"'
+            ' g2s:deviceId="1"><g2s:optionGroup '
+            'g2s:optionGroupId="G2S_handpayOptions"><g2s:optionItem '
+            f'g2s:optionId="G2S_handpayOptions">{defs}{vals}</g2s:optionItem>'
+            "</g2s:optionGroup></g2s:deviceOptions></g2s:optionList>")
+
+
+def values_sent(cmds):
+    """{paramId: value} of the newest setOptionChange the host sent."""
+    for _c, name, _a, el in reversed(cmds):
+        if name == "setOptionChange":
+            return {v.get(f"{{{gh.SCHEMA_NS}}}paramId"): (v.text or "")
+                    for v in el.iter()
+                    if gh.localname(v.tag).endswith("Value")
+                    and gh.localname(v.tag) != "complexValue"}
+    return None
+
+
+def item_22_what_the_machine_lets_a_host_change():
+    print("— audit item 22: canModRemote (§9.15: \"If set to false, the "
+          "host MUST NOT change the value of the parameter\")")
+    host = make_host()
+    egm = online(joined(host, "BTB_canmod"))
+    a = egm.assoc
+    mark = len(host.sent)
+    host._maybe_arm_remote_handpay_on_join(a)
+    drain(host, a)
+    asked = [x for _c, name, x, _e in sent_since(host, mark)
+             if name == "getOptionList"]
+    check("the join's read of the handpay options asks for the "
+          "definitions", asked and asked[-1].get("optionDetail") == "true",
+          asked)
+    mark = len(host.sent)
+    answer_to(egm, "optionConfig", "getOptionList", handpay_options(),
+              device="1")
+    sent = values_sent(sent_since(host, mark))
+    check("the parameters the machine allows are switched on",
+          sent is not None and sent.get("G2S_enabledRemoteCredit") == "true"
+          and sent.get("G2S_enabledRemoteHandpay") == "true", sent)
+    check("the ones it marks canModRemote=false go back as the machine has "
+          "them (the hub asked to change them, and a WMS Bluebird 2 refused "
+          "the whole set at every join: G2S_OCX015)",
+          sent is not None and sent.get("G2S_disabledRemoteCredit") == "false"
+          and sent.get("G2S_disabledRemoteHandpay") == "false", sent)
+
+    print("— one parameter, asked for by name")
+    r = host.start_option_change_cycle(
+        a, device_class="G2S_handpay", device_id="1",
+        option_id="G2S_handpayOptions", param_id="G2S_disabledRemoteCredit",
+        value="true")
+    check("a change to a parameter the machine keeps to itself is refused "
+          "here, with the reason", r.get("ok") is False
+          and r.get("notModifiable") == ["G2S_disabledRemoteCredit"]
+          and "at the machine" in r.get("error", ""), r)
+
+    print("— the flag that matters, kept by the machine and off")
+    host = make_host()
+    egm = online(joined(host, "BTB_canmod_off"))
+    a = egm.assoc
+    host._maybe_arm_remote_handpay_on_join(a)
+    drain(host, a)
+    mark = len(host.sent)
+    answer_to(egm, "optionConfig", "getOptionList", handpay_options(
+        (("G2S_enabledRemoteCredit", "false", "false"),) + HANDPAY_PARAMS[1:]))
+    r = host.enable_remote_handpay(a)
+    check("nothing is sent, and the answer says where to turn it on",
+          values_sent(sent_since(host, mark)) is None
+          and r.get("ok") is False and "machine's own menu" in r["error"], r)
+
+    print("— a machine already set as far as a host may set it (the "
+          "Bluebird at every join)")
+    host = make_host()
+    egm = online(joined(host, "BTB_canmod_done"))
+    a = egm.assoc
+    host._maybe_arm_remote_handpay_on_join(a)
+    drain(host, a)
+    mark = len(host.sent)
+    answer_to(egm, "optionConfig", "getOptionList", handpay_options((
+        ("G2S_enabledRemoteCredit", "true", "true"),
+        ("G2S_disabledRemoteCredit", "false", "false"),
+        ("G2S_enabledRemoteHandpay", "true", "true"),
+        ("G2S_disabledRemoteHandpay", "false", "false"))))
+    r = host.enable_remote_handpay(a)
+    check("nothing is sent and it is not reported as a failure: the two "
+          "parameters left are the machine's to set",
+          values_sent(sent_since(host, mark)) is None and r.get("ok") is True
+          and r.get("alreadyEnabled") is True
+          and r.get("notModifiable") == ["G2S_disabledRemoteCredit",
+                                         "G2S_disabledRemoteHandpay"], r)
+
+    print("— definitions that say nothing")
+    host = make_host()
+    egm = online(joined(host, "BTB_canmod_bare"))
+    a = egm.assoc
+    # the config-sync push a machine sends unasked, with bare definition
+    # elements (a WMS Bluebird 2 sends them so)
+    egm.send("optionConfig", handpay_options(bare=True), device="1")
+    check("bare definitions in a list the machine sent unasked mark "
+          "nothing as unchangeable", a.config_can_mod == {}, a.config_can_mod)
+    mark = len(host.sent)
+    r = host.enable_remote_handpay(a)
+    sent = values_sent(sent_since(host, mark)) if not drain(host, a) else None
+    sent = values_sent(sent_since(host, mark))
+    check("so a change goes ahead as it always did",
+          r.get("ok") is True and sent is not None
+          and sent.get("G2S_disabledRemoteCredit") == "true", (r, sent))
+    host2 = make_host()
+    egm2 = online(joined(host2, "BTB_canmod_absent"))
+    host2._maybe_arm_remote_handpay_on_join(egm2.assoc)
+    drain(host2, egm2.assoc)
+    answer_to(egm2, "optionConfig", "getOptionList",
+              handpay_options(bare=True))
+    check("in the answer to a read that ASKED for them, an absent "
+          "canModRemote is false, as the document defines it",
+          egm2.assoc.config_can_mod.get(
+              "G2S_handpay/1/G2S_enabledRemoteCredit") is False,
+          egm2.assoc.config_can_mod)
+
+
+def change_status(cfg, txn, status, exc="0"):
+    return (f'<g2s:optionChangeStatus g2s:configurationId="{cfg}" '
+            f'g2s:transactionId="{txn}" g2s:changeStatus="{status}" '
+            f'g2s:changeException="{exc}"/>')
+
+
+def _a_change_in_flight(name):
+    host = make_host()
+    egm = online(joined(host, name))
+    a = egm.assoc
+    egm.send("optionConfig", handpay_options(definitions=False), device="1")
+    r = host.start_option_change_cycle(
+        a, device_class="G2S_handpay", device_id="1",
+        option_id="G2S_handpayOptions", param_id="G2S_enabledRemoteCredit",
+        value="true")
+    drain(host, a)
+    assert r.get("ok"), r
+    return host, egm, a, str(r["configId"])
+
+
+def cancels(cmds):
+    return [a for _c, name, a, _e in cmds if name == "cancelOptionChange"]
+
+
+def item_26_a_set_the_hub_gives_up_on():
+    print("— audit item 26: a validated set the hub is no longer driving "
+          "is cancelled, not left pending on the machine (§9.16)")
+    host, egm, a, cfg = _a_change_in_flight("BTB_cancel_auth")
+    answer_to(egm, "optionConfig", "setOptionChange",
+              change_status(cfg, "77", "G2S_pending"))
+    check("(validated: the hub authorizes it)",
+          a.optionconfig_stage == "authorizing")
+    mark = len(host.sent)
+    auth_sid = [s for s, r in a.sent_requests.items()
+                if r["command"] == "authorizeOptionChange"][-1]
+    egm.refuse("optionConfig", auth_sid, "G2S_OCX009", device="1")
+    c = cancels(sent_since(host, mark))
+    check("the authorize is refused: the set the machine still holds is "
+          "cancelled (it was left there, the machine waiting on it)",
+          a.optionconfig_stage == "failed" and len(c) == 1
+          and c[0].get("transactionId") == "77"
+          and c[0].get("configurationId") == cfg, (a.optionconfig_stage, c))
+
+    host, egm, a, cfg = _a_change_in_flight("BTB_cancel_exc")
+    mark = len(host.sent)
+    answer_to(egm, "optionConfig", "setOptionChange",
+              change_status(cfg, "78", "G2S_pending", exc="3"))
+    c = cancels(sent_since(host, mark))
+    check("pending with an exception: cancelled",
+          len(c) == 1 and c[0].get("transactionId") == "78", c)
+
+    host, egm, a, cfg = _a_change_in_flight("BTB_cancel_late")
+    host.cancel_option_change(a)             # before any transactionId
+    a.optionconfig_stage = "cancelled"
+    mark = len(host.sent)
+    answer_to(egm, "optionConfig", "setOptionChange",
+              change_status(cfg, "79", "G2S_pending"))
+    c = cancels(sent_since(host, mark))
+    check("pending arriving after the change was given up here: cancelled "
+          "now that its transactionId is known",
+          len(c) == 1 and c[0].get("transactionId") == "79", c)
+
+    host, egm, a, cfg = _a_change_in_flight("BTB_cancel_not")
+    answer_to(egm, "optionConfig", "setOptionChange",
+              change_status(cfg, "80", "G2S_pending"))
+    mark = len(host.sent)
+    egm.send("optionConfig", change_status(cfg, "80", "G2S_pending"),
+             device="1")                     # the same status, pushed too
+    check("a second pending status for a change that is being authorized "
+          "does NOT cancel it", not cancels(sent_since(host, mark))
+          and a.optionconfig_stage == "authorizing",
+          names(sent_since(host, mark)))
+
+    print("— a set the machine has authorized is waiting to apply")
+    answer_to(egm, "optionConfig", "authorizeOptionChange",
+              change_status(cfg, "80", "G2S_authorized"))
+    a.option_change["progressTs"] -= 500
+    check("it is not shown as timed out",
+          a.snapshot().get("optionChange", {}).get("result") == "authorized",
+          a.snapshot().get("optionChange"))
+    r = host.start_option_change_cycle(
+        a, device_class="G2S_handpay", device_id="1",
+        option_id="G2S_handpayOptions", param_id="G2S_enabledRemoteHandpay",
+        value="true")
+    check("and a new change does not replace it",
+          r.get("ok") is False and "waiting to apply" in r.get("error", ""),
+          r)
+
+
+def host_list(items):
+    """items: [(hostIndex, hostId, attrs, [(tag, class, id, active)])]"""
+    out = ""
+    for index, hid, attrs, devs in items:
+        extra = "".join(f' g2s:{k}="{v}"' for k, v in attrs.items())
+        rows = "".join(
+            f'<g2s:{tag} g2s:deviceClass="{c}" g2s:deviceId="{d}" '
+            f'g2s:deviceActive="{act}"/>' for tag, c, d, act in devs)
+        out += (f'<g2s:commHostItem g2s:hostIndex="{index}" '
+                f'g2s:hostId="{hid}" g2s:hostRegistered="true"{extra}>'
+                f'{rows}</g2s:commHostItem>')
+    return f"<g2s:commHostList>{out}</g2s:commHostList>"
+
+
+OUR_ITEM = (3, 1, {"hostLocation": "http://10.0.0.9:8081/G2S",
+                   "requiredForPlay": "true", "timeToLive": "45000",
+                   "noResponseTimer": "120000"},
+            [("ownedDevice", "G2S_communications", "1", "true"),
+             ("configDevice", "G2S_communications", "1", "true"),
+             ("ownedDevice", "G2S_wat", "2", "false"),
+             ("configDevice", "G2S_wat", "2", "false"),
+             ("configDevice", "G2S_hopper", "1", "true"),
+             ("guestDevice", "G2S_voucher", "1", "true"),
+             ("guestDevice", "G2S_progressive", "1", "true")])
+
+
+def items_21_24_25_37_the_ownership_claim():
+    print("— audit items 21, 24, 37: the claim is built on what the "
+          "machine holds for this host (§8.15: a setHostItem \"overwrite[s] "
+          "any previous settings\")")
+    host = make_host()
+    egm = online(joined(host, "BTB_claim"))
+    a = egm.assoc
+    r = host.start_ownership_cycle(a)
+    check("with the machine's host list not yet read, a claim is refused "
+          "(it went ahead from a guessed list that left out the "
+          "communications device)", isinstance(r, dict)
+          and r.get("ok") is False and "getCommHostList" in r["error"], r)
+    host.enqueue_get_comm_host_list(a)
+    drain(host, a)
+    answer_to(egm, "commConfig", "getCommHostList",
+              host_list([OUR_ITEM, (1, 0, {}, [])]))
+    r = host.start_ownership_cycle(a)
+    drain(host, a)
+    check("progressive is left as it is: the hub does not serve it",
+          r.get("ok") and r["left"] == ["G2S_progressive/1"]
+          and "G2S_progressive/1" not in r["claimed"], r)
+    mark = len(host.sent)
+    answer_to(egm, "commConfig", "enterCommConfigMode",
+              '<g2s:commConfigModeStatus g2s:enabled="true" '
+              'g2s:configurationId="0"/>')
+    sent = sent_since(host, mark)
+    item = next((el for _c, name, _a, el in sent
+                 if name == "setCommChange"), None)
+    shi = item[0] if item is not None else None
+    at = {k.rsplit("}", 1)[-1]: v for k, v in shi.attrib.items()} \
+        if shi is not None else {}
+    check("the machine's own slot and the address it reaches us at go back "
+          "unchanged (the hub sent its own idea of its address)",
+          at.get("hostIndex") == "3"
+          and at.get("hostLocation") == "http://10.0.0.9:8081/G2S", at)
+    check("and so do the host's other settings (requiredForPlay was forced "
+          "false, the rest fell to defaults)",
+          at.get("requiredForPlay") == "true"
+          and at.get("timeToLive") == "45000"
+          and at.get("noResponseTimer") == "120000", at)
+    rows = {(gh.localname(d.tag), d.get(f"{{{gh.SCHEMA_NS}}}deviceClass"),
+             d.get(f"{{{gh.SCHEMA_NS}}}deviceId")):
+            d.get(f"{{{gh.SCHEMA_NS}}}deviceActive")
+            for d in (shi if shi is not None else [])}
+    check("a device that was inactive stays inactive (every device was "
+          "written active)",
+          rows.get(("ownedDevice", "G2S_wat", "2")) == "false"
+          and rows.get(("ownedDevice", "G2S_communications", "1")) == "true",
+          rows)
+    check("a device we are only configurator of is kept",
+          ("configDevice", "G2S_hopper", "1") in rows
+          and ("ownedDevice", "G2S_hopper", "1") not in rows, sorted(rows))
+    check("the guest we asked for is claimed, the progressive stays guest",
+          ("ownedDevice", "G2S_voucher", "1") in rows
+          and ("guestDevice", "G2S_progressive", "1") in rows
+          and ("ownedDevice", "G2S_progressive", "1") not in rows,
+          sorted(rows))
+
+    print("— audit item 8: once the change applies, the exit goes first")
+    cfg = a.pending_config_id
+    answer_to(egm, "commConfig", "setCommChange",
+              f'<g2s:commChangeStatus g2s:configurationId="{cfg}" '
+              f'g2s:transactionId="90" g2s:changeStatus="G2S_pending"/>')
+    mark = len(host.sent)
+    answer_to(egm, "commConfig", "authorizeCommChange",
+              f'<g2s:commChangeStatus g2s:configurationId="{cfg}" '
+              f'g2s:transactionId="90" g2s:changeStatus="G2S_applied"/>')
+    order = names(sent_since(host, mark))
+    check("enterCommConfigMode(enable=false) is the first thing queued (it "
+          "was third, behind two reads a rejoin could drop it with)",
+          order[:1] == ["enterCommConfigMode"]
+          and len(exits(sent_since(host, mark), "enterCommConfigMode")) == 1,
+          order)
+
+    print("— audit item 25: a host list the machine sends unasked carries "
+          "only the hosts that changed (§8.13)")
+    egm.send("commConfig", host_list([(2, 5, {}, [
+        ("ownedDevice", "G2S_printer", "1", "true")])]), device="1")
+    check("our own entry is still there (the list replaced the whole "
+          "table, and the hub forgot what it owns)",
+          "1" in a.host_items and a.host_items["1"]["hostIndex"] == "3"
+          and "5" in a.host_items, sorted(a.host_items))
+    host.enqueue_get_comm_host_list(a)
+    drain(host, a)
+    answer_to(egm, "commConfig", "getCommHostList", host_list([OUR_ITEM]))
+    check("the answer to our own getCommHostList is the whole table and "
+          "replaces it", sorted(a.host_items) == ["1"], sorted(a.host_items))
+
+
 def main():
     logging.basicConfig(level=logging.CRITICAL + 1)
     logging.getLogger("g2s_host").setLevel(logging.CRITICAL + 1)
@@ -1294,6 +1832,10 @@ def main():
     item_11_a_message_that_did_not_go_out()
     item_13_the_machines_queue_is_full()
     item_42_a_request_past_its_time_to_live()
+    items_5_and_8_a_machine_left_in_a_config_mode()
+    item_22_what_the_machine_lets_a_host_change()
+    item_26_a_set_the_hub_gives_up_on()
+    items_21_24_25_37_the_ownership_claim()
     print("=" * 50)
     print(f"RESULT: {_p} passed, {_f} failed")
     return 1 if _f else 0

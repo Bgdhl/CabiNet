@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.3.20
+Third batch from the G2S audit: configuration changes. Eight items.
+- **A machine is not left in a configuration mode.** While a machine is
+  in one it cannot be played. The hub could leave it there when a
+  denomination change got no answer to its write, when the command to
+  leave the mode was refused or lost, when the machine entered the mode
+  later than it first answered, or when the hub restarted part-way. The
+  hub now gives the write a deadline, sends the exit again until the
+  machine confirms it, notices a machine that has entered a mode nothing
+  is driving and takes it out, and checks for this at every join. A mode
+  entered by hand through the command API is left to whoever entered it.
+- **The hub only changes the options a machine allows a host to
+  change.** It reads which ones those are before changing anything. A
+  WMS Bluebird 2 keeps two of the handpay settings to itself, so the
+  hub's change was refused whole at every join, the settings it does
+  allow included. They are now left as the machine has them.
+- **An option change the hub gives up on is cancelled on the machine**
+  instead of being left there waiting. One the machine has accepted and
+  is waiting to apply is no longer shown as timed out or replaced.
+- **Claiming ownership of a machine's devices builds on what the machine
+  already holds for this hub.** The claim sent the hub's own idea of its
+  address, reset the host's settings to defaults, marked every device
+  active and could drop devices. It now sends back what the machine
+  reported, refuses to run before that has been read, and does not claim
+  a class the hub does not serve (progressive, player, central).
+- A host list the machine sends unasked updates the entries it carries
+  and no longer replaces the whole table.
+
 ## v0.3.19
 Second batch from the G2S audit: how the hub reads, answers and sends
 G2S messages. Nine items.
