@@ -48,6 +48,25 @@ With a `clock` it also keeps time (audit batch 4):
 `general_faults` spoils the answers to general polls the same way `faults`
 does for long polls (only DROP makes sense for a one-byte answer).
 
+Lock, unlock and the handpay lockup (audit batch 6):
+
+  §7.4  shutdown (01) and startup (02) are type S polls: the answer is ACK
+        (the bare address) or NACK (address | 0x80), or the busy answer of
+        §4.1 ([address][00]) when the machine cannot take it just now
+        (`busy`, `nack`, `deaf` make it give each). §7.4.1 lets a machine
+        cash out its credits when it is shut down
+        (`cashes_out_on_shutdown`).
+  §14.2 A8 enables a reset method for the pending handpay: code 00
+        enabled, 01 unable, 02 not in a handpay.
+  §7.9  94 resets the handpay: code 00 was reset, 01 unable, 02 not in a
+        handpay. With the reset-to-credit method enabled the amount goes on
+        the credit meter. A machine not configured for remote reset ignores
+        94 (`remote_reset=False`).
+  §7.8.1 exception 52 "is not sent until the corresponding 1B long poll has
+        been received, responded to and acknowledged, and the associated
+        handpay has been reset". Exception 55: the player cancelled the
+        handpay request (player_cancels_handpay).
+
 StrictMachine in test_sas_implied_ack.py is the older, narrower relative:
 it models what a tester's Ainsworth A560 was seen to do with three 0x73
 polls, which is not quite the document either.
@@ -78,8 +97,25 @@ class ByTheBookMachine:
     def __init__(self, address=1, mark_read_on="ack", peek_marks_read=False,
                  knows_look_ahead=True, speaks_4d=True,
                  resends_on_nack=True, answers_4d_with_zeros=False,
-                 clock=None, min_gap=0.0):
+                 clock=None, min_gap=0.0, remote_reset=True,
+                 can_reset_to_credit=True, cashes_out_on_shutdown=False):
         self.address = address
+        # lock/unlock and the handpay lockup
+        self.shut_down = False
+        self.cashes_out_on_shutdown = cashes_out_on_shutdown
+        self.busy = {}               # command -> busy answers still to give
+        self.nack = {}               # command -> NACKs still to give
+        self.deaf = set()            # commands that get no answer at all
+        self.credits = 0             # the credit meter, in cents
+        self.ticketed = []           # amounts cashed out to a ticket
+        self.in_handpay = False      # locked up in a handpay
+        self.handpay_amount = 0
+        self.reset_method = 0x00     # 00 standard, 01 to the credit meter
+        self.remote_reset = remote_reset
+        self.can_reset_to_credit = can_reset_to_credit
+        self.reset_unable = False    # answer 94 with code 01
+        self.key_off_after_a8 = False  # an attendant resets it in between
+        self._reset_done = False     # reset, its exception 52 still owed
         self.resends_on_nack = resends_on_nack      # True per §3.2
         # timekeeping (only with a clock)
         self.clock = clock
@@ -127,8 +163,36 @@ class ByTheBookMachine:
             data = bytes([0x00, 0x40]) + int_to_bcd(125000, 5) \
                 + int_to_bcd(0, 2) + bytes([0x00]) + bytes(10)
         self.handpays.append({"data": bytes(data), "reported": False})
+        self.in_handpay = True
+        self.handpay_amount = int(bytes(data)[2:7].hex())
+        self.reset_method = 0x00
         if 0x51 not in self.exceptions:
             self.exceptions.append(0x51)
+
+    def key_off(self):
+        """An attendant resets the handpay at the machine (standard)."""
+        self._reset_handpay(to_credit=False)
+
+    def player_cancels_handpay(self):
+        """The player cancels the handpay request: exception 55, no 52."""
+        self.in_handpay = False
+        self.exceptions.append(0x55)
+
+    def _reset_handpay(self, to_credit):
+        if not self.in_handpay:
+            return
+        self.in_handpay = False
+        if to_credit:
+            self.credits += self.handpay_amount
+        self._reset_done = True
+        self._owe_52()
+
+    def _owe_52(self):
+        """§7.8.1: 52 only once the handpay is reset AND its 1B record has
+        been read and acknowledged."""
+        if self._reset_done and all(h["reported"] for h in self.handpays):
+            self._reset_done = False
+            self.exceptions.append(0x52)
 
     def fifteen_seconds_pass(self):
         """The document's reissue timers: 3D/3E while unread records remain
@@ -240,8 +304,26 @@ class ByTheBookMachine:
 
     def _long(self, raw):
         command = raw[1]
+        if command in self.deaf:
+            return b""
+        if self.busy.get(command):
+            self.busy[command] -= 1
+            return bytes([self.address, 0x00])       # §4.1: busy
         if command == 0x1B and len(raw) == 2:
             return self._send_handpay_info()
+        if command == 0x1A and len(raw) == 2:
+            return frame(self.address, 0x1A, int_to_bcd(self.credits, 4))
+        if command in (0x01, 0x02, 0x94, 0xA8):
+            if sas_crc(raw[:-2]).to_bytes(2, "little") != raw[-2:]:
+                return b""
+            if self.nack.get(command):
+                self.nack[command] -= 1
+                return bytes([self.address | 0x80])  # Table 7.4b: NACK
+            if command in (0x01, 0x02):
+                return self._shutdown(command == 0x01)
+            if command == 0xA8:
+                return frame(self.address, 0xA8, bytes([self._method(raw[2])]))
+            return self._remote_reset()
         if command == 0x3D and len(raw) == 2:
             # standard validation read; a machine in enhanced validation
             # answers with a zero validation field
@@ -256,6 +338,35 @@ class ByTheBookMachine:
         if command == 0x4D:
             return self._send_validation(raw[2])
         return b""                                   # not supported: ignored
+
+    def _shutdown(self, off):
+        self.shut_down = off
+        if off and self.cashes_out_on_shutdown and self.credits:
+            self.ticketed.append(self.credits)       # §7.4.1 allows this
+            self.credits = 0
+        return bytes([self.address])                 # Table 7.4b: ACK
+
+    def _method(self, method):
+        """§14.2, Table 14.2b."""
+        if not self.in_handpay:
+            return 0x02
+        if method == 0x01 and not self.can_reset_to_credit:
+            return 0x01
+        self.reset_method = method
+        if self.key_off_after_a8:
+            self.key_off()
+        return 0x00
+
+    def _remote_reset(self):
+        """§7.9, Table 7.9b."""
+        if not self.remote_reset:
+            return b""                               # "must ignore long poll 94"
+        if not self.in_handpay:
+            return frame(self.address, 0x94, bytes([0x02]))
+        if self.reset_unable:
+            return frame(self.address, 0x94, bytes([0x01]))
+        self._reset_handpay(to_credit=self.reset_method == 0x01)
+        return frame(self.address, 0x94, bytes([0x00]))
 
     def _record_bytes(self, r, index):
         return (bytes([r["type"], index])
@@ -301,6 +412,7 @@ class ByTheBookMachine:
 
         def reported(entry=entry):
             entry["reported"] = True
+            self._owe_52()
         self._on_ack = reported
         return frame(self.address, 0x1B, entry["data"])
 

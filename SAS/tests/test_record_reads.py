@@ -104,7 +104,6 @@ class TestAskAgain:
         BAD,                              # bad CRC
         GOOD[:17],                        # cut short
         b"",                              # never arrived
-        bytes([0x01, 0x00]),              # busy
         frame(2, 0x4D, bytes(31)),        # another machine's
         frame(1, 0x3D, bytes(9)),         # another command's
     ])
@@ -113,6 +112,15 @@ class TestAskAgain:
         resp, heard, sent = transact_reread(t, READ)
         assert (resp, sent) == (GOOD, 2)
         assert t.sent == [READ, READ]
+
+    def test_a_busy_machine_is_not_asked_again_at_once(self):
+        """§4.1: on a busy response the host "aborts the long poll attempt"
+        and comes back to it later. Until v0.3.15 it was asked twice more
+        on the spot."""
+        busy = bytes([0x01, 0x00])
+        t = _Scripted(busy, GOOD)
+        assert transact_reread(t, READ) == (busy, True, 1)
+        assert t.sent == [READ]
 
     def test_three_sends_and_no_more(self):
         t = _Scripted(BAD, BAD, BAD, GOOD, GOOD)

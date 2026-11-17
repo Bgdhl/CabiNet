@@ -194,14 +194,18 @@ class TestTwoStepSequence:
         assert result.step2_code == RESET_CODE_UNABLE
         assert machine.in_handpay is True
 
-    def test_acked_but_unconfirmed_is_timeout(self):
-        """Step 2 acked but no 0x52 within the confirm window: the typed
-        result must NOT claim reset_ok."""
+    def test_acked_but_unconfirmed_is_still_a_reset(self):
+        """Step 2 answered code 00, "handpay was reset" (SAS 6.02 Table
+        7.9b), and no 0x52 within the watch. The machine has reset it and
+        said so; exception 52 is held back until the handpay's 1B record
+        has been read (§7.8.1). Until v0.3.15 this was a TIMEOUT, and the
+        hub kept its HANDPAY banner over a machine that had paid."""
         machine = HandpayMachine(announce_reset=False)
         port = MockSASSerialPort(machine)
         result = reset_handpay_to_credits(port, 1, sleep=NO_SLEEP,
                                           confirm_polls=3)
-        assert result.outcome is HandpayResetOutcome.TIMEOUT
+        assert result.outcome is HandpayResetOutcome.RESET_OK
+        assert result.ok is True
         assert result.step2_code == RESET_CODE_OK
         assert result.confirmed_by_exception is False
 

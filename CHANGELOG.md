@@ -1,5 +1,43 @@
 # Changelog
 
+## v0.3.15
+Sixth batch from the SAS audit: lock, unlock and handpay reset report
+what the machine answered.
+- **A lock or unlock is only recorded when the machine acknowledges it.**
+  Anything that came back counted as done, and so did nothing coming back:
+  a lock the machine refused, put off because it was busy, or never heard
+  was shown as locked on the hub. The satellite now reads the answer. A
+  busy machine is asked again (three tries); a refusal or silence is
+  reported as such and the hub's lock state does not change. The chip on
+  the machine's tile goes amber with the reason.
+- **Locking reports what happened to the credits.** A machine is allowed
+  to cash out its credits when it is locked. The credit meter is read
+  before and after, both figures are in the result, and a drop is called
+  out.
+- **A handpay reset the machine confirms is a reset.** The hub's reset
+  was reported as a timeout, and the HANDPAY banner stayed, unless the
+  machine's follow-up notice arrived within about a second. The machine's
+  own answer "handpay was reset" is now the result. If a handpay notice
+  arrives while waiting, its record is read, which is what lets the
+  machine send that follow-up.
+- **The HANDPAY banner clears when it should.** It only cleared on the
+  machine's "handpay was reset" notice. It now also clears when the
+  player cancels the handpay request, and when the machine answers a
+  reset with "not in a handpay", which until now left the banner up until
+  the satellite restarted.
+- **A stray byte is not taken for consent to reset.** A lone address
+  byte, which is what a machine that cannot hear the hub sends unasked,
+  was accepted as the answer to both steps of a reset.
+- "Not in a handpay" from the second step of a reset is reported as that,
+  not as "method refused".
+- **A busy or refused answer is acknowledged before the command is sent
+  again.** Sent again with nothing between, a strict machine takes the
+  retry as "say that again", repeats its busy, and then stops answering.
+  A busy machine is also no longer asked twice more on the spot when a
+  record is being read.
+- Comments that called the handpay and bonus polls guesses now cite the
+  document's tables.
+
 ## v0.3.14
 Fifth batch from the SAS audit: the machine's own CASH OUT button to a
 wallet, on SAS machines.

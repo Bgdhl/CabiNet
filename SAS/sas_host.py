@@ -306,8 +306,14 @@ class HandpayLatch:
     """C3 pendingHandpay latch — the HANDPAY banner state for the hub/UI.
 
     Latched ON when exception 0x51 (handpay pending) comes off the FIFO;
-    latched OFF on exception 0x52 (handpay was reset — key, fob or remote)
-    or on a handpay_reset hub command the machine acked (ok=true). It is
+    latched OFF on exception 0x52 (handpay was reset — key, fob or remote),
+    on exception 0x55 (the player cancelled the handpay request), on a
+    handpay_reset hub command the machine acked (ok=true), or when the
+    machine answers such a command "not currently in a handpay condition".
+    Until v0.3.15 only the 52 and the acked reset cleared it: a cancelled
+    request, or a 52 that was lost, left HANDPAY on the hub until the
+    satellite restarted, and the reset button answered "no handpay"
+    without clearing it (SAS 6.02 audit, item 24). It is
     STATE, not an event: it survives report cycles until the handpay is
     actually cleared. Single writer (the POLL thread — exception dispatch
     and run_hub_command both live there) with a lock-free reader (the
@@ -331,6 +337,10 @@ class HandpayLatch:
         elif code == HANDPAY_RESET_EXCEPTION and self.pending is not None:
             self.pending = None
             logger.info("🧾 handpay latch cleared (0x52 handpay was reset)")
+        elif code == HANDPAY_CANCELLED_EXCEPTION and self.pending is not None:
+            self.pending = None
+            logger.info("🧾 handpay latch cleared (0x55 the player cancelled "
+                        "the handpay request)")
 
     def on_reset_ok(self) -> None:
         """A handpay_reset hub command came back ok=true (poll thread).
@@ -340,6 +350,45 @@ class HandpayLatch:
         if self.pending is not None:
             self.pending = None
             logger.info("🧾 handpay latch cleared (handpay_reset acked)")
+
+    def on_no_handpay(self) -> None:
+        """The machine answered a reset attempt "not currently in a
+        handpay condition" (A8 or 94, code 02). That is its own word that
+        there is nothing pending."""
+        if self.pending is not None:
+            self.pending = None
+            logger.info("🧾 handpay latch cleared (the machine says it is "
+                        "not in a handpay)")
+
+
+HANDPAY_CANCELLED_EXCEPTION = 0x55   # player has cancelled the handpay request
+# Shutdown / startup (lock / unlock): how many times the poll is sent while
+# the machine answers busy or nothing, and how long a busy machine is given.
+LOCK_TRIES = 3
+LOCK_RETRY_SEC = 0.5
+
+
+def classify_type_s(reply, address) -> str:
+    """The machine's answer to a type S long poll that asks for no data
+    (shutdown 01, startup 02, game enable 09, legacy bonus 8A):
+
+      "ack"     the bare address (SAS 6.02 Table 7.4b)
+      "nack"    the address ORed with 0x80: the poll did not validate
+      "busy"    [address][00] (§4.1): the machine cannot take it just now,
+                and the host is to send it again later
+      "silent"  nothing, or anything else
+
+    Busy is tested first. Its first byte IS the address, so a test for the
+    address alone calls a machine that declined the command an ack."""
+    if not reply:
+        return "silent"
+    if len(reply) == 2 and reply[0] == address and reply[1] == 0x00:
+        return "busy"
+    if len(reply) == 1 and reply[0] == (address | 0x80):
+        return "nack"
+    if len(reply) == 1 and reply[0] == address:
+        return "ack"
+    return "silent"
 
 
 def parse_ticket_data_reply(value):
@@ -1983,6 +2032,8 @@ def main():
                     # (no-op if the 0x52 drained in the confirm window
                     # already did — the latch logs once either way).
                     hp_latch.on_reset_ok()
+                elif res.outcome.value == "no_handpay":
+                    hp_latch.on_no_handpay()
                 result["ok"] = res.ok
                 result["outcome"] = res.outcome.value
                 result["detail"] = res.detail
@@ -2347,22 +2398,90 @@ def main():
                 return result
             if cmd.get("type") in ("sas_disable", "sas_enable"):
                 # Machine lock/unlock = SAS shutdown 0x01 / startup 0x02
-                # (SASCommandBuilder — type-S control polls, CRC even with no
-                # data). VERIFY_ON_BENCH: the BB2's exact reply to 0x01/0x02 is
-                # unproven — 0x01/0x02 are commonly NO-response, so an empty
-                # read is a normal "sent" and a non-empty reply is a clean
-                # "ack"; either way the operator sees the machine lock/unlock
-                # on the glass. Applies immediately (no credit/idle gate).
+                # (SAS 6.02 §7.4, Table B-1: type S, answered "ACK or NACK").
+                # The answer decides the result. ACK is the bare address;
+                # NACK is address|0x80; a busy machine answers [addr][00]
+                # (§4.1) and is asked again; silence is asked again too. Only
+                # an ACK records the lock.
+                #
+                # Until v0.3.15 anything that came back read "ack" and
+                # nothing read "sent", and the lock was recorded either way:
+                # a shutdown the machine refused, put off, or never heard was
+                # shown as locked on the hub (audit item 7).
+                #
+                # What a shutdown does is the MACHINE's choice (§7.4.1): it
+                # "can either automatically cash out any accumulated credits
+                # or allow the user to cash them out", cash out stays
+                # available either way, and a machine in a game finishes the
+                # game first. So the credit meter is read before and after a
+                # lock and both figures go in the result (item 11).
                 lock = cmd.get("type") == "sas_disable"
                 builder = SASCommandBuilder(poller.protocol)
                 frame = (builder.shutdown(args.address) if lock
                          else builder.startup(args.address))
-                reply = poller.transport.transact(frame)
-                result["locked"] = lock
-                result["result"] = "ack" if reply else "sent"
-                logger.info("{} hub command {}: SAS {} -> {}",
-                            "🔒" if lock else "🔓", cmd_id,
-                            "disable" if lock else "enable", result["result"])
+
+                def read_credits():
+                    try:
+                        r = poller.transport.transact(
+                            build_meter_poll(args.address, 0x1A))
+                        pk = poller.protocol.parse_packet(r) if r else None
+                        if pk and pk.address == args.address \
+                                and pk.command == 0x1A:
+                            return parse_single_meter(pk.data)
+                    except Exception:                     # noqa: BLE001
+                        pass
+                    return None
+
+                before = read_credits() if lock else None
+                outcome, reply, tries = "silent", b"", 0
+                for tries in range(1, LOCK_TRIES + 1):
+                    reply = poller.transport.transact(frame)
+                    outcome = classify_type_s(reply, args.address)
+                    if outcome == "ack":
+                        break
+                    if tries < LOCK_TRIES:
+                        time.sleep(LOCK_RETRY_SEC if outcome == "busy"
+                                   else SAS_POLL_FLOOR)
+                ok = outcome == "ack"
+                result["ok"] = ok
+                result["outcome"] = outcome
+                result["tries"] = tries
+                result["sent"] = frame.hex(" ")
+                result["raw"] = reply.hex(" ") if reply else ""
+                # the UI keys on "ack" as the one success verdict
+                result["result"] = "ack" if ok else outcome
+                if ok:
+                    result["locked"] = lock      # absent = no state change
+                else:
+                    result["detail"] = {
+                        "nack": "the machine refused the command (NACK)",
+                        "busy": "the machine answered busy each time; it "
+                                "has not been "
+                                + ("locked" if lock else "enabled"),
+                        "silent": "the machine did not answer; it has not "
+                                  "been recorded as "
+                                  + ("locked" if lock else "enabled"),
+                    }[outcome]
+                if ok and lock:
+                    time.sleep(SAS_POLL_FLOOR)
+                    after = read_credits()
+                    if before is not None:
+                        result["creditsBefore"] = before
+                    if after is not None:
+                        result["creditsAfter"] = after
+                    if before and after is not None and after < before:
+                        result["detail"] = (
+                            f"the machine cashed out {before - after} "
+                            "credits when it was locked (a machine may do "
+                            "that on shutdown, SAS 6.02 §7.4.1)")
+                        logger.warning("🔒 the machine cashed out {} credits "
+                                       "when it was locked ({} -> {})",
+                                       before - after, before, after)
+                logger.info("{} hub command {}: SAS {} -> {} (raw {}, {} "
+                            "{})", "🔒" if lock else "🔓", cmd_id,
+                            "disable" if lock else "enable", outcome,
+                            result["raw"] or "nothing", tries,
+                            "try" if tries == 1 else "tries")
                 return result
             if cmd.get("type") == "sas_game_state":
                 # Per-game enable/disable = LP09 (Table 7.6.1, type M):

@@ -223,6 +223,10 @@ BENCH_EXCEPTIONS: Dict[int, SASExceptionInfo] = {e.code: e for e in [
 # and drop it. At address 2 that was 82, every trip into the attendant
 # menu.
 APPENDIX_A_EXCEPTIONS: Dict[int, SASExceptionInfo] = {e.code: e for e in [
+    # 55 ends a handpay request with no 52: the HANDPAY banner clears on it
+    # (sas_host.HandpayLatch).
+    SASExceptionInfo(0x55, "player cancelled the handpay request",
+                     _C.HANDPAY, "handpay_cancelled"),
     SASExceptionInfo(0x80, "hopper full detected", _C.TILT, "hopper_full"),
     SASExceptionInfo(0x81, "hopper level low detected", _C.TILT,
                      "hopper_low"),
