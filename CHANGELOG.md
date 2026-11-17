@@ -9,6 +9,14 @@ remainder. Twelve smaller items.
   ticket expiry from the issue time, so a ticket stamped years back could
   be removed as expired the same day it printed. The machine's date is
   kept with the ticket for the record.
+- **The machine's clock is kept in step.** The satellite reads the
+  machine's date and time when it comes online and once a day, and sets
+  it when it is more than five seconds off. That is what the machine
+  prints on tickets and writes in its own logs, and it is wrong after a
+  RAM clear. The satellite only sets it when its own clock comes from a
+  time source (NTP); a Pi that started without one leaves the machine
+  alone and says so in its log. A machine kept right some other way,
+  such as over G2S, just reads as in step.
 - **The hub offers the right denomination for every machine.** A SAS
   machine reports its accounting denomination as a code. The hub only
   knew one code (1 cent), so any other machine showed a bare code for the

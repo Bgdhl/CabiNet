@@ -406,3 +406,78 @@ class TestGameEnableCommands:
               "enable": True, "denom": 1}])
         assert "outside the range" in run["by_id"]["zero-1"]["experiment"]
         assert "experiment" not in run["by_id"]["real-1"]
+
+
+# ---------------------------------------------------------------------------
+# The machine's clock is kept in step (item 22, the owner's choice)
+# ---------------------------------------------------------------------------
+
+import sas_host
+
+
+def _clocked(skew):
+    machine = ByTheBookMachine()
+    machine.clock_skew = skew
+    fixed = datetime.datetime(2026, 11, 17, 3, 30, 0)
+    machine.wall_clock = lambda: fixed
+    port = ImpliedAckTransport(MockSASSerialPort(machine))
+    return machine, port, (lambda: fixed)
+
+
+def _sync(port, clock, synced=True):
+    return sas_host.sync_machine_clock(port, 1, SASProtocol(),
+                                       synced=lambda: synced, clock=clock,
+                                       sleep=NO_SLEEP)
+
+
+class TestMachineClock:
+    def test_a_clock_in_step_is_left_alone(self):
+        machine, port, clock = _clocked(3)
+        out = _sync(port, clock)
+        assert (out["state"], out["driftSec"]) == ("in_step", 3)
+        assert machine.clock_sets == 0
+
+    def test_a_clock_years_back_is_set(self):
+        """After a RAM clear, or with a dead clock battery."""
+        machine, port, clock = _clocked(-26 * 365 * 86400)
+        out = _sync(port, clock)
+        assert out["state"] == "set"
+        assert "behind this satellite; set to 2026-11-17T03:30:00" \
+            in out["detail"]
+        assert machine.clock_sets == 1 and machine.clock_skew == 0
+        assert _sync(port, clock)["state"] == "in_step"
+
+    def test_a_clock_ahead_is_set_too(self):
+        machine, port, clock = _clocked(90)
+        out = _sync(port, clock)
+        assert out["state"] == "set" and "ahead of" in out["detail"]
+
+    @pytest.mark.parametrize("synced", [False, None])
+    def test_a_satellite_with_no_time_source_does_not_set_it(self, synced):
+        """A Pi has no clock battery; one that started without a time
+        source may itself be months out."""
+        machine, port, clock = _clocked(-4000)
+        out = _sync(port, clock, synced=synced)
+        assert out["state"] == "not_trusted"
+        assert machine.clock_sets == 0 and machine.clock_skew == -4000
+
+    def test_a_machine_that_keeps_no_clock(self):
+        machine = ByTheBookMachine()
+        port = ImpliedAckTransport(MockSASSerialPort(machine))
+        out = _sync(port, datetime.datetime.now)
+        assert out["state"] == "unread"
+        assert not [f for f, _ in port.sent_frames
+                    if len(f) > 1 and f[1] == 0x7F]
+
+    def test_a_machine_that_refuses(self):
+        machine, port, clock = _clocked(-4000)
+        machine.nack[0x7F] = 1
+        assert _sync(port, clock)["state"] == "refused"
+        assert machine.clock_skew == -4000
+
+    def test_the_frame(self):
+        machine, port, clock = _clocked(-4000)
+        _sync(port, clock)
+        sent = [bytes(f) for f, _ in port.sent_frames
+                if len(f) > 1 and f[1] == 0x7F][0]
+        assert sent[2:9] == bytes.fromhex("11172026033000")   # MMDDYYYY HHMMSS

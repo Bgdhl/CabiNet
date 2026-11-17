@@ -33,10 +33,12 @@ import json
 import signal
 import socket
 import struct
+import subprocess
 import sys
 import threading
 import time
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -57,6 +59,7 @@ from core.sas_machine_info import (parse_enabled_game_numbers,
                                    denom_code_cents)
 from core.sas_meters import (SAS_FAST_POLL, SAS_POLL_FLOOR,
                              build_enabled_features_poll, build_meter_poll,
+                             build_receive_date_time_poll, parse_date_time,
                              parse_enabled_features, parse_meters_10_15,
                              parse_single_meter, parse_total_games)
 from core.sas_handpay_reset import (HANDPAY_PENDING_EXCEPTION,
@@ -446,6 +449,95 @@ def _restricted_moved(res) -> int:
             or final.restricted_cents is None:
         return 0
     return int(final.restricted_cents)
+
+
+# ---------------------------------------------------------------------------
+# The machine's clock (SAS 6.02 §7.17 long poll 7F, §7.18 long poll 7E)
+# ---------------------------------------------------------------------------
+CLOCK_CHECK_SEC = 86400         # once a day, and whenever the machine comes up
+CLOCK_RETRY_SEC = 300           # after a check the machine was too busy for
+CLOCK_LEAVE_SEC = 6 * 3600      # after one that cannot succeed just now
+CLOCK_TOLERANCE_SEC = 5         # closer than this is "in step"
+
+
+def satellite_clock_synced():
+    """Is THIS computer's clock set from a time source? True, False, or
+    None when that cannot be told (no timedatectl).
+
+    A Pi has no clock battery. One that started without a time source
+    carries on from the last time it saved, which can be months back, and
+    must not hand that to a machine as the time."""
+    try:
+        out = subprocess.run(
+            ["timedatectl", "show", "-p", "NTPSynchronized", "--value"],
+            capture_output=True, text=True, timeout=3).stdout.strip().lower()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return {"yes": True, "no": False}.get(out)
+
+
+def sync_machine_clock(transport, address, protocol,
+                       synced=satellite_clock_synced,
+                       tolerance=CLOCK_TOLERANCE_SEC,
+                       clock=datetime.now, sleep=time.sleep,
+                       pace=SAS_POLL_FLOOR) -> dict:
+    """Read the machine's date and time (long poll 7E) and, when it is off
+    by more than `tolerance` seconds, set it (long poll 7F, type S).
+
+    Why (AJ, 2026-11-17: "for logs sake ... its probably better to keep the
+    machine in sync"): the machine's clock is what it prints on a ticket
+    and writes in its own logs and in every validation record. Nothing here
+    set it or looked at it. It is wrong after a RAM clear and on a machine
+    with a dead clock battery.
+
+    Returns {"state", "driftSec", "machineTime", "detail"}. state is:
+
+      in_step      within tolerance; nothing sent but the read
+      set          it was off, and the machine acknowledged the new time
+      not_trusted  it is off, but this satellite's own clock is not set
+                   from a time source, so the machine's was left alone
+      unread       the machine did not answer 7E (it may not keep a clock)
+      refused / busy / silent   what the machine answered to 7F
+
+    The time sent is this satellite's local time, which is what the
+    machine shows and prints. A machine kept right some other way (a WMS
+    Bluebird 2 over G2S) simply reads in_step."""
+    out = {"state": "unread", "driftSec": None, "machineTime": None,
+           "detail": "the machine did not answer the clock read (7E)"}
+    resp = transport.transact(build_meter_poll(address, 0x7E))
+    packet = protocol.parse_packet(resp) if resp else None
+    if packet is None or packet.address != address \
+            or packet.command != 0x7E:
+        return out
+    try:
+        theirs = parse_date_time(packet.data)
+    except ValueError as e:
+        out["detail"] = f"the machine's clock read does not parse ({e})"
+        return out
+    drift = (theirs - clock()).total_seconds()
+    out.update(driftSec=round(drift), machineTime=theirs.isoformat())
+    how = (f"{abs(round(drift))} s "
+           + ("ahead of" if drift > 0 else "behind") + " this satellite")
+    if abs(drift) <= tolerance:
+        out.update(state="in_step", detail=f"machine clock {how}")
+        return out
+    if synced() is not True:
+        out.update(state="not_trusted",
+                   detail=f"machine clock is {how}, but this satellite's "
+                          "own clock is not set from a time source, so the "
+                          "machine's was left alone")
+        return out
+    sleep(pace)
+    when = clock().replace(microsecond=0)
+    answer = classify_type_s(
+        transport.transact(build_receive_date_time_poll(address, when)),
+        address)
+    out.update(
+        state={"ack": "set", "nack": "refused"}.get(answer, answer),
+        detail=(f"machine clock was {how}; set to {when.isoformat()}"
+                if answer == "ack" else
+                f"machine clock is {how}; setting it got: {answer}"))
+    return out
 
 
 CASHOUT_REQUEST = 0x6A          # AFT request for host cashout
@@ -1981,6 +2073,7 @@ def main():
     # without logging each of the ~5 polls/second.
     hb = {"last": time.monotonic()}
     aft_next = {"at": 0.0}       # next due time for the AFT status cache read
+    clock_next = {"at": 0.0}     # next due time for the machine clock check
     stats["polls"] = 0
 
     def run_hub_command(cmd):
@@ -3381,6 +3474,27 @@ def main():
                 logger.warning("AFT status read failed (ignored): {}", e)
         if not poller.state.online:
             machine_info_read["at"] = 0.0       # re-read after a reconnect
+            clock_next["at"] = 0.0              # and look at its clock again
+        # The machine's clock: looked at when the machine comes up and once
+        # a day, set when it is off (sync_machine_clock). Poll thread, and
+        # only reachable ENABLED, like everything else here.
+        if poller.state.online and now >= clock_next["at"]:
+            clock_next["at"] = now + CLOCK_RETRY_SEC
+            try:
+                time.sleep(SAS_POLL_FLOOR)
+                ck = sync_machine_clock(poller.transport, args.address,
+                                        poller.protocol)
+                clock_next["at"] = now + (
+                    CLOCK_CHECK_SEC if ck["state"] in ("in_step", "set")
+                    else CLOCK_RETRY_SEC if ck["state"] in ("busy", "silent")
+                    else CLOCK_LEAVE_SEC)
+                stats["clock"] = dict(
+                    ck, checkedAt=time.strftime("%Y-%m-%dT%H:%M:%S"))
+                (logger.info if ck["state"] in ("in_step", "set", "unread")
+                 else logger.warning)("🕒 {} ({})", ck["detail"],
+                                      ck["state"])
+            except Exception as e:                    # noqa: BLE001
+                logger.warning("machine clock check failed (ignored): {}", e)
         # Machine-info + games-census read (identity 0x1F + A0/51/56 census).
         # A SAS machine reports its ACCOUNTING DENOMINATION on the 0x1F frame.
         # The code and its Table C-4 value both go to the hub; neither is
