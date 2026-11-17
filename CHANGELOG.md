@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.3.18
+First batch from an audit of the G2S host against the G2S Message
+Protocol 1.0.3 document: the four items where money or a locked machine
+is at stake. None shows in ordinary play on the machines this has run
+on; each needs an uncommon event.
+- **A ticket printed after a machine's memory was cleared is no longer
+  lost.** A cleared machine numbers its transactions from 1 again. The
+  hub recognised a repeat by that number alone, so a new ticket that
+  landed on an old number was acknowledged and not recorded, and was
+  refused when it came back. The same went for the end of a redemption
+  and for a handpay: a new lockup could be acknowledged and never appear
+  on the hub. A repeat is now the same number and the same ticket (or
+  the same moment, for a handpay).
+- **A machine holding ticket numbers this hub did not issue is given new
+  ones at once.** After the hub's ticket store has been replaced, or with
+  a machine that last ran on another hub, the machine's stored numbers
+  are no good here. When such a machine asked for no new numbers, the hub
+  left the old ones in place, and the tickets printed from them were
+  refused later.
+- **Resetting a handpay asks for the right amount when the machine paid
+  part of the win itself.** The hub took the machine-paid part off the
+  amount a second time. A win of 2,000 with 1,200 paid to the meter
+  showed a lockup of 0, and the reset was refused. With nothing
+  machine-paid, which is every handpay seen so far, nothing changes.
+- **A wallet cash-out cannot be credited twice after a long absence.** A
+  machine keeps sending the end of a transfer until the hub's answer
+  reaches it. If it then stayed off the network while the rest of the
+  floor was busy, the hub could forget the transfer and credit the
+  wallet again when the machine returned. The hub now notes on the
+  transfer itself that its money has moved, and keeps each machine's
+  transfers apart.
+
 ## v0.3.17
 The last four items of the SAS audit. With these it is complete.
 - **The machine is polled while the hub decides on a ticket.** When a

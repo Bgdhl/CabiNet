@@ -125,7 +125,7 @@ if "tournament_names" not in _hub_store_mod.HOST_SETTING_KEYS:
 # the MINOR bump per the repo's version rule). Surfaced in engine_meta() ->
 # /api/status ["_engine"]["version"]; bump this and add a CHANGELOG.md
 # section on every commit with a user-visible change.
-CABINET_VERSION = "0.3.17"
+CABINET_VERSION = "0.3.18"
 
 WSDL_NS = "http://www.gamingstandards.com/wsdl/g2s/v1.0"
 SCHEMA_NS = "http://www.gamingstandards.com/g2s/schemas/v1.0.3"
@@ -720,6 +720,18 @@ def escape_g2s_string(s):
 
 def localname(tag):
     return tag.rsplit("}", 1)[-1]
+
+
+def g2s_true(value):
+    """A G2S boolean attribute that is set. The type is XML Schema's
+    boolean, whose true is spelled "true" or "1" (Appendix A)."""
+    return str(value or "").strip().lower() in ("true", "1")
+
+
+def same_stamp(a, b):
+    """Do two date-time attributes name the same moment, as far as can be
+    told? An absent one cannot say no."""
+    return not a or not b or a == b
 
 
 def attr(el, name):
@@ -1981,6 +1993,9 @@ class EgmAssociation:
         # resident page without waiting out a pre-reboot throttle window.
         self.glass_push = {}
         self.glass_recovery_ts = 0.0
+        # a validation-list reconcile that was in flight belongs to the old
+        # epoch; left set, it would stop every later one from starting
+        self.voucher_reconciling = False
         # visibility belief resets to unknown-hidden; the button toggle
         # self-corrects in one press if the window survived visible
         self.glass_visible = False
@@ -2565,16 +2580,47 @@ class VoucherStore:
             self._save_locked()
         return list_id, items
 
+    @staticmethod
+    def same_transaction(egm_id, kind, txn, vid, stored, masked=False):
+        """Is `stored` (a ring record) the transaction (egm, kind, txn, vid)?
+
+        The transactionId alone does not say so. After a memory reset an
+        EGM counts transactionIds from 1 again (§1.21: on deviceReset the
+        host "MUST assume that the ... transaction identifiers ... of the
+        EGM may have been compromised"), while this ring keeps that
+        machine's last few hundred records. Until v0.3.18 a new ticket
+        whose issueVoucher landed on an old transactionId was taken for a
+        retry: acknowledged, not recorded, its validationId left 'unused',
+        and refused when it came back. A real retry is the same command
+        again, so it carries the same validationId; a new ticket never
+        does, because every id is issued once. A record that carries no
+        validationId (very old builds) still matches on the rest.
+
+        masked=True is for an entry read from the EGM's voucher log, where
+        §21.26 has the validationId masked down to its last four digits:
+        only those are compared."""
+        if stored.get("egmId") != egm_id or \
+                stored.get("transactionId") != txn:
+            return False
+        skind = "commit" if stored.get("kind") == "redeem" \
+            else stored.get("kind")
+        if skind != kind:
+            return False
+        svid = stored.get("validationId") or ""
+        if not svid or not vid:
+            return True
+        return svid[-4:] == vid[-4:] if masked else svid == vid
+
     def record_voucher(self, egm_id, rec):
-        """Persist an issue/commit record. Returns True if this (egmId, kind,
-        transactionId) is already recorded — the EGM retrying an unacked
-        command (§21.5 duplicate detection) — so the caller re-acks WITHOUT
-        double-recording."""
+        """Persist an issue/commit record. Returns True if this transaction
+        is already recorded — the EGM retrying an unacked command (§21.5
+        duplicate detection) — so the caller re-acks WITHOUT
+        double-recording. See same_transaction for what counts."""
         with self.lock:
             for v in self.state["vouchers"]:
-                if v.get("egmId") == egm_id and \
-                        v.get("kind") == rec.get("kind") and \
-                        v.get("transactionId") == rec.get("transactionId"):
+                if self.same_transaction(
+                        egm_id, rec.get("kind"), rec.get("transactionId"),
+                        rec.get("validationId") or "", v):
                     return True
             stored = dict(rec)
             stored["egmId"] = egm_id
@@ -2868,10 +2914,9 @@ class VoucherStore:
             # Normalize legacy merge records: earlier builds keyed redeem
             # entries as kind='redeem' while the live commitVoucher path
             # records 'commit' — treat them as the same kind so both dedupe.
-            seen = {(v.get("egmId"),
-                     "commit" if v.get("kind") == "redeem" else v.get("kind"),
-                     v.get("transactionId"))
-                    for v in ring}
+            # (same_transaction also treats a legacy 'redeem' record as a
+            # 'commit', and a transactionId the EGM used again after a
+            # memory reset as a different transaction)
             for e in entries:
                 kind = "issue" if e.get("voucherAction") == "G2S_issue" \
                     else "commit"
@@ -2883,7 +2928,10 @@ class VoucherStore:
                     # this txn merges on a later fetch.
                     summary["open"] += 1
                     continue
-                if (egm_id, kind, txn) in seen:
+                if any(self.same_transaction(
+                        egm_id, kind, txn, e.get("validationId") or "", v,
+                        masked=True)
+                        for v in ring):
                     summary["known"] += 1
                     continue
                 summary["merged"] += 1
@@ -2903,7 +2951,6 @@ class VoucherStore:
                     "expireDateTime": e.get("expireDateTime"),
                     "source": "egmLog", "seenAt": now_iso(),
                 })
-                seen.add((egm_id, kind, txn))
                 if len(vid) != 18 or not vid.isdigit():
                     # masked/garbled id — ring history only
                     summary["masked"] += 1
@@ -3237,16 +3284,20 @@ class WatStore:
                        a NON-ZERO requestId on every initiateRequest; never
                        reused across restarts, so a stale EGM retry can never
                        collide with a fresh push);
-      * transfers    — bounded ring of per-transfer records keyed by
-                       (egmId, transactionId) and, pre-transactionId, by
-                       (egmId, requestId).
+      * transfers    — per-transfer records keyed by (egmId,
+                       transactionId) and, pre-transactionId, by (egmId,
+                       requestId). Bounded PER MACHINE (the newest
+                       KEEP_TRANSFERS each); a transfer whose escrow is
+                       still out is never dropped (_append_locked).
 
     Each record walks the §22.7 state machine:
         requested -> pending -> initiated -> authorized
                   -> committed / denied / failed / cancelled
     commitSeen is the §22.31 dedupe latch — the EGM re-sends commitTransfer
     until acked, so a duplicate re-acks WITHOUT re-applying the account
-    movement (the duplicate-issueVoucher treatment). All transitions are
+    movement (the duplicate-issueVoucher treatment). "legs" names the
+    account movements already made for the record (mark_leg), which is
+    what a retry is checked against. All transitions are
     atomic under self.lock and survive host restarts mid-transfer: the
     assoc-level ring is just a presentation mirror of this store.
 
@@ -3315,11 +3366,54 @@ class WatStore:
                 return rec
         return None
 
+    @staticmethod
+    def _holds_escrow(rec):
+        """Authorized and not yet closed by the machine's commit: the
+        funding account has been debited for it and the refund (or the
+        reconcile to what really moved) is still to come."""
+        return rec.get("state") == "authorized" and not rec.get("commitSeen")
+
     def _append_locked(self, rec):
+        """Add a record and trim. Each machine keeps its own newest
+        KEEP_TRANSFERS records, and a record whose escrow is still out is
+        never dropped, however old.
+
+        Until v0.3.18 this was one ring of 200 for the whole floor, cut
+        whatever the records' state. §22.31: "The EGM MUST continue to
+        send the commitTransfer command until a valid commitTransferAck
+        command is received", with no time limit. A machine whose ack was
+        lost and which then stayed off the network came back to find its
+        record pushed out by 200 transfers on OTHER machines; its commit
+        was then recorded as a new transaction and the wallet credited a
+        second time. A machine that is away adds no records of its own, so
+        with a ring per machine the record is still here when it returns."""
         self.state["transfers"].append(rec)
-        if len(self.state["transfers"]) > self.KEEP_TRANSFERS:
-            self.state["transfers"] = \
-                self.state["transfers"][-self.KEEP_TRANSFERS:]
+        egm = rec.get("egmId")
+        mine = [r for r in self.state["transfers"]
+                if r.get("egmId") == egm and not self._holds_escrow(r)]
+        extra = len(mine) - self.KEEP_TRANSFERS
+        if extra > 0:
+            drop = {id(r) for r in mine[:extra]}
+            self.state["transfers"] = [r for r in self.state["transfers"]
+                                       if id(r) not in drop]
+
+    def mark_leg(self, egm_id, txn_id, created_at, leg):
+        """Note on the record that one of its account movements (escrow /
+        commit / refund) has been made. The record is found by its
+        transactionId AND its createdAt, the same pair the ledger ref is
+        built from, so a transactionId the EGM used again after a memory
+        reset is never marked for the earlier transfer's money."""
+        with self.lock:
+            for rec in reversed(self.state["transfers"]):
+                if rec.get("egmId") == egm_id \
+                        and str(rec.get("transactionId")) == str(txn_id) \
+                        and rec.get("createdAt") == created_at:
+                    legs = rec.setdefault("legs", [])
+                    if leg not in legs:
+                        legs.append(leg)
+                        self._save_locked()
+                    return True
+        return False
 
     def find(self, egm_id, txn_id=None, request_id=None):
         with self.lock:
@@ -4103,8 +4197,14 @@ class G2SHost:
     def __init__(self, host_id="1", sync_timer=30000, inline=False,
                  auto_enable=True, keepalive_ms=0, harvest=False,
                  subscribe=True, host_uri=None, host_base=DEFAULT_HOST_BASE,
-                 auto_clock=True, game_sweep=False):
+                 auto_clock=True, game_sweep=False, data_dir=None):
         self.host_id = host_id
+        # Where the durable stores live: G2S/data beside this file, always,
+        # on a hub. data_dir is for a gate that builds a real host and must
+        # not open a real floor's wallets and vouchers to do it
+        # (tools/test_g2s_by_the_book.py).
+        data = data_dir or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "data")
         self.sync_timer = sync_timer
         # host_base: this host's own reachable base URL (install-time
         # configurable via --host-base — lite mode puts the host on a plain
@@ -4180,35 +4280,28 @@ class G2SHost:
         # relative (like webui/) so it works from any cwd; runtime state,
         # gitignored. Own lock — never taken while holding assoc.lock.
         self.voucher_store = VoucherStore(os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "data",
-            "voucher_state.json"))
+            data, "voucher_state.json"))
         # GR-10: durable optionConfig inventory beside the voucher store —
         # config-sync only re-fires on deviceReset, so a warm host restart
         # must reload config_devices/config_options rather than sit blind
         # until the EGM's next reboot. Own lock — never taken while holding
         # assoc.lock.
         self.config_store = ConfigInventoryStore(os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "data",
-            "config_inventory.json"))
+            data, "config_inventory.json"))
         # wat (G2S-39): durable transfer ledger + enthusiast accounts beside
         # the voucher store. Own locks — never taken while holding assoc.lock.
-        self.wat_store = WatStore(os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "data",
-            "wat_state.json"))
+        self.wat_store = WatStore(os.path.join(data, "wat_state.json"))
         self.account_store = AccountStore(os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "data",
-            "account_state.json"))
+            data, "account_state.json"))
         # hub.db (SQLite spine): the cross-protocol machine registry +
         # server-side nicknames — one source of truth so the DSI kiosk and a
         # phone show the same names (localStorage-per-browser can't). Money
         # tables migrate here in a later phase; this slice is names only.
-        self.hub_store = HubStore(os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "data", "hub.db"))
+        self.hub_store = HubStore(os.path.join(data, "hub.db"))
         # Optional hub login (web_auth.py): off unless the owner turns it
         # on. Handlers reach it with getattr — a bench engine built without
         # __init__ has none, and no gate means open, as it always was.
-        self.web_auth = web_auth.WebAuth(self.hub_store, os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "data"))
+        self.web_auth = web_auth.WebAuth(self.hub_store, data)
         # Money symbol: the stored setting wins; else the first cabinet's
         # currencyId adopts it when its profile arrives (refresh_currency).
         self.refresh_currency()
@@ -16569,9 +16662,10 @@ class G2SHost:
         be reset). txn_id defaults to the OLDEST pending handpay; an
         explicit key_off_type still overrides — the EGM is the enforcer
         and answers G2S_JPX002 for a type it did not offer.
-        keyOff*Amt = request*Amt − egmPaid*Amt (the un-paid remainder; the
-        host MAY adjust per §11.14 — a shortfall makes the EGM issue a fresh
-        handpayRequest). Owner-only; pre-ownership the AVP just g2sAcks then
+        keyOff*Amt = request*Amt, the amounts the EGM said require a
+        handpay (what it paid itself, egmPaid*Amt, is not part of them; the
+        host MAY send other amounts per §11.14, and a shortfall makes the
+        EGM issue a fresh handpayRequest). Owner-only; pre-ownership the AVP just g2sAcks then
         stays silent — the record parks at keyOffSent and snapshot() derives
         a lazy 30s timeout (no timer threads, no retry storms). Success path:
         remoteKeyOffAck (JPE103) then keyedOff -> our keyedOffAck."""
@@ -18366,16 +18460,22 @@ class G2SHost:
             # host push still waiting on that machine's answer (requested/
             # pending) died with its RAM, and the epoch bump above just
             # dropped any still-queued initiateRequest too: abandon them so
-            # they can't wedge pendingTransfers forever. Full fencing of
-            # the transfer ring keyed on these flags is deliberately NOT
-            # done — this AVP raises all four flags on EVERY boot (capture
-            # 20250725), so they cannot discriminate a RAM clear from a
-            # plain reboot, and the §22.31 cross-reboot commitTransfer
-            # retry must keep deduping. transactionId reuse after a REAL
-            # RAM clear is handled where it bites instead: the field-match
-            # reuse checks in WatStore.on_initiate/on_commit.
-            if flags.get("deviceReset") == "true" or \
-                    flags.get("metersReset") == "true":
+            # they can't wedge pendingTransfers forever. The records of
+            # earlier transactions are NOT fenced off on these flags. §1.21
+            # has the EGM set all four on its first contact with a host and
+            # keep them set until that host's commsOnLineAck arrives (which
+            # is what the 20250725 capture shows: no ack had been accepted
+            # yet), and again when the host's address changes, so a flag
+            # does not by itself say "RAM clear"; and a real retry across a
+            # reboot must still be recognised (§22.31). What the document
+            # does require on deviceReset is to "assume that the ...
+            # transaction identifiers ... may have been compromised", and
+            # that is done where it bites: a transaction counts as one
+            # already seen only when its own facts match, not just its
+            # number (WatStore.on_initiate/on_commit,
+            # VoucherStore.same_transaction, the handpay branches below).
+            if g2s_true(flags.get("deviceReset")) or \
+                    g2s_true(flags.get("metersReset")):
                 for r in self.wat_store.abandon_open_requests(
                         assoc.egm_id, "egm reset (commsOnLine flags)"):
                     self._wat_mirror(assoc, r)
@@ -19291,10 +19391,11 @@ class G2SHost:
                 # or every fresh entry would be skipped as 'already merged'
                 # until the new sequence climbed past the old one. (The
                 # commsOnLine metersReset flag is deliberately NOT used for
-                # this: the real AVP raises all four reset flags on every
-                # boot commsOnLine — capture 20250725 — so it cannot
-                # discriminate an actual RAM clear from a plain reboot, and
-                # resetting on it would re-merge rolled-off entries.)
+                # this: §1.21 has an EGM raise all four reset flags on
+                # first contact with a host and until that host's ack is
+                # accepted — capture 20250725 — so a flag cannot by itself
+                # tell a RAM clear from a first join, and resetting on it
+                # would re-merge rolled-off entries.)
                 if entries and prev_last and entries[-1][0] and \
                         entries[-1][0] < prev_last:
                     restarted_from = prev_last
@@ -20539,11 +20640,30 @@ class G2SHost:
                 cap = int(prof_max)
             except (TypeError, ValueError):
                 cap = 0
+            # a full buffer: the profile's maxValIds, else Table 21.12's
+            # default of 20
+            full_buffer = cap if cap > 0 else 20
             if cap <= 0:
                 cap = 100
             num = max(0, min(num, cap))
             known = self.voucher_store.last_list_id(assoc.egm_id)
             delete_current = expired or egm_list_id != str(known)
+            # The EGM holds a list this host did not issue (a replaced or
+            # rewound voucher store, or a machine last served by another
+            # host). Everything it prints from that list would be refused
+            # when it came back. §21.16 gives deleteCurrent for exactly
+            # this ("if, for example, an EGM comes online with a
+            # validationListId the host does not recognize"), so the whole
+            # buffer is replaced NOW, however many ids were asked for. An
+            # EGM whose buffer is above its minimum asks for none (§21.15:
+            # numValidationIds "should be set to 0"), and until v0.3.18 that
+            # request was answered by handing the unknown list id back with
+            # deleteCurrent=false: the stale ids stayed in use until the
+            # buffer ran low.
+            stale = egm_list_id not in ("", "0") \
+                and egm_list_id != str(known)
+            if stale:
+                num = max(num, full_buffer)
             if num > 0:
                 list_id, items = self.voucher_store.new_validation_list(
                     assoc.egm_id, num)
@@ -20572,7 +20692,12 @@ class G2SHost:
                 # numValidationIds=0: buffer still above minLevelValIds. An
                 # EMPTY validationData is the prescribed reply (Table 21.15)
                 # and still resets the EGM's valIdListRefresh/Life timers.
+                # The list id echoed is one we issued (or 0 for a machine
+                # that has none): a list we do not know took the branch
+                # above.
                 list_id, items_xml, delete_current = egm_list_id, "", False
+                with assoc.lock:
+                    assoc.voucher_reconciling = False
                 log.info("🎫 [%s] getValidationData(num=0) -> empty "
                          "validationData (timer refresh, listId=%s)",
                          assoc.egm_id, list_id)
@@ -20860,27 +20985,33 @@ class G2SHost:
                 if not open_hp:
                     closed += 1
                     continue
+                lg_dt = attr(lg, "handpayDateTime") or ""
                 with assoc.lock:
-                    known = txn in assoc.handpays_pending or any(
-                        h.get("transactionId") == txn for h in assoc.handpays)
+                    held = assoc.handpays_pending.get(txn)
+                    if held is not None and not same_stamp(
+                            held.get("handpayDateTime"), lg_dt):
+                        # the EGM's open lockup under this number is not
+                        # the one we hold: ours died with its memory
+                        held.update(state="lostAtEgmReset",
+                                    closedAt=now_iso())
+                        assoc.handpays.append(
+                            assoc.handpays_pending.pop(txn))
+                        held = None
+                    known = held is not None or any(
+                        h.get("transactionId") == txn and same_stamp(
+                            h.get("handpayDateTime"), lg_dt)
+                        for h in assoc.handpays)
                     if not known:
                         assoc.handpays_pending[txn] = {
                             "transactionId": txn,
                             "deviceId": attr(lg, "deviceId") or "1",
                             "handpayType": attr(lg, "handpayType"),
                             "handpayDateTime": attr(lg, "handpayDateTime"),
-                            "pendingCashableAmt":
-                                lg_amt("requestCashableAmt")
-                                - min(lg_amt("egmPaidCashableAmt"),
-                                      lg_amt("requestCashableAmt")),
-                            "pendingPromoAmt":
-                                lg_amt("requestPromoAmt")
-                                - min(lg_amt("egmPaidPromoAmt"),
-                                      lg_amt("requestPromoAmt")),
-                            "pendingNonCashAmt":
-                                lg_amt("requestNonCashAmt")
-                                - min(lg_amt("egmPaidNonCashAmt"),
-                                      lg_amt("requestNonCashAmt")),
+                            # the request amounts ARE what is owed (see the
+                            # handpayRequest branch)
+                            "pendingCashableAmt": lg_amt("requestCashableAmt"),
+                            "pendingPromoAmt": lg_amt("requestPromoAmt"),
+                            "pendingNonCashAmt": lg_amt("requestNonCashAmt"),
                             "requestCashableAmt": lg_amt("requestCashableAmt"),
                             "requestPromoAmt": lg_amt("requestPromoAmt"),
                             "requestNonCashAmt": lg_amt("requestNonCashAmt"),
@@ -20935,6 +21066,7 @@ class G2SHost:
             # own example uses G2S_largeWin — store whatever arrives.
             el = req["commandEl"]
             txn = attr(el, "transactionId") or "0"
+            hp_dt = attr(el, "handpayDateTime") or ""
 
             def hp_amt(name):
                 try:
@@ -20942,27 +21074,49 @@ class G2SHost:
                 except ValueError:
                     return 0
             with assoc.lock:
-                dup = txn in assoc.handpays_pending or any(
-                    h.get("transactionId") == txn for h in assoc.handpays)
+                # A retry is the same request again: the same transactionId
+                # AND the same handpayDateTime. The number alone does not
+                # say so: after a memory reset the EGM counts from 1 again
+                # (§1.21), and until v0.3.18 a new lockup that landed on an
+                # earlier handpay's number was acknowledged and not
+                # recorded, so the machine sat locked with nothing on the
+                # hub to reset.
+                held = assoc.handpays_pending.get(txn)
+                if held is not None and not same_stamp(
+                        held.get("handpayDateTime"), hp_dt):
+                    # the lockup we hold under this number is gone with the
+                    # EGM's memory; this is a new one
+                    held.update(state="lostAtEgmReset", closedAt=now_iso())
+                    assoc.handpays.append(assoc.handpays_pending.pop(txn))
+                    held = None
+                dup = held is not None or any(
+                    h.get("transactionId") == txn and same_stamp(
+                        h.get("handpayDateTime"), hp_dt)
+                    and h.get("state") != "lostAtEgmReset"
+                    for h in assoc.handpays)
                 if not dup:
                     rec = {
                         "transactionId": txn,
                         "deviceId": req["deviceId"],
                         "handpayType": attr(el, "handpayType"),
                         "handpayDateTime": attr(el, "handpayDateTime"),
-                        # request − egmPaid = what still needs keying off
-                        "pendingCashableAmt":
-                            hp_amt("requestCashableAmt")
-                            - min(hp_amt("egmPaidCashableAmt"),
-                                  hp_amt("requestCashableAmt")),
-                        "pendingPromoAmt":
-                            hp_amt("requestPromoAmt")
-                            - min(hp_amt("egmPaidPromoAmt"),
-                                  hp_amt("requestPromoAmt")),
-                        "pendingNonCashAmt":
-                            hp_amt("requestNonCashAmt")
-                            - min(hp_amt("egmPaidNonCashAmt"),
-                                  hp_amt("requestNonCashAmt")),
+                        # What still needs keying off is the REQUEST amount
+                        # itself. Table 11.6: request*Amt is the amount
+                        # "requiring a handpay", egmPaid*Amt the part of
+                        # the same win "paid by the EGM", and §11.12: the
+                        # source transactions' totals "MUST equal the total
+                        # amounts recorded in the EGM-paid and
+                        # handpay-request attributes". So win = egmPaid +
+                        # request. Until v0.3.18 this took egmPaid off the
+                        # request a second time: a win of 2,000 with 1,200
+                        # paid to the meter showed a lockup of 0 and sent a
+                        # key-off of 0, which a machine refuses, and it
+                        # stayed locked. With nothing EGM-paid, which is
+                        # every handpay seen on a real machine so far, the
+                        # two readings give the same figure.
+                        "pendingCashableAmt": hp_amt("requestCashableAmt"),
+                        "pendingPromoAmt": hp_amt("requestPromoAmt"),
+                        "pendingNonCashAmt": hp_amt("requestNonCashAmt"),
                         "requestCashableAmt": hp_amt("requestCashableAmt"),
                         "requestPromoAmt": hp_amt("requestPromoAmt"),
                         "requestNonCashAmt": hp_amt("requestNonCashAmt"),
@@ -21040,10 +21194,16 @@ class G2SHost:
             kcash, kpromo, knon = (ko_amt("keyOffCashableAmt"),
                                    ko_amt("keyOffPromoAmt"),
                                    ko_amt("keyOffNonCashAmt"))
+            ko_dt = attr(el, "keyOffDateTime") or ""
             with assoc.lock:
                 rec = assoc.handpays_pending.pop(txn, None)
+                # a retry is the same key-off again: same number, same
+                # keyOffDateTime (see the handpayRequest branch)
                 dup = rec is None and any(
-                    h.get("transactionId") == txn for h in assoc.handpays)
+                    h.get("transactionId") == txn
+                    and h.get("state") == "keyedOff"
+                    and same_stamp(h.get("keyOffDateTime"), ko_dt)
+                    for h in assoc.handpays)
                 if rec is None and not dup:
                     # local key-off of a lockup whose handpayRequest we never
                     # saw (e.g. pre-ownership) — synthesize the record so the
@@ -21059,7 +21219,7 @@ class G2SHost:
                         "state": "keyedOff", "keyOffType": ko_type,
                         "keyOffCashableAmt": kcash, "keyOffPromoAmt": kpromo,
                         "keyOffNonCashAmt": knon,
-                        "keyOffDateTime": attr(el, "keyOffDateTime"),
+                        "keyOffDateTime": ko_dt,
                         "keyedOffAt": now_iso()})
                     assoc.handpays.append(rec)
                     if len(assoc.handpays) > 200:
@@ -21100,7 +21260,12 @@ class G2SHost:
                         sess = self.card_sessions.get(assoc.egm_id) or {}
                         hp_dest = sess.get("accountId") or "house"
                         hp_who = sess.get("name") or "the House"
-                    hp_ref = f"hp:{assoc.egm_id}:{txn}"
+                    # The key-off's own date-time is part of the ref, so
+                    # a retry (same moment) is paid once and a new handpay
+                    # that reuses the number after a memory reset is not
+                    # taken for one already paid.
+                    hp_ref = f"hp:{assoc.egm_id}:{txn}" \
+                        + (f":{ko_dt}" if ko_dt else "")
                     _, aerr = self.account_store.adjust(
                         hp_dest, kcash, kpromo, knon,
                         note=f"handpay paid ({ko_type}) txn {txn}",
@@ -21295,8 +21460,17 @@ class G2SHost:
                 led = self.account_store.ref_totals(
                     self._wat_ref(assoc.egm_id, rec, "escrow"))
                 escrow = tuple(max(0, -d) for d in led)
+            # A leg that is noted on the record has been made, and is not
+            # made again whatever the ledger still shows. Until v0.3.18 the
+            # only guard on a retried commit was adjust(once=True), which
+            # looks for the ref in the last 2000 ledger entries: a machine
+            # that came back after more than that had moved was credited,
+            # or refunded, a second time. The once=True stays as the guard
+            # for the crash window described above (movement saved, note on
+            # the record not yet).
+            legs_done = rec.get("legs") or []
             if rec.get("watDirection") == "G2S_fromEgm":
-                if total > 0:
+                if total > 0 and "commit" not in legs_done:
                     aerr = None
                     if account_id:
                         _, aerr = self.account_store.adjust(
@@ -21304,6 +21478,10 @@ class G2SHost:
                             trans_rec[2], note="WAT cash-out from EGM",
                             ref=self._wat_ref(assoc.egm_id, rec, "commit"),
                             once=True)
+                        if not aerr:
+                            self.wat_store.mark_leg(
+                                assoc.egm_id, txn, rec.get("createdAt"),
+                                "commit")
                     if not account_id or aerr:
                         # NO HOUSE FALLBACK — reject → ticket (AJ,
                         # CORRECTED 2026-07-12): the credits left the
@@ -21330,7 +21508,7 @@ class G2SHost:
                         # the EGM's §22.31 commit retries find the pin
                         # already gone and send nothing.
                         self._tournament_consume_wat_sweep(assoc)
-            elif sum(escrow) > 0:
+            elif sum(escrow) > 0 and "refund" not in legs_done:
                 refund = tuple(max(0, e - t)
                                for e, t in zip(escrow, trans_rec))
                 if any(t > e for e, t in zip(escrow, trans_rec)):
@@ -21358,6 +21536,10 @@ class G2SHost:
                     if aerr:  # refunds are credits — cannot overdraft
                         log.error("[%s] 🏦 escrow refund FAILED: %s",
                                   assoc.egm_id, aerr)
+                    else:
+                        self.wat_store.mark_leg(
+                            assoc.egm_id, txn, rec.get("createdAt"),
+                            "refund")
             if not dup:
                 with assoc.lock:
                     if ok and rec.get("watDirection") == "G2S_fromEgm":
