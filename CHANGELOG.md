@@ -34,8 +34,11 @@ Fourth batch from the G2S audit: meters and game play. Eight items.
   false, everywhere the hub reads one. A machine that writes them that
   way could be left in a configuration mode, have every denomination
   shown as off, and be sent the same handpay settings at every join.
-- The Games page says on the Disable button when turning that game off
-  turns the whole machine off.
+- A machine can mark a game as one it will not run without. Disabling
+  such a game takes the whole machine out of play (still powered, shown
+  as disabled). The Games page now says so on that game's Disable
+  button. For every other game Disable only makes the title unavailable,
+  as before.
 - A machine whose currency does not have two decimal places (yen, for
   one) gets a note on its tile saying its amounts are off and by how
   much; the hub does not rescale them, and does not put that currency's

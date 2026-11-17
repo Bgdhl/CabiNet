@@ -3148,16 +3148,18 @@ function renderGames(){
       const hOff=String(g.hostEnabled)==="false", eOff=String(g.egmEnabled)==="false";
       const state=hOff?chip("off · host","warn"):eOff?chip("off · machine",""):chip("live","ok");
       const da=`data-egm="${esc(e)}" data-dev="${esc(d)}"`;
-      /* requiredForPlay (the game's own profile): with this game off, the
-         machine turns itself off as a whole. Said on the button, before
-         the tap. Absent on an older hub = no line. */
-      const reqd=String((g.profile||{}).requiredForPlay)==="true";
+      /* requiredForPlay (the machine's own setting for this game): with
+         this game disabled the machine disables itself as a whole: out of
+         play, not powered down. Most games do not have it set, and for
+         those Disable only makes the title unavailable. Said on the
+         button, before the tap. Absent on an older hub = no line. */
+      const reqd=String(g.requiredForPlay)==="true";
       const tog=hOff
         ? `<button class="btn slim" ${da} data-en="1" onclick="gpState(this)">
              <span class="bl">Enable</span></button>`
         : `<button class="btn slim danger" ${da} data-en="0" onclick="gpState(this)">
              <span class="bl">Disable</span>${reqd
-               ?'<span class="ba">the whole machine goes off with it</span>':""}</button>`;
+               ?'<span class="ba">this machine goes out of play without it</span>':""}</button>`;
       /* DENOMS — every supported denom is an always-visible toggle chip;
          lit = active (a player can pick it). Tapping enters edit mode for
          THIS device (GM.denomEdit, module-level so the 2s repaint keeps

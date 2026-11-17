@@ -2445,6 +2445,41 @@ def item_52_a_game_the_machine_needs():
           [a.game_play[d]["profile"]["requiredForPlay"] for d in "123"]
           == ["true", "false", "true"],
           [a.game_play[d]["profile"].get("requiredForPlay") for d in "123"])
+    shown = a.snapshot()["gamePlay"]
+    check("and shown per game",
+          [shown[d]["requiredForPlay"] for d in "123"]
+          == ["true", "false", "true"])
+
+    print("— a game whose profile was read before the hub kept it")
+    host = make_host()
+    egm = online(joined(host, "BTB_required_old"))
+    a = egm.assoc
+    for dev in ("1", "2"):
+        a_known_game(host, egm, dev=dev)
+        with a.lock:        # as a profile stored by an earlier version
+            a.game_play[dev]["profile"].pop("requiredForPlay")
+
+    def protocol_options(dev, value):
+        return ('<g2s:deviceOptions g2s:deviceClass="G2S_gamePlay" '
+                f'g2s:deviceId="{dev}"><g2s:optionGroup '
+                'g2s:optionGroupId="G2S_gamePlayOptions"><g2s:optionItem '
+                'g2s:optionId="G2S_protocolOptions"><g2s:optionCurrentValues>'
+                '<g2s:complexValue g2s:paramId="G2S_protocolParams">'
+                '<g2s:booleanValue g2s:paramId="G2S_requiredForPlay">'
+                f'{value}</g2s:booleanValue></g2s:complexValue>'
+                "</g2s:optionCurrentValues></g2s:optionItem>"
+                "</g2s:optionGroup></g2s:deviceOptions>")
+    egm.send("optionConfig", "<g2s:optionList>" + protocol_options("1", "true")
+             + protocol_options("2", "false") + "</g2s:optionList>")
+    shown = a.snapshot()["gamePlay"]
+    check("the machine's option list says it for every game, so it shows "
+          "without the profile being read again",
+          [shown[d]["requiredForPlay"] for d in "12"] == ["true", "false"],
+          [shown[d].get("requiredForPlay") for d in "12"])
+    check("read back from what the hub keeps of the option list after a "
+          "restart", gh.games_required_for_play(a.config_options)
+          == {"1": "true", "2": "false"},
+          gh.games_required_for_play(a.config_options))
 
 
 def item_27_booleans_written_as_1_and_0():

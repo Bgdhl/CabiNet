@@ -1367,6 +1367,27 @@ def option_values_equal(a, b):
 _BOOL_TEXT = {"true": True, "1": True, "false": False, "0": False}
 
 
+def games_required_for_play(config_options):
+    """{gamePlay deviceId: "true"/"false"} — each game's requiredForPlay as
+    the machine's option list states it (G2S_gamePlayOptions /
+    G2S_protocolOptions, parameter G2S_requiredForPlay: the same setting
+    the gamePlayProfile reports, Table 6.6). The option list is held for
+    every game from the join on; a game's profile is read once and only
+    again when the game changes, so a profile read before v0.3.21 does not
+    carry it."""
+    out = {}
+    for key, opt in (config_options or {}).items():
+        parts = str(key).split("/")
+        if len(parts) != 4 or parts[0] != "G2S_gamePlay" \
+                or parts[3] != "G2S_protocolOptions":
+            continue
+        val = option_param_values((opt or {}).get("currentValues")).get(
+            "G2S_requiredForPlay")
+        if val is not None:
+            out[parts[1]] = g2s_bool(val)
+    return out
+
+
 def derive_handpay_options(config_options):
     """Rebuild the handpay paramId -> value map (assoc.handpay_options) from a
     STRUCTURED config-options inventory — the same values the live optionList
@@ -1830,6 +1851,10 @@ class EgmAssociation:
         self.meters_at = 0.0
         self.cabinet_at = 0.0
         self.meter_reads = {}
+        # gamePlay device -> "true"/"false": requiredForPlay as the option
+        # list states it (games_required_for_play). /api/status shows it
+        # per game unless the game's own profile says.
+        self.gp_required = {}
         # gamePlay device -> when its profile and denominations were last
         # asked for again because the machine said its configuration
         # changed (one such re-read per device per GP_REREAD_DEBOUNCE_SEC).
@@ -2375,7 +2400,13 @@ class EgmAssociation:
         # record — the stamp must replace it wholesale on the copy, never
         # mutate in place (a late gamePlayStatus still confirms via its
         # sessionId).
-        for gp_copy in game_play.values():
+        for gp_dev, gp_copy in game_play.items():
+            # requiredForPlay: the game's own profile when it carries it,
+            # else what the machine's option list says for that game
+            prof_req = (gp_copy.get("profile") or {}).get("requiredForPlay")
+            gp_copy["requiredForPlay"] = g2s_bool(
+                prof_req if prof_req is not None
+                else self.gp_required.get(gp_dev))
             sc = gp_copy.get("stateChange")
             if sc and sc.get("result") in ("sent", "acked") and \
                     time.time() - sc.get("sentTs", 0) > 30:
@@ -4932,6 +4963,8 @@ class G2SHost:
                     a.config_options = dict(saved.get("configOptions") or {})
                     a.config_seeded = bool(a.config_options)
                     a.handpay_options = derive_handpay_options(
+                        a.config_options)
+                    a.gp_required = games_required_for_play(
                         a.config_options)
                     log.info("[%s] config inventory RELOADED from %s — "
                              "%d device(s), %d option(s), remote key-off "
@@ -14677,11 +14710,15 @@ class G2SHost:
                 a, "gamePlay", dev,
                 f'<g2s:setGamePlayState g2s:enable="{on}"{text}/>',
                 str(sid), "30000")
-            if not enable and g2s_true(((a.game_play.get(dev) or {}).get(
-                    "profile") or {}).get("requiredForPlay")):
+            prof_req = ((a.game_play.get(dev) or {}).get("profile")
+                        or {}).get("requiredForPlay")
+            if not enable and g2s_true(
+                    prof_req if prof_req is not None
+                    else getattr(a, "gp_required", {}).get(dev)):
                 log.warning("🎰 [%s] dev=%s is requiredForPlay: with it "
-                            "disabled the machine disables itself as a "
-                            "whole (Table 6.6, §6.23.1)", a.egm_id, dev)
+                            "disabled the machine takes itself out of "
+                            "play as a whole (Table 6.6, §6.23.1)",
+                            a.egm_id, dev)
             # Per-device tracking in the G2S-21 store. The nested record is
             # REPLACED wholesale on every transition (never mutated in
             # place): snapshot()'s per-device copies are shallow, so the
@@ -21101,9 +21138,10 @@ class G2SHost:
                 "secondaryAllowed": g2s_bool(attr(el, "secondaryAllowed")),
                 "centralAllowed": g2s_bool(attr(el, "centralAllowed")),
                 # Table 6.6: with this true "the EGM MUST be disabled if
-                # either egmEnabled or hostEnabled is set to false": turning
-                # this one title off turns the whole machine off. Kept so
-                # the Games page can say so before the tap.
+                # either egmEnabled or hostEnabled is set to false": with
+                # this one title disabled the machine disables itself (out
+                # of play, not powered down). Kept so the Games page can
+                # say so before the tap.
                 "requiredForPlay": g2s_bool(attr(el, "requiredForPlay")),
                 "wagerCategories": wager_cats,
                 "winLevels": win_levels,
@@ -21412,6 +21450,9 @@ class G2SHost:
                         "valueRows": value_rows,
                     }
                     assoc.config_options.update(dev_options)
+                    if dcls == "G2S_gamePlay":
+                        assoc.gp_required.update(
+                            games_required_for_play(dev_options))
                 synced.append(key)
                 # G2S-25: the handpay device's option VALUES are the
                 # permission gate for remote key-off (G2S_enabledRemoteCredit
