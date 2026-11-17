@@ -1773,6 +1773,9 @@ class EgmAssociation:
         self.sent_requests = {}
         # the hostId a machine addressed us by, when it is not ours (§1.18.1)
         self.host_id_seen = None
+        # requests the machine sent after their own time-to-live had run
+        # out (handle_g2s_message); processed all the same
+        self.stale_requests = 0
         # Communications are established in this epoch: our commsOnLineAck
         # reached the machine (its POST was answered, or the machine went on
         # to send commsDisabled, which it only does after that ack). Until
@@ -2283,6 +2286,9 @@ class EgmAssociation:
             # the host number the machine addresses the hub by, when it is
             # not the hub's own (None otherwise)
             "hostIdSeen": self.host_id_seen,
+            # requests the machine sent later than their own time-to-live
+            # allowed (counted, still processed)
+            "staleRequests": self.stale_requests,
             "clockSync": clock_sync,
             "meterCount": len(meters),
             "meters": meters,
@@ -12674,6 +12680,10 @@ class G2SHost:
                 # true on every part but the last of a response sent in
                 # several commands (§1.18.3.2, Table 1.5)
                 "sessionMore": g2s_true(attr(cls, "sessionMore")),
+                # when the command was made and how long it stays good, in
+                # ms, 0 = for ever (see the note in handle_g2s_message)
+                "dateTime": attr(cls, "dateTime"),
+                "timeToLive": attr(cls, "timeToLive"),
                 "errorCode": attr(cls, "errorCode"),
                 # errorText rides beside errorCode on §1.18.9 error
                 # responses — the AVP puts real diagnostics there (RB:
@@ -18065,12 +18075,46 @@ class G2SHost:
                         "start the hub with --host-id %s.", egm_id,
                         body_host, self.host_id, self.host_id, body_host)
 
-        # A request's timeToLive is not enforced here (§1.18.3.2 has the
-        # recipient answer G2S_APX011 to one it could not start in time).
-        # Every command is started the moment its message arrives, so the
-        # only way one could be "late" is by the two clocks disagreeing, and
-        # machines minutes adrift are normal on a home floor (see the skew
-        # tracked just below): enforcing it would refuse live requests.
+        # A request past its timeToLive (§1.18.3.2: one not started within
+        # it, "counted from its dateTime", is answered G2S_APX011). Every
+        # command is started the moment its message arrives, so the only
+        # request that can be past it is one the machine held back: made at
+        # one time, sent later. That shows in the machine's OWN two stamps,
+        # the command's dateTime and the message's dateTimeSent, so it can
+        # be told without the two clocks having to agree (they do agree:
+        # the hub is the machines' time server, and corrects a clock that
+        # is more than CLOCK_SKEW_SYNC_SEC out; the two on the owner's
+        # floor read 0.2 s and 4 s off on 2026-11-17).
+        #
+        # Such a request is COUNTED AND STILL PROCESSED, not refused. What
+        # a machine holds back and sends late is what it must not lose: an
+        # issueVoucher, a commitTransfer, a keyedOff, a persisted event,
+        # all of which it re-sends until acknowledged. Whether real machines
+        # give those a current dateTime when they re-send, as §1.18.4 asks,
+        # is not known; one that does not would be answered APX011 for
+        # ever and could never close the transaction. None was seen stale
+        # in 600 requests across two restarts. staleRequests in
+        # /api/status says how often it happens, which is what is needed
+        # before deciding to refuse.
+        sent_at = parse_g2s_datetime(msg.get("dateTimeSent"))
+        for c in msg["classes"]:
+            if c.get("sessionType") != "G2S_request" or sent_at is None:
+                continue
+            try:
+                ttl_ms = int(c.get("timeToLive") or 0)
+            except ValueError:
+                ttl_ms = 0
+            made_at = parse_g2s_datetime(c.get("dateTime"))
+            if ttl_ms <= 0 or made_at is None:
+                continue
+            held_ms = (sent_at - made_at).total_seconds() * 1000
+            if held_ms > ttl_ms:
+                assoc.stale_requests += 1
+                log.warning("[%s] %s.%s was made %.0f s before the machine "
+                            "sent it, past its own time-to-live of %.0f s; "
+                            "processed anyway (%d such so far)", egm_id,
+                            c.get("class"), c.get("command"), held_ms / 1000,
+                            ttl_ms / 1000, assoc.stale_requests)
 
         # G2S-20: every inbound g2sBody timestamps the EGM's clock. Track the
         # rolling skew vs ours (negative = EGM behind) — it feeds the join-time

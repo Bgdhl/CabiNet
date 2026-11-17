@@ -1237,6 +1237,45 @@ def item_13_the_machines_queue_is_full():
           code('garbage g2sAck errorCode="G2S_MSX004" <<<') == "G2S_MSX004")
 
 
+def item_42_a_request_past_its_time_to_live():
+    print("— audit item 42: a request the machine held back past its own "
+          "time-to-live (§1.18.3.2) is counted, and still processed")
+    host = make_host()
+    egm = joined(host, "BTB_ttl")
+    a = egm.assoc
+
+    def keep_alive(made, sent, ttl):
+        egm.cid += 1
+        return egm._deliver(
+            f'<g2s:g2sMessage xmlns:g2s="{gh.SCHEMA_NS}">'
+            f'<g2s:g2sBody g2s:egmId="{egm.egm_id}" g2s:hostId="1" '
+            f'g2s:dateTimeSent="{sent}"><g2s:communications '
+            f'g2s:deviceId="1" g2s:commandId="{egm.cid}" '
+            f'g2s:sessionType="G2S_request" g2s:sessionId="{egm.cid}" '
+            f'g2s:timeToLive="{ttl}" g2s:dateTime="{made}">'
+            f'<g2s:keepAlive/></g2s:communications></g2s:g2sBody>'
+            f'</g2s:g2sMessage>')
+
+    # the machine's clock is years out; only its own two stamps are compared
+    got = keep_alive("2019-03-01T10:00:00.000Z", "2019-03-01T10:00:01.000Z",
+                     30000)
+    check("a request sent a second after it was made is not stale, whatever "
+          "the machine's clock says",
+          a.stale_requests == 0 and egm.answer(got, "keepAliveAck")
+          is not None, a.stale_requests)
+    got = keep_alive("2019-03-01T10:00:00.000Z", "2019-03-01T10:05:00.000Z",
+                     30000)
+    check("one sent five minutes after it was made, with 30 s to live, is "
+          "counted", a.stale_requests == 1
+          and a.snapshot().get("staleRequests") == 1, a.stale_requests)
+    check("and still answered: it may be a transaction the machine must not "
+          "lose", egm.answer(got, "keepAliveAck") is not None
+          and "errorCode" not in egm.reply, egm.reply)
+    keep_alive("2019-03-01T10:00:00.000Z", "2019-03-01T10:05:00.000Z", 0)
+    check("a time-to-live of 0 never runs out", a.stale_requests == 1,
+          a.stale_requests)
+
+
 def main():
     logging.basicConfig(level=logging.CRITICAL + 1)
     logging.getLogger("g2s_host").setLevel(logging.CRITICAL + 1)
@@ -1254,6 +1293,7 @@ def main():
     item_12_not_established()
     item_11_a_message_that_did_not_go_out()
     item_13_the_machines_queue_is_full()
+    item_42_a_request_past_its_time_to_live()
     print("=" * 50)
     print(f"RESULT: {_p} passed, {_f} failed")
     return 1 if _f else 0
