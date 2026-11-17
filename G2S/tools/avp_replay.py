@@ -2913,9 +2913,13 @@ def main():
         check("override honored: keyOffType=G2S_remoteVoucher at txn 777002",
               a.get("keyOffType") == "G2S_remoteVoucher"
               and a.get("transactionId") == "777002", f"got {a}")
-        check("key-off amount = request − egmPaid ($50 − $10 = 4000000 "
-              "millicents)",
-              a.get("keyOffCashableAmt") == "4000000", f"got {a}")
+        # the request amount IS what is owed: the $10 the EGM paid is the
+        # other part of the same win (§11.12, Table 11.6). Until v0.3.18
+        # this expected $50 − $10. (Pinned for real by
+        # tools/test_g2s_by_the_book.py, which runs everywhere.)
+        check("key-off amount = the request amount ($50 = 5000000 "
+              "millicents), whatever the EGM paid itself",
+              a.get("keyOffCashableAmt") == "5000000", f"got {a}")
         # The EGM rejects: class-level G2S_JPX003 (no child command, §1.18.9)
         # — the txn is no longer pending (attendant keyed it off locally).
         err = (
