@@ -61,6 +61,7 @@ __all__ = [
     "parse_machine_id", "parse_game_config", "parse_sas_version",
     "parse_selected_game_number", "parse_enabled_game_numbers",
     "parse_extended_validation_status", "build_extended_validation_status_poll",
+    "read_extended_validation_status",
     "parse_current_player_denom", "parse_enabled_player_denoms",
     "build_extended_game_info_poll", "parse_extended_game_info",
     "denom_code_cents",
@@ -171,13 +172,44 @@ def parse_enabled_game_numbers(data: bytes) -> List[Optional[int]]:
     return [bcd_to_int(data[i:i + 2]) for i in range(2, len(data), 2)]
 
 
-def build_extended_validation_status_poll(address: int) -> bytes:
-    """§4.4.26 (0x7B) poll, read-only per the Montana guidance: control mask
-    0000, status bits 0000, both expiration fields 0000 ("should always be
-    set to 0000") — so this never reconfigures the machine, it only reads
-    the asset number / status / expirations back."""
-    body = bytes([address, 0x7B, 0x08]) + b"\x00" * 8
+def build_extended_validation_status_poll(address: int,
+                                          cashable_days: int = 0,
+                                          restricted_days: int = 0) -> bytes:
+    """Long poll 7B (SAS 6.02 §15.2, Table 15.2a). With the defaults it is
+    read-only: control mask 0000, status bits 0000, both expirations 0000
+    ("do not change") — it never reconfigures the machine, it only reads
+    the asset number / status / expirations back.
+
+    cashable_days / restricted_days set the expiration the machine prints,
+    in days: 0000 leaves it alone, 0001-9998 is a number of days, 9999 is
+    never. The control mask stays 0000 either way, so no validation
+    function is switched. "Values set using long poll 7B take precedence
+    over the expiration field in long poll 7D" (§15.2)."""
+    for days in (cashable_days, restricted_days):
+        if not 0 <= int(days) <= 9999:
+            raise ValueError("7B expiration is 0000-9999 days")
+    body = (bytes([address, 0x7B, 0x08]) + b"\x00" * 4
+            + int_to_bcd(int(cashable_days), 2)
+            + int_to_bcd(int(restricted_days), 2))
     return _crc_frame(body)
+
+
+def read_extended_validation_status(transport, address: int, protocol,
+                                    cashable_days: int = 0):
+    """Send long poll 7B (optionally setting the cashable expiration) and
+    return the parsed answer, or None when it did not arrive intact or the
+    machine does not speak it."""
+    resp = transport.transact(build_extended_validation_status_poll(
+        address, cashable_days=cashable_days))
+    if not resp or len(resp) < 4:
+        return None
+    packet = protocol.parse_packet(resp)
+    if packet is None or packet.address != address or packet.command != 0x7B:
+        return None
+    try:
+        return parse_extended_validation_status(packet.data)
+    except ValueError:
+        return None
 
 
 @dataclass(frozen=True)

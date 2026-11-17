@@ -618,6 +618,60 @@ class TestTicketHeaderKeepsTrying:
         assert lookup(0x8C).event not in sas_host.TICKET_HEADER_LOST_EVENTS
 
 
+class TestTheMachinesOwnWordOnItsTicketSettings:
+    """SAS has no poll that reads the header text back. The expiry travels
+    with it, and long poll 7B reports it at any time (audit item 39, and
+    AJ 2026-11-16: "The machine should tell us what its ticket header is
+    set as")."""
+
+    def _applied(self, baseline=180):
+        st, clock = _state()
+        st.mark_attempted(2)
+        st.record_result(2, True, "applied")
+        st.expiry_baseline = baseline
+        return st, clock
+
+    def test_the_same_expiry_changes_nothing(self):
+        st, clock = self._applied()
+        for _ in range(5):
+            assert st.on_expiry_report(180) is False
+        clock.tick(3600)
+        assert st.due() is None and st.snapshot()["appliedRev"] == 2
+
+    def test_a_changed_expiry_sends_the_header_again(self):
+        st, clock = self._applied()
+        assert st.on_expiry_report(30) is True       # back to its default
+        assert st.snapshot()["appliedRev"] is None
+        clock.tick(sas_host.TICKET_HEADER_SETTLE_SEC + 0.01)
+        assert st.due()["rev"] == 2
+        # once: nothing more until the header has gone on again
+        assert st.on_expiry_report(30) is False
+
+    def test_it_compares_with_the_machines_own_report_not_the_hubs_value(
+            self):
+        """A machine that clamps the value (asked for 180, reports 99) must
+        not be sent the header on every read for ever."""
+        st, clock = self._applied(baseline=99)
+        for _ in range(10):
+            assert st.on_expiry_report(99) is False
+        assert st.due() is None
+
+    def test_no_baseline_or_no_answer_means_no_opinion(self):
+        st, clock = self._applied(baseline=None)
+        assert st.on_expiry_report(30) is False
+        st, clock = self._applied()
+        assert st.on_expiry_report(None) is False
+
+    def test_a_failed_apply_forgets_the_baseline(self):
+        st, clock = self._applied()
+        st.on_machine_event(lost=True)
+        clock.tick(sas_host.TICKET_HEADER_SETTLE_SEC + 0.01)
+        st.mark_attempted(2)
+        st.record_result(2, False, "silence")
+        assert st.expiry_baseline is None
+        assert st.on_expiry_report(30) is False
+
+
 # The Bluebird 2's own log, 2026-11-16, in seconds after it came online at
 # 12:33:53.762. The header attempt two seconds in met silence; the first
 # ticket was printed 422 s in with no header from us on the machine.
@@ -736,20 +790,42 @@ class TestApplyTicketHeader:
         return ok, detail, tp, sleeps
 
     def test_7c_ack_then_expiration_only_7d(self):
-        """The text rides 0x7C; the expiration byte can only ride 0x7D —
-        a 7C ACK is now followed by exactly one text-less 7D."""
+        """The text rides 0x7C; a 7C ACK is followed by one text-less 7D
+        for the expiration, and then by long poll 7B, which SAS 6.02 §15.2
+        gives for it (audit item 39). A machine silent to 7B changes
+        nothing."""
         ok, detail, tp, sleeps = self._apply(
             [_resp(1, 0x7C, 0x01), _resp(1, 0x7D, 0x01)])
         assert ok is True and "0x7C" in detail
         assert "expiration 0d via 0x7D (ACK)" in detail
-        assert len(tp.frames) == 2
+        assert "0x7B" not in detail
+        assert len(tp.frames) == 3
         assert tp.frames[0] == build_set_extended_ticket_data(
             1, location="FUNCINO", address1="1 COLLECTOR WAY",
             address2="GAME ROOM NV")
         assert tp.frames[1] == build_set_ticket_data(
             1, host_id=DEFAULT_SYSTEM_ID, expiration_days=0,
             allow_no_text=True)
-        assert sleeps == [sas_host.SAS_POLL_FLOOR]
+        # 7B: mask 0000, states 0000, cashable 9999 (never), restricted 0000
+        assert tp.frames[2] == _crc(bytes([0x01, 0x7B, 0x08, 0, 0, 0, 0,
+                                           0x99, 0x99, 0x00, 0x00]))
+        assert sleeps == [sas_host.SAS_POLL_FLOOR] * 2
+
+    def test_the_expiry_also_goes_by_7b_and_the_answer_is_kept(self):
+        """The 7B answer carries the expiry the machine will print. It is
+        handed back as the baseline for the later check."""
+        answer_7b = _crc(bytes([0x01, 0x7B, 0x0A, 0xE8, 0x03, 0, 0, 0, 0,
+                                0x01, 0x80, 0x00, 0x30]))
+        seen = {}
+        ok, detail, tp, _ = self._apply(
+            [_resp(1, 0x7C, 0x01), _resp(1, 0x7D, 0x01), answer_7b],
+            target=_target(expire=180), report=seen)
+        assert ok is True
+        assert "expiration 180d via 0x7D (ACK) and 0x7B (machine reports " \
+               "180d)" in detail
+        assert seen == {"expiry": 180}
+        assert tp.frames[2] == _crc(bytes([0x01, 0x7B, 0x08, 0, 0, 0, 0,
+                                           0x01, 0x80, 0x00, 0x00]))
 
     def test_expiration_7d_nack_or_silence_never_fails_the_header(self):
         """The expiration write is advisory: a machine that refuses or

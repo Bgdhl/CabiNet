@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.3.11
+Third batch from the SAS audit, second part.
+- **The ticket expiry is also set the way the document says.** It was
+  sent only inside the older ticket-data poll. The document has a
+  dedicated poll for it whose value wins, so both are sent now.
+- **The machine's own word is used to tell whether it still holds our
+  ticket settings.** SAS has no poll that reads the ticket header text
+  back, but the expiry travels with it and can be read at any time. The
+  SAS box notes the expiry the machine reports when the header goes on,
+  reads it again every 30 seconds, and sends the header again if it has
+  changed. It compares with the machine's own earlier answer, not with
+  the hub's setting, so a machine that rounds or caps the value is not
+  re-sent the header for ever.
+
 ## v0.3.10
 Third batch from the SAS audit, first part: a ticket redemption is
 followed to its end.
