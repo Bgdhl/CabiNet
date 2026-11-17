@@ -9124,6 +9124,12 @@ class G2SHost:
                 mc = int(acct.get("cashableMillicents") or 0)
                 out["creditsMc"] = mc
                 out["credits"] = f"{money_symbol()}{mc / 100000:,.2f}"
+                # the restricted promotional balance ("Free Slot Play" on
+                # the player's screen), sent only when there is some, so
+                # the home page can show it beside the wallet balance
+                non = int(acct.get("nonCashMillicents") or 0)
+                if non > 0:
+                    out["restrictedMc"] = non
                 if str(acct.get("name") or "").strip():
                     out["name"] = acct.get("name")
         except Exception as e:  # noqa: BLE001 — poll keeps answering

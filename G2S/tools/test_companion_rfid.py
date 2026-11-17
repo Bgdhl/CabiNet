@@ -1158,11 +1158,22 @@ def main():
     check("glass_state back to the player: no overlay, credits restored",
           st2.get("carded") is True and not st2.get("overlay") and
           st2.get("credits") == "$0.00")
+    # the restricted promotional balance ("Free Slot Play" on the player's
+    # screen) rides the same poll, only when the player has some
+    check("no restricted balance = no restrictedMc on the glass state",
+          "restrictedMc" not in st2)
+    eng.account_store.accounts["p1"]["nonCashMillicents"] = 15000000
+    st2r = eng.glass_state(EGM)
+    check("a restricted balance rides the glass state beside the credits",
+          st2r.get("restrictedMc") == 15000000 and
+          st2r.get("credits") == "$0.00")
 
     print("— admin overlay: a genuine card-out drops the overlay too")
     report(eng, taps=[tap(5, uid="AA11BB22")])       # admin overlays AJ again
     check("overlay back up", (eng.admin_overlays.get(EGM) or {}).get("uid")
           == "AA11BB22")
+    check("the overlay hides the friend's restricted balance with the credits",
+          "restrictedMc" not in eng.glass_state(EGM))
     eng._glass_card_out(EGM)                          # AJ's session truly ends
     check("card-out pops BOTH the player body and the stale overlay",
           eng.card_sessions == {} and eng.admin_overlays == {})
