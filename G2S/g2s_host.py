@@ -1863,6 +1863,11 @@ class EgmAssociation:
         # Games page's Refresh, or the hub's own on finding the game under
         # one of them replaced: _game_replaced_resweep)
         self.gp_resweep_at = 0.0
+        # when the hub started such a sweep by itself, last 24 h (at most
+        # GP_REPLACED_SWEEPS_PER_DAY of them), and when it last said it
+        # had stopped
+        self.gp_auto_sweeps = []
+        self.gp_auto_sweep_warned_at = 0.0
         # gamePlay read state (G2S-21): per-deviceId dict keyed by the string
         # deviceId (a multi-game cabinet exposes several gamePlay devices, one
         # per theme+paytable, §6.1). Each holds themeId/paytableId/enabled/
@@ -14143,6 +14148,21 @@ class G2SHost:
             # device's own theme is in the store — when it disagrees with
             # the cabinet's claim, one scoped getCabinetStatus re-read
             # (debounced) makes the tile honest again.
+            # KNOWN, TO REVISIT (2026-11-17, left as it is on purpose): a
+            # WMS Bluebird 2 names its game one way in the cabinet status
+            # (WMS_SSPDrJackpot) and another in the game device
+            # (WMS_SE88-000-1010C2). The two never match, so every game
+            # played there draws a cabinet read, at most one in 10 s (185
+            # in two days). An IGT AVP uses one name in both places and
+            # draws none once it has caught up. Asking less often for a
+            # disagreement that stands was tried and withdrawn: after a
+            # switch of games on a machine with many, the title shown
+            # could stay the old one for as long as the hub held off. The
+            # idea to try: compare the device the cabinet says is loaded
+            # (cabinetStatus gamePlayId; 12 on the Bluebird, 28 on the
+            # IGT that day) with the device the event came from, and fall
+            # back to the names only when the cabinet gives no device.
+            # It needs a switch of games watched on the IGT.
             now = time.time()
             with assoc.lock:
                 gp_theme = (assoc.game_play.get(dev) or {}).get("themeId")
@@ -14946,8 +14966,15 @@ class G2SHost:
         return moved
 
     #: One sweep of a machine's game devices in this many seconds on
-    #: finding the game under one of them replaced.
+    #: finding the game under one of them replaced, and no more than this
+    #: many in a day. A game is replaced by a re-image, a memory clear or
+    #: an install, which nobody does four times a day. A machine with
+    #: several games has one device per game and paytable (§6.1), so
+    #: switching games changes nothing under any device; but if one ever
+    #: reports its games under the same device id, turn about, this is
+    #: what keeps the hub from sweeping it for ever.
     GP_REPLACED_SWEEP_DEBOUNCE_SEC = 600
+    GP_REPLACED_SWEEPS_PER_DAY = 3
 
     @staticmethod
     def _game_replaced(theme_was, theme_now):
@@ -14971,10 +14998,30 @@ class G2SHost:
         the new game's one (seen 2026-11-17: Wizard of Oz II entries last
         read on 07-10, on a machine running Dr. Jackpot)."""
         now = time.time()
+        warn = False
         with assoc.lock:
             last = getattr(assoc, "gp_resweep_at", 0.0)
             if now - last < self.GP_REPLACED_SWEEP_DEBOUNCE_SEC:
                 return False
+            mine = [t for t in getattr(assoc, "gp_auto_sweeps", [])
+                    if now - t < 86400]
+            capped = len(mine) >= self.GP_REPLACED_SWEEPS_PER_DAY
+            if capped:
+                warn = now - getattr(assoc, "gp_auto_sweep_warned_at",
+                                     0.0) > 86400
+                if warn:
+                    assoc.gp_auto_sweep_warned_at = now
+            else:
+                mine.append(now)
+            assoc.gp_auto_sweeps = mine
+        if capped:
+            if warn:
+                log.warning("🎰 [%s] the game under this machine's game "
+                            "devices keeps changing (dev=%s: %s, was %s) "
+                            "— %d sweeps today already; leaving the rest "
+                            "to the Games page's Refresh", assoc.egm_id,
+                            dev, replaced[1], replaced[0], len(mine))
+            return False
         log.info("🎰 [%s] gamePlay dev=%s now reports %s where the hub "
                  "held %s — the game was replaced; reading every game "
                  "device on the machine again", assoc.egm_id, dev,

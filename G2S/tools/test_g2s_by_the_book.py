@@ -2535,6 +2535,100 @@ def item_20_a_machine_whose_game_was_replaced():
         gh.GP_RESCAN_DESC_WAIT_SEC = kept
 
 
+def with_status(egm, dev, theme, paytable, code="G2S_GPE113"):
+    """A game event from that device carrying its status, as a machine
+    sends one for the game being played."""
+    egm.event_id = getattr(egm, "event_id", 5000) + 1
+    return egm.send(
+        "eventHandler",
+        '<g2s:eventReport g2s:deviceClass="G2S_gamePlay" '
+        f'g2s:deviceId="{dev}" g2s:eventCode="{code}" '
+        f'g2s:eventId="{egm.event_id}" '
+        f'g2s:eventDateTime="{egm.stamp()}" g2s:transactionId="0">'
+        '<g2s:deviceList><g2s:statusInfo g2s:deviceClass="G2S_gamePlay" '
+        f'g2s:deviceId="{dev}">' + game_status(theme=theme, paytable=paytable)
+        + "</g2s:statusInfo></g2s:deviceList></g2s:eventReport>")
+
+
+def several_games(host, name, themes):
+    egm = online(joined(host, name))
+    a = egm.assoc
+    egm.send("optionConfig", "<g2s:optionList>" + "".join(
+        paytable_options(str(i + 1)) for i in range(len(themes)))
+        + "</g2s:optionList>")
+    for i, theme in enumerate(themes):
+        a_known_game(host, egm, dev=str(i + 1))
+        host.enqueue_get_game_play_status(a, str(i + 1))
+        drain(host, a)
+        answer_to(egm, "gamePlay", "getGamePlayStatus",
+                  game_status(theme=theme, paytable=theme + "-94"),
+                  device=str(i + 1))
+        answer_to(egm, "gamePlay", "getGamePlayProfile",
+                  game_profile(theme=theme, paytable=theme + "-94"),
+                  device=str(i + 1))
+    time.sleep(0.5)
+    drain(host, a)
+    a.gp_resweep_at = 0.0
+    a.gp_auto_sweeps = []
+    a.gp_reread_at.clear()
+    return egm
+
+
+def item_20_no_reading_in_a_loop():
+    print("— a machine with several games: a player going from one to "
+          "another changes nothing under any device (§6.1: one device per "
+          "game and paytable)")
+    host = make_host()
+    kept = gh.GP_RESCAN_DESC_WAIT_SEC
+    gh.GP_RESCAN_DESC_WAIT_SEC = 0.2
+    try:
+        egm = several_games(host, "BTB_chest", ["A", "B", "C"])
+        a = egm.assoc
+        mark = len(host.sent)
+        for dev, theme in (("1", "A"), ("2", "B"), ("3", "C"), ("1", "A"),
+                           ("3", "C"), ("2", "B"), ("1", "A")):
+            with_status(egm, dev, theme, theme + "-94")
+        time.sleep(0.5)
+        drain(host, a)
+        got = [n for n in names(sent_since(host, mark)) if n != "eventAck"]
+        check("seven games played across three titles: nothing is read "
+              "again (no sweep, no profile, no denominations)",
+              got == [], got)
+
+        print("— the worst a machine could do: report a different game "
+              "under the same device every time")
+        sweeps = 0
+        for n in range(6):
+            a.gp_resweep_at = 0.0           # as if ten minutes had passed
+            mark = len(host.sent)
+            with_status(egm, "1", f"OTHER{n}", f"OTHER{n}-94")
+            sweeps += names(sent_since(host, mark)).count("getDescriptor")
+            time.sleep(0.4)
+            drain(host, a)
+        check("the hub sweeps the machine three times in a day and then "
+              "leaves it to the Refresh button", sweeps == 3, sweeps)
+        a.gp_auto_sweeps = [time.time() - 90000] * 3    # yesterday's
+        a.gp_resweep_at = 0.0
+        mark = len(host.sent)
+        with_status(egm, "1", "TOMORROW", "TOMORROW-94")
+        again = names(sent_since(host, mark)).count("getDescriptor")
+        time.sleep(0.4)
+        drain(host, a)
+        check("a day later it will sweep again", again == 1, again)
+        mark = len(host.sent)
+        for n in range(4):
+            with_status(egm, "1", f"AGAIN{n}", f"AGAIN{n}-94")
+        time.sleep(0.4)
+        drain(host, a)
+        got = names(sent_since(host, mark))
+        check("and that one device's profile is asked for once in 30 "
+              "seconds however often it changes",
+              got.count("getDescriptor") == 0
+              and got.count("getGamePlayProfile") <= 1, got)
+    finally:
+        gh.GP_RESCAN_DESC_WAIT_SEC = kept
+
+
 def item_52_a_game_the_machine_needs():
     print("— audit item 52: requiredForPlay (Table 6.6: \"the EGM MUST be "
           "disabled if either egmEnabled or hostEnabled is set to false\")")
@@ -2781,6 +2875,7 @@ def main():
     item_7_a_range_of_denominations()
     item_20_a_game_whose_configuration_changed()
     item_20_a_machine_whose_game_was_replaced()
+    item_20_no_reading_in_a_loop()
     item_52_a_game_the_machine_needs()
     item_27_booleans_written_as_1_and_0()
     item_16_a_currency_without_two_decimal_places()

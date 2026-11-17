@@ -35,7 +35,9 @@ Fourth batch from the G2S audit: meters and game play. Eight items.
   that game's paytables. Only the one the machine is set to reports
   anything, so the others kept the old game's name: a Bluebird running
   Dr. Jackpot still listed eleven Wizard of Oz II paytables four months
-  after the change.
+  after the change. The hub does this by itself at most three times a
+  day per machine. A player moving between the games of a multi-game
+  machine does not trigger it.
 - **Yes/no values written 1 and 0 are understood**, as well as true and
   false, everywhere the hub reads one. A machine that writes them that
   way could be left in a configuration mode, have every denomination
