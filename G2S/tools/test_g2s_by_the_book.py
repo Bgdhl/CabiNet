@@ -1298,14 +1298,17 @@ def online(egm):
     return egm
 
 
-def answer_to(egm, cls, command, body, device="1", where=None):
+def answer_to(egm, cls, command, body, device="1", where=None, sid=None,
+              more=False):
     """The EGM's RESPONSE to the newest request of that name from the host
     (same sessionId, as §1.18.3.2 requires). `where` narrows it to the
-    request that carried those attributes."""
-    sid = [s for s, r in egm.assoc.sent_requests.items()
-           if r["command"] == command
-           and all(r["attrs"].get(k) == v
-                   for k, v in (where or {}).items())][-1]
+    request that carried those attributes, `sid` names the request
+    outright, and `more` marks the answer as one part with more to come."""
+    if sid is None:
+        sid = [s for s, r in egm.assoc.sent_requests.items()
+               if r["command"] == command
+               and all(r["attrs"].get(k) == v
+                       for k, v in (where or {}).items())][-1]
     egm.cid += 1
     ts = gh.now_iso()
     return egm._deliver(
@@ -1313,15 +1316,16 @@ def answer_to(egm, cls, command, body, device="1", where=None):
         f'<g2s:g2sBody g2s:egmId="{egm.egm_id}" g2s:hostId="1" '
         f'g2s:dateTimeSent="{ts}"><g2s:{cls} g2s:deviceId="{device}" '
         f'g2s:commandId="{egm.cid}" g2s:sessionType="G2S_response" '
-        f'g2s:sessionId="{sid}" g2s:timeToLive="0" g2s:dateTime="{ts}">'
+        f'g2s:sessionId="{sid}" g2s:timeToLive="0" g2s:dateTime="{ts}"'
+        + (' g2s:sessionMore="true"' if more else "") + ">"
         f'{body}</g2s:{cls}></g2s:g2sBody></g2s:g2sMessage>'), sid
 
 
-def event(egm, code, cls="G2S_optionConfig"):
+def event(egm, code, cls="G2S_optionConfig", dev="1"):
     egm.event_id = getattr(egm, "event_id", 5000) + 1
     return egm.send(
         "eventHandler",
-        f'<g2s:eventReport g2s:deviceClass="{cls}" g2s:deviceId="1" '
+        f'<g2s:eventReport g2s:deviceClass="{cls}" g2s:deviceId="{dev}" '
         f'g2s:eventCode="{code}" g2s:eventId="{egm.event_id}" '
         f'g2s:eventDateTime="{egm.stamp()}" g2s:transactionId="0"/>')
 
@@ -2028,6 +2032,819 @@ def items_21_24_25_37_the_ownership_claim():
     check("the answer to our own getCommHostList is the whole table and "
           "replaces it", sorted(a.host_items) == ["1"], sorted(a.host_items))
 
+# ---------------------------------------------------------------------------
+# Batch 4: meters and game play
+
+def meters_xml(*groups, kind="G2S_onDemand"):
+    """A meterInfo. Each group is (element name, its attributes,
+    {meterName: value})."""
+    out = ""
+    for tag, attrs, meters in groups:
+        out += (f"<g2s:{tag} "
+                + " ".join(f'g2s:{k}="{v}"' for k, v in attrs.items()) + ">"
+                + "".join(f'<g2s:simpleMeter g2s:meterName="{n}" '
+                          f'g2s:meterValue="{v}"/>'
+                          for n, v in meters.items())
+                + f"</g2s:{tag}>")
+    return (f'<g2s:meterInfo g2s:meterInfoType="{kind}" '
+            f'g2s:meterDateTime="{gh.now_iso()}">{out}</g2s:meterInfo>')
+
+
+def cabinet_credits(cash=0, promo=0, non_cash=0):
+    return ("deviceMeters", {"deviceClass": "G2S_cabinet", "deviceId": "1"},
+            {"G2S_playerCashableAmt": cash, "G2S_playerPromoAmt": promo,
+             "G2S_playerNonCashAmt": non_cash})
+
+
+def pushed(egm, *groups):
+    """A periodic meter report: a notification, sent unasked."""
+    return egm.send("meters", meters_xml(*groups, kind="G2S_onPeriodic"),
+                    stype="G2S_notification")
+
+
+def asks(cmds, name):
+    return [a for _c, n, a, _e in cmds if n == name]
+
+
+def item_6_the_credit_figure_counts_all_three():
+    print("— audit item 6: the credit on a machine is all three credit "
+          "types (§5.9: \"The credit meter displayed to the player is the "
+          "total of the three types of credits\")")
+    host = make_host()
+    egm = online(joined(host, "BTB_credits"))
+    a = egm.assoc
+    pushed(egm, cabinet_credits(non_cash=50000))
+    check("restricted credit alone counts as credit on the machine (it "
+          "read as an empty machine)", host._machine_credits_mc(a) == 50000,
+          host._machine_credits_mc(a))
+    seat = {"kind": "g2s"}
+    check("the tournament's empty-machine test sees it, with no need to "
+          "ask", host._tournament_clear_confirmed(
+              "BTB_credits", seat, time.time()) is True
+          and "clearAskedAt" not in seat, seat)
+    mark = len(host.sent)
+    host._tournament_pull_seat("BTB_credits", seat, slot="clear")
+    drain(host, a)
+    req = asks(sent_since(host, mark), "initiateRequest")
+    check("so the clear pulls it off before the stake goes on (it was "
+          "settled as $0 and the stake was put on top)",
+          (seat.get("clear") or {}).get("state") == "pulling" and req
+          and req[-1].get("watDirection") == "G2S_fromEgm"
+          and req[-1].get("reqNonCashAmt") == "50000"
+          and req[-1].get("reqCashableAmt") == "0", (seat, req))
+
+    host = make_host()
+    egm = online(joined(host, "BTB_credits3"))
+    a = egm.assoc
+    pushed(egm, cabinet_credits(cash=30000, promo=2000, non_cash=5000))
+    mark = len(host.sent)
+    r = host.start_wat_credit_pull(a, "house")
+    drain(host, a)
+    req = asks(sent_since(host, mark), "initiateRequest")
+    check("a pull asks for each type as its own meter reads (it asked "
+          "for the cashable alone and left the rest on the machine)",
+          r.get("askedMc") == 37000
+          and r.get("askedBucketsMc") == [30000, 2000, 5000] and req
+          and (req[-1].get("reqCashableAmt"), req[-1].get("reqPromoAmt"),
+               req[-1].get("reqNonCashAmt")) == ("30000", "2000", "5000"),
+          (r, req))
+    host = make_host()
+    egm = online(joined(host, "BTB_credits0"))
+    pushed(egm, cabinet_credits())
+    r = host.start_wat_credit_pull(egm.assoc, "house")
+    check("all three at zero is still an empty machine",
+          r.get("ok") is False and "nothing on the glass" in r["error"], r)
+
+
+def item_18_a_meter_answer_belongs_to_its_read():
+    print("— audit item 18: only the answer to its own read confirms an "
+          "empty machine (Table 5.10: meterInfoType says what caused a "
+          "report, meterDateTime is when \"the meter snapshot was taken\")")
+    host = make_host()
+    egm = online(joined(host, "BTB_meters"))
+    a = egm.assoc
+    # two reads already out and not yet answered: one of the cabinet, one
+    # of the games
+    host.enqueue_get_meter_info(a, device_class="G2S_cabinet",
+                                device_id="-1")
+    host.enqueue_get_meter_info(a, device_class="G2S_gamePlay",
+                                device_id="-1")
+    drain(host, a)
+    old_cabinet, games = list(a.meter_reads)[-2:]
+    time.sleep(0.02)
+    seat = {"kind": "g2s"}
+    name = "BTB_meters"
+
+    def confirmed():
+        return host._tournament_clear_confirmed(name, seat, time.time())
+    mark = len(host.sent)
+    first = confirmed()
+    drain(host, a)
+    check("a machine that reads empty is asked before it is believed",
+          first is False
+          and names(sent_since(host, mark)) == ["getMeterInfo"],
+          names(sent_since(host, mark)))
+    own = list(a.meter_reads)[-1]
+    empty = meters_xml(cabinet_credits())
+    pushed(egm, cabinet_credits())
+    check("a periodic report that arrives after the question is not the "
+          "answer: it was taken before it was sent (it was counted)",
+          confirmed() is False)
+    got = egm.send("meters", meters_xml(cabinet_credits(), kind="G2S_onEOD"))
+    check("nor is an end-of-day report (which is still acknowledged)",
+          confirmed() is False and "meterInfoAck" in names(got), names(got))
+    answer_to(egm, "meters", "getMeterInfo", meters_xml((
+        "deviceMeters", {"deviceClass": "G2S_gamePlay", "deviceId": "1"},
+        {"G2S_wageredAmt": 5})), sid=games)
+    check("nor the answer to a read about the games, which carries no "
+          "cabinet meter", confirmed() is False)
+    answer_to(egm, "meters", "getMeterInfo", empty, sid=old_cabinet)
+    check("nor the answer to a cabinet read made before the question",
+          confirmed() is False)
+    host.enqueue_get_meter_info(a, device_class="G2S_gamePlay",
+                                device_id="-1")
+    drain(host, a)
+    answer_to(egm, "meters", "getMeterInfo", meters_xml((
+        "deviceMeters", {"deviceClass": "G2S_gamePlay", "deviceId": "1"},
+        {"G2S_wageredAmt": 6})), sid=list(a.meter_reads)[-1])
+    check("nor the answer to a read about the games made after it",
+          confirmed() is False)
+    answer_to(egm, "meters", "getMeterInfo", empty, sid=own, more=True)
+    check("the first part of its own answer, with more to come: not yet",
+          confirmed() is False)
+    answer_to(egm, "meters", "getMeterInfo", empty, sid=own)
+    check("the last part of its own answer: the machine is empty",
+          confirmed() is True)
+
+
+def item_19_a_breakdown_is_not_the_device_total():
+    print("— audit item 19: wager, denomination and currency breakdowns "
+          "use the device's own meter names (Tables 5.16-5.18)")
+    host = make_host()
+    egm = online(joined(host, "BTB_groups"))
+    a = egm.assoc
+    game = {"deviceClass": "G2S_gamePlay", "deviceId": "1"}
+    notes = {"deviceClass": "G2S_noteAcceptor", "deviceId": "1"}
+    groups = (
+        ("deviceMeters", game, {"G2S_wageredAmt": 1000}),
+        ("wagerMeters", dict(game, wagerCategory="2"),
+         {"G2S_wageredAmt": 400, "G2S_playedCnt": 7}),
+        ("gameDenomMeters", dict(game, denomId="1000"),
+         {"G2S_wageredAmt": 250}),
+        ("deviceMeters", notes, {"G2S_currencyInAmt": 9000}),
+        ("currencyMeters", dict(notes, currencyType="G2S_note",
+                                currencyId="USD", denomId="500000"),
+         {"G2S_currencyInAmt": 500}))
+    pushed(egm, *groups)
+    check("the game's wagered total stays the device's (the last "
+          "breakdown line replaced it)",
+          a.meters.get("G2S_gamePlay/1/G2S_wageredAmt") == "1000",
+          a.meters.get("G2S_gamePlay/1/G2S_wageredAmt"))
+    check("a meter that exists only per wager category does not appear "
+          "as a device meter", "G2S_gamePlay/1/G2S_playedCnt" not in a.meters)
+    check("the note acceptor's total is not replaced by one "
+          "denomination's line",
+          a.meters.get("G2S_noteAcceptor/1/G2S_currencyInAmt") == "9000",
+          a.meters.get("G2S_noteAcceptor/1/G2S_currencyInAmt"))
+    egm.event_id = getattr(egm, "event_id", 5000) + 1
+    egm.send(
+        "eventHandler",
+        '<g2s:eventReport g2s:deviceClass="G2S_gamePlay" g2s:deviceId="1" '
+        f'g2s:eventCode="G2S_GPE112" g2s:eventId="{egm.event_id}" '
+        f'g2s:eventDateTime="{egm.stamp()}" g2s:transactionId="0">'
+        "<g2s:meterList>" + meters_xml(
+            ("deviceMeters", game, {"G2S_wageredAmt": 1100}),
+            ("gameDenomMeters", dict(game, denomId="1000"),
+             {"G2S_wageredAmt": 350}), kind="G2S_onEvent")
+        + "</g2s:meterList></g2s:eventReport>")
+    check("the same in the meters that come with an event",
+          a.meters.get("G2S_gamePlay/1/G2S_wageredAmt") == "1100",
+          a.meters.get("G2S_gamePlay/1/G2S_wageredAmt"))
+
+
+def denom_list(*parts):
+    """A gameDenomList: ('d', denomId, active) for a single,
+    ('r', min, max, interval or None, active) for a range."""
+    out = ""
+    for part in parts:
+        if part[0] == "d":
+            out += (f'<g2s:gameDenom g2s:denomId="{part[1]}" '
+                    f'g2s:active="{part[2]}"/>')
+        else:
+            step = "" if part[3] is None else \
+                f' g2s:denomInterval="{part[3]}"'
+            out += (f'<g2s:gameRange g2s:denomMin="{part[1]}" '
+                    f'g2s:denomMax="{part[2]}"{step} '
+                    f'g2s:active="{part[4]}"/>')
+    return f"<g2s:gameDenomList>{out}</g2s:gameDenomList>"
+
+
+def read_denoms(host, egm, body, dev="1"):
+    host.enqueue_get_game_denoms(egm.assoc, dev)
+    drain(host, egm.assoc)
+    return answer_to(egm, "gamePlay", "getGameDenoms", body, device=dev)
+
+
+def item_7_a_range_of_denominations():
+    print("— audit item 7: a denomination range stands for the series it "
+          "spans (§6.3: it \"can substitute for a series of denomIds in "
+          "all cases where a list of denomIds can be used\")")
+    host = make_host()
+    egm = online(joined(host, "BTB_range"))
+    a = egm.assoc
+    # the document's own example answer (§6.24.5.2), plus two singles
+    read_denoms(host, egm, denom_list(
+        ("r", 1000, 5000, None, "true"),
+        ("d", 10000, "false"), ("d", 25000, "true")))
+    g = a.game_play["1"]
+    check("each denomination in the range is listed (the range was kept "
+          "aside and read by nothing: no chip on the Games page)",
+          [d["denomId"] for d in g["denoms"]] == [
+              "1000", "2000", "3000", "4000", "5000", "10000", "25000"],
+          [d["denomId"] for d in g["denoms"]])
+    check("and counted as active when the range is (it read as one "
+          "active denomination)", g["activeDenoms"] == [
+              "1000", "2000", "3000", "4000", "5000", "25000"],
+          g["activeDenoms"])
+    # a change the machine answers with a range
+    host.enqueue_get_game_denoms(a, "1")
+    drain(host, a)
+    sid = list(a.sent_requests)[-1]
+    with a.lock:
+        a.game_play["1"]["denomChange"] = {
+            "result": "sent", "sessionId": sid,
+            "denoms": ["1000", "2000", "3000"]}
+    answer_to(egm, "gamePlay", "getGameDenoms", denom_list(
+        ("r", 1000, 3000, None, "true"), ("r", 4000, 5000, None, "false"),
+        ("d", 10000, "false"), ("d", 25000, "false")), sid=sid)
+    check("a change the machine echoes as a range is read as accepted (it "
+          "read as a disagreement)",
+          a.game_play["1"]["denomChange"]["result"] == "accepted",
+          a.game_play["1"]["denomChange"])
+
+    print("— the interval, and a denomination named both ways")
+    read_denoms(host, egm, denom_list(
+        ("r", 5000, 25000, 10000, "true"), ("d", 15000, "false")))
+    g = a.game_play["1"]
+    check("the range runs in steps of its interval",
+          [d["denomId"] for d in g["denoms"]] == ["5000", "15000", "25000"],
+          g["denoms"])
+    check("a denomination also named on its own is as its own entry says",
+          g["activeDenoms"] == ["5000", "25000"], g["activeDenoms"])
+
+    print("— a range that cannot be listed")
+    read_denoms(host, egm, denom_list(
+        ("r", 1, 500000, 1, "true"), ("d", 1000, "true")))
+    g = a.game_play["1"]
+    mark = len(host.sent)
+    r = host.start_denom_ceremony(a, device_id="1", denoms=[1000])
+    drain(host, a)
+    check("it is said, and a denomination change for that game is "
+          "refused: it would switch off whatever is active in the range",
+          bool(g.get("denomsPartial")) and r.get("ok") is False
+          and "range" in r.get("error", "")
+          and sent_since(host, mark) == [], (g.get("denomsPartial"), r))
+    read_denoms(host, egm, denom_list(("d", 1000, "true")))
+    check("a later list that is all there clears it",
+          not a.game_play["1"].get("denomsPartial"))
+
+
+def game_status(theme="T1", paytable="P1", **more):
+    extra = "".join(f' g2s:{k}="{v}"' for k, v in more.items())
+    return (f'<g2s:gamePlayStatus g2s:themeId="{theme}" '
+            f'g2s:paytableId="{paytable}"{extra}/>')
+
+
+def game_profile(theme="T1", paytable="P1", **more):
+    extra = "".join(f' g2s:{k}="{v}"' for k, v in more.items())
+    return (f'<g2s:gamePlayProfile g2s:themeId="{theme}" '
+            f'g2s:paytableId="{paytable}" g2s:maxWagerCredits="5"{extra}>'
+            '<g2s:wagerCategoryList><g2s:wagerCategoryItem '
+            'g2s:wagerCategory="1" g2s:theoPaybackPct="9000"/>'
+            "</g2s:wagerCategoryList><g2s:winLevelList><g2s:winLevelItem "
+            'g2s:winLevelIndex="1"/></g2s:winLevelList></g2s:gamePlayProfile>')
+
+
+def a_known_game(host, egm, dev="1", **profile):
+    a = egm.assoc
+    host.enqueue_get_game_play_status(a, dev)
+    drain(host, a)
+    answer_to(egm, "gamePlay", "getGamePlayStatus", game_status(),
+              device=dev)
+    host.enqueue_get_game_play_profile(a, dev)
+    drain(host, a)
+    answer_to(egm, "gamePlay", "getGamePlayProfile", game_profile(**profile),
+              device=dev)
+
+
+def item_20_a_game_whose_configuration_changed():
+    print("— audit item 20: a game's profile is not fixed for the life of "
+          "its device id (§6.13: its options \"can be set locally at the "
+          "EGM or remotely via a configuration server\")")
+    host = make_host()
+    egm = online(joined(host, "BTB_profile"))
+    a = egm.assoc
+    a_known_game(host, egm)
+    mark = len(host.sent)
+    event(egm, "G2S_GPE006", cls="G2S_gamePlay")
+    check("G2S_GPE006, configuration changed at the machine: status, "
+          "profile and denominations are read again (the status alone was)",
+          sorted(names(sent_since(host, mark))) == [
+              "eventAck", "getGameDenoms", "getGamePlayProfile",
+              "getGamePlayStatus"], names(sent_since(host, mark)))
+    mark = len(host.sent)
+    event(egm, "G2S_GPE005", cls="G2S_gamePlay")
+    check("a second such event straight after does not ask twice",
+          "getGamePlayProfile" not in names(sent_since(host, mark)),
+          names(sent_since(host, mark)))
+    a_known_game(host, egm, dev="2")
+    mark = len(host.sent)
+    event(egm, "G2S_GPE005", cls="G2S_gamePlay", dev="2")
+    check("G2S_GPE005, configuration changed by a host, on another game: "
+          "the same three reads",
+          sorted(names(sent_since(host, mark))) == [
+              "eventAck", "getGameDenoms", "getGamePlayProfile",
+              "getGamePlayStatus"], names(sent_since(host, mark)))
+    mark = len(host.sent)
+    event(egm, "G2S_GPE103", cls="G2S_gamePlay")
+    check("a spin is not a configuration change",
+          names(sent_since(host, mark)) == ["eventAck"],
+          names(sent_since(host, mark)))
+
+    print("— a status that names another paytable than the profile held")
+    host = make_host()
+    egm = online(joined(host, "BTB_profile2"))
+    a = egm.assoc
+    a_known_game(host, egm)
+    host.enqueue_get_game_play_status(a, "1")
+    drain(host, a)
+    mark = len(host.sent)
+    answer_to(egm, "gamePlay", "getGamePlayStatus",
+              game_status(paytable="P2"))
+    check("the profile for the old paytable is dropped and read again (the "
+          "Games page showed the new paytable with the old one's payback "
+          "and maximum wager)", "profile" not in a.game_play["1"]
+          and sorted(names(sent_since(host, mark))) == [
+              "getGameDenoms", "getGamePlayProfile"],
+          names(sent_since(host, mark)))
+    answer_to(egm, "gamePlay", "getGamePlayProfile",
+              game_profile(paytable="P2"))
+    check("the new one is kept", a.game_play["1"]["profile"][
+        "paytableId"] == "P2")
+    # a machine whose profile goes on naming the other one
+    a.gp_reread_at.clear()
+    host.enqueue_get_game_play_status(a, "1")
+    drain(host, a)
+    answer_to(egm, "gamePlay", "getGamePlayStatus",
+              game_status(paytable="P3"))
+    answer_to(egm, "gamePlay", "getGamePlayProfile",
+              game_profile(paytable="P2"))
+    a.gp_reread_at.clear()
+    host.enqueue_get_game_play_status(a, "1")
+    drain(host, a)
+    mark = len(host.sent)
+    answer_to(egm, "gamePlay", "getGamePlayStatus",
+              game_status(paytable="P3"))
+    check("a profile that still names the other paytable after being read "
+          "again is the machine's answer: kept, not asked for in a loop",
+          "profile" in a.game_play["1"]
+          and sent_since(host, mark) == [], names(sent_since(host, mark)))
+
+    print("— the same, when the status comes with an event")
+    host = make_host()
+    egm = online(joined(host, "BTB_profile3"))
+    a = egm.assoc
+    a_known_game(host, egm)
+    egm.event_id = getattr(egm, "event_id", 5000) + 1
+    mark = len(host.sent)
+    egm.send(
+        "eventHandler",
+        '<g2s:eventReport g2s:deviceClass="G2S_gamePlay" g2s:deviceId="1" '
+        f'g2s:eventCode="G2S_GPE113" g2s:eventId="{egm.event_id}" '
+        f'g2s:eventDateTime="{egm.stamp()}" g2s:transactionId="0">'
+        '<g2s:deviceList><g2s:statusInfo g2s:deviceClass="G2S_gamePlay" '
+        'g2s:deviceId="1">' + game_status(paytable="P7")
+        + "</g2s:statusInfo></g2s:deviceList></g2s:eventReport>")
+    check("the profile is dropped and read again there too",
+          "profile" not in a.game_play["1"]
+          and "getGamePlayProfile" in names(sent_since(host, mark)),
+          names(sent_since(host, mark)))
+
+
+def paytable_options(dev):
+    """One game device as the machine's option list names it."""
+    return ('<g2s:deviceOptions g2s:deviceClass="G2S_gamePlay" '
+            f'g2s:deviceId="{dev}"><g2s:optionGroup '
+            'g2s:optionGroupId="G2S_gamePlayOptions"><g2s:optionItem '
+            'g2s:optionId="G2S_protocolOptions"><g2s:optionCurrentValues>'
+            '<g2s:complexValue g2s:paramId="G2S_protocolParams">'
+            '<g2s:booleanValue g2s:paramId="G2S_requiredForPlay">false'
+            "</g2s:booleanValue></g2s:complexValue>"
+            "</g2s:optionCurrentValues></g2s:optionItem></g2s:optionGroup>"
+            "</g2s:deviceOptions>")
+
+
+def item_20_a_machine_whose_game_was_replaced():
+    print("— audit item 20, as it stood on the floor: one game on the "
+          "machine, its game devices that game's paytables, and the game "
+          "replaced")
+    host = make_host()
+    egm = online(joined(host, "BTB_replaced"))
+    a = egm.assoc
+    egm.send("optionConfig", "<g2s:optionList>" + "".join(
+        paytable_options(d) for d in "123") + "</g2s:optionList>")
+    for dev, pay in (("1", "OLD-88"), ("2", "OLD-92"), ("3", "OLD-96")):
+        host.enqueue_get_game_play_status(a, dev)
+        drain(host, a)
+        answer_to(egm, "gamePlay", "getGamePlayStatus",
+                  game_status(theme="OLD", paytable=pay), device=dev)
+    a.gp_resweep_at = 0.0
+    kept = gh.GP_RESCAN_DESC_WAIT_SEC
+    gh.GP_RESCAN_DESC_WAIT_SEC = 0.3
+    try:
+        # the paytable the machine is set to is played: its status comes
+        # with the event, naming the new game
+        egm.event_id = getattr(egm, "event_id", 5000) + 1
+        mark = len(host.sent)
+        egm.send(
+            "eventHandler",
+            '<g2s:eventReport g2s:deviceClass="G2S_gamePlay" '
+            f'g2s:deviceId="3" g2s:eventCode="G2S_GPE113" '
+            f'g2s:eventId="{egm.event_id}" '
+            f'g2s:eventDateTime="{egm.stamp()}" g2s:transactionId="0">'
+            '<g2s:deviceList><g2s:statusInfo g2s:deviceClass="G2S_gamePlay" '
+            'g2s:deviceId="3">' + game_status(theme="NEW", paytable="NEW-96")
+            + "</g2s:statusInfo></g2s:deviceList></g2s:eventReport>")
+        time.sleep(0.9)
+        drain(host, a)
+        asked = [name for name in names(sent_since(host, mark))
+                 if name in ("getDescriptor", "getGamePlayStatus")]
+        check("the other paytables are read again too: they send no "
+              "events of their own, and went on showing the old game "
+              "(eleven of them for four months on a Bluebird)",
+              asked.count("getDescriptor") == 1
+              and asked.count("getGamePlayStatus") == 3, asked)
+        # the answers name the new game as well; no second sweep follows
+        mark = len(host.sent)
+        for dev, pay in (("1", "NEW-88"), ("2", "NEW-92")):
+            host.enqueue_get_game_play_status(a, dev)
+            drain(host, a)
+            answer_to(egm, "gamePlay", "getGamePlayStatus",
+                      game_status(theme="NEW", paytable=pay), device=dev)
+        time.sleep(0.5)
+        drain(host, a)
+        check("and their own answers, naming the new game, do not start "
+              "it over", "getDescriptor" not in names(sent_since(host, mark))
+              and [a.game_play[d]["themeId"] for d in "123"]
+              == ["NEW"] * 3, names(sent_since(host, mark)))
+        a.gp_resweep_at = 0.0
+        mark = len(host.sent)
+        host.enqueue_get_game_play_status(a, "1")
+        drain(host, a)
+        answer_to(egm, "gamePlay", "getGamePlayStatus",
+                  game_status(theme="NEW", paytable="NEW-90"), device="1")
+        time.sleep(0.5)
+        drain(host, a)
+        check("a paytable changed under the same game is not a replaced "
+              "game", "getDescriptor" not in names(sent_since(host, mark)),
+              names(sent_since(host, mark)))
+        mark = len(host.sent)
+        host.enqueue_get_game_play_status(a, "2")
+        drain(host, a)
+        answer_to(egm, "gamePlay", "getGamePlayStatus",
+                  game_status(theme="THIRD", paytable="T-92"), device="2")
+        time.sleep(0.9)
+        drain(host, a)
+        got = names(sent_since(host, mark))
+        check("a replaced game found in the answer to a read, not in an "
+              "event, starts the same sweep",
+              got.count("getDescriptor") == 1
+              and got.count("getGamePlayStatus") == 4, got)
+        a.gp_resweep_at = 0.0
+        mark = len(host.sent)
+        host.enqueue_get_game_play_status(a, "9")
+        drain(host, a)
+        answer_to(egm, "gamePlay", "getGamePlayStatus",
+                  game_status(theme="THIRD", paytable="T-99"), device="9")
+        time.sleep(0.5)
+        drain(host, a)
+        check("a device heard from for the first time is not a replaced "
+              "game", "getDescriptor" not in names(sent_since(host, mark)),
+              names(sent_since(host, mark)))
+    finally:
+        gh.GP_RESCAN_DESC_WAIT_SEC = kept
+
+
+def with_status(egm, dev, theme, paytable, code="G2S_GPE113"):
+    """A game event from that device carrying its status, as a machine
+    sends one for the game being played."""
+    egm.event_id = getattr(egm, "event_id", 5000) + 1
+    return egm.send(
+        "eventHandler",
+        '<g2s:eventReport g2s:deviceClass="G2S_gamePlay" '
+        f'g2s:deviceId="{dev}" g2s:eventCode="{code}" '
+        f'g2s:eventId="{egm.event_id}" '
+        f'g2s:eventDateTime="{egm.stamp()}" g2s:transactionId="0">'
+        '<g2s:deviceList><g2s:statusInfo g2s:deviceClass="G2S_gamePlay" '
+        f'g2s:deviceId="{dev}">' + game_status(theme=theme, paytable=paytable)
+        + "</g2s:statusInfo></g2s:deviceList></g2s:eventReport>")
+
+
+def several_games(host, name, themes):
+    egm = online(joined(host, name))
+    a = egm.assoc
+    egm.send("optionConfig", "<g2s:optionList>" + "".join(
+        paytable_options(str(i + 1)) for i in range(len(themes)))
+        + "</g2s:optionList>")
+    for i, theme in enumerate(themes):
+        a_known_game(host, egm, dev=str(i + 1))
+        host.enqueue_get_game_play_status(a, str(i + 1))
+        drain(host, a)
+        answer_to(egm, "gamePlay", "getGamePlayStatus",
+                  game_status(theme=theme, paytable=theme + "-94"),
+                  device=str(i + 1))
+        answer_to(egm, "gamePlay", "getGamePlayProfile",
+                  game_profile(theme=theme, paytable=theme + "-94"),
+                  device=str(i + 1))
+    time.sleep(0.5)
+    drain(host, a)
+    a.gp_resweep_at = 0.0
+    a.gp_auto_sweeps = []
+    a.gp_reread_at.clear()
+    return egm
+
+
+def item_20_no_reading_in_a_loop():
+    print("— a machine with several games: a player going from one to "
+          "another changes nothing under any device (§6.1: one device per "
+          "game and paytable)")
+    host = make_host()
+    kept = gh.GP_RESCAN_DESC_WAIT_SEC
+    gh.GP_RESCAN_DESC_WAIT_SEC = 0.2
+    try:
+        egm = several_games(host, "BTB_chest", ["A", "B", "C"])
+        a = egm.assoc
+        mark = len(host.sent)
+        for dev, theme in (("1", "A"), ("2", "B"), ("3", "C"), ("1", "A"),
+                           ("3", "C"), ("2", "B"), ("1", "A")):
+            with_status(egm, dev, theme, theme + "-94")
+        time.sleep(0.5)
+        drain(host, a)
+        got = [n for n in names(sent_since(host, mark)) if n != "eventAck"]
+        check("seven games played across three titles: nothing is read "
+              "again (no sweep, no profile, no denominations)",
+              got == [], got)
+
+        print("— the worst a machine could do: report a different game "
+              "under the same device every time")
+        sweeps = 0
+        for n in range(6):
+            a.gp_resweep_at = 0.0           # as if ten minutes had passed
+            mark = len(host.sent)
+            with_status(egm, "1", f"OTHER{n}", f"OTHER{n}-94")
+            sweeps += names(sent_since(host, mark)).count("getDescriptor")
+            time.sleep(0.4)
+            drain(host, a)
+        check("the hub sweeps the machine three times in a day and then "
+              "leaves it to the Refresh button", sweeps == 3, sweeps)
+        a.gp_auto_sweeps = [time.time() - 90000] * 3    # yesterday's
+        a.gp_resweep_at = 0.0
+        mark = len(host.sent)
+        with_status(egm, "1", "TOMORROW", "TOMORROW-94")
+        again = names(sent_since(host, mark)).count("getDescriptor")
+        time.sleep(0.4)
+        drain(host, a)
+        check("a day later it will sweep again", again == 1, again)
+        mark = len(host.sent)
+        for n in range(4):
+            with_status(egm, "1", f"AGAIN{n}", f"AGAIN{n}-94")
+        time.sleep(0.4)
+        drain(host, a)
+        got = names(sent_since(host, mark))
+        check("and that one device's profile is asked for once in 30 "
+              "seconds however often it changes",
+              got.count("getDescriptor") == 0
+              and got.count("getGamePlayProfile") <= 1, got)
+    finally:
+        gh.GP_RESCAN_DESC_WAIT_SEC = kept
+
+
+def item_52_a_game_the_machine_needs():
+    print("— audit item 52: requiredForPlay (Table 6.6: \"the EGM MUST be "
+          "disabled if either egmEnabled or hostEnabled is set to false\")")
+    host = make_host()
+    egm = online(joined(host, "BTB_required"))
+    a = egm.assoc
+    a_known_game(host, egm, dev="1", requiredForPlay="true")
+    a_known_game(host, egm, dev="2")
+    a_known_game(host, egm, dev="3", requiredForPlay="1")
+    check("it is kept with the game's profile, for the Games page to say "
+          "before a Disable (it was dropped)",
+          [a.game_play[d]["profile"]["requiredForPlay"] for d in "123"]
+          == ["true", "false", "true"],
+          [a.game_play[d]["profile"].get("requiredForPlay") for d in "123"])
+    shown = a.snapshot()["gamePlay"]
+    check("and shown per game",
+          [shown[d]["requiredForPlay"] for d in "123"]
+          == ["true", "false", "true"])
+
+    print("— a game whose profile was read before the hub kept it")
+    host = make_host()
+    egm = online(joined(host, "BTB_required_old"))
+    a = egm.assoc
+    for dev in ("1", "2"):
+        a_known_game(host, egm, dev=dev)
+        with a.lock:        # as a profile stored by an earlier version
+            a.game_play[dev]["profile"].pop("requiredForPlay")
+
+    def protocol_options(dev, value):
+        return ('<g2s:deviceOptions g2s:deviceClass="G2S_gamePlay" '
+                f'g2s:deviceId="{dev}"><g2s:optionGroup '
+                'g2s:optionGroupId="G2S_gamePlayOptions"><g2s:optionItem '
+                'g2s:optionId="G2S_protocolOptions"><g2s:optionCurrentValues>'
+                '<g2s:complexValue g2s:paramId="G2S_protocolParams">'
+                '<g2s:booleanValue g2s:paramId="G2S_requiredForPlay">'
+                f'{value}</g2s:booleanValue></g2s:complexValue>'
+                "</g2s:optionCurrentValues></g2s:optionItem>"
+                "</g2s:optionGroup></g2s:deviceOptions>")
+    egm.send("optionConfig", "<g2s:optionList>" + protocol_options("1", "true")
+             + protocol_options("2", "false") + "</g2s:optionList>")
+    shown = a.snapshot()["gamePlay"]
+    check("the machine's option list says it for every game, so it shows "
+          "without the profile being read again",
+          [shown[d]["requiredForPlay"] for d in "12"] == ["true", "false"],
+          [shown[d].get("requiredForPlay") for d in "12"])
+    check("read back from what the hub keeps of the option list after a "
+          "restart", gh.games_required_for_play(a.config_options)
+          == {"1": "true", "2": "false"},
+          gh.games_required_for_play(a.config_options))
+
+
+def item_27_booleans_written_as_1_and_0():
+    print("— audit item 27: a boolean may be written 1 or 0 (Appendix C: "
+          "XML Schema's boolean; the document's own examples write "
+          "sessionRetry=\"0\")")
+    check("the two spellings are put into one",
+          [gh.g2s_bool(v) for v in ("true", "TRUE", "1", "false", "0",
+                                    None, "maybe")]
+          == ["true", "true", "true", "false", "false", "false", "false"]
+          and gh.g2s_bool(None, "true") == "true")
+    eq = gh.option_values_equal
+    check("an option at 1 is at its target of true, and 0 is not",
+          eq("1", "true") and eq("true", "1") and eq("0", "false")
+          and not eq("0", "true") and not eq("1", "false"))
+    check("numbers and text are still compared as they are written",
+          eq("1", "1") and not eq("1", "2") and not eq("abc", "ABC")
+          and eq(" True ", "true") and not eq("10", "true"))
+    check("a handpay's own flags likewise",
+          gh.pick_remote_key_off_type({"remoteCredit": "1"})
+          == "G2S_remoteCredit")
+
+    host = make_host()
+    egm = online(joined(host, "BTB_bool"))
+    a = egm.assoc
+    host.enqueue_get_option_config_mode_status(a)
+    drain(host, a)
+    mark = len(host.sent)
+    answer_to(egm, "optionConfig", "getOptionConfigModeStatus",
+              '<g2s:optionConfigModeStatus g2s:enabled="1"/>')
+    check("enabled=\"1\": the machine IS in the option configuration "
+          "mode, and is taken out (it read as out, and stayed in with "
+          "play stopped)", len(exits(sent_since(host, mark))) == 1,
+          names(sent_since(host, mark)))
+    host.enqueue_get_comm_config_mode_status(a)
+    drain(host, a)
+    mark = len(host.sent)
+    answer_to(egm, "commConfig", "getCommConfigModeStatus",
+              '<g2s:commConfigModeStatus g2s:enabled="1" '
+              'g2s:configurationId="0"/>')
+    check("the same for the communications configuration mode",
+          len(exits(sent_since(host, mark), "enterCommConfigMode")) == 1,
+          names(sent_since(host, mark)))
+
+    print("— a game switched off, answered with hostEnabled=\"0\"")
+    a_known_game(host, egm)
+    host.enqueue_set_game_play_state(a, enable=False, disable_text="off",
+                                     device_id="1")
+    drain(host, a)
+    answer_to(egm, "gamePlay", "setGamePlayState",
+              game_status(hostEnabled="0", egmEnabled="1"))
+    g = a.game_play["1"]
+    check("it is read as off and the change as confirmed (it read as a "
+          "disagreement, and the game showed live)",
+          g["hostEnabled"] == "false" and g["egmEnabled"] == "true"
+          and g["stateChange"]["result"] == "confirmed", g["stateChange"])
+    read_denoms(host, egm, denom_list(("d", 1000, "1"), ("d", 2000, "0")))
+    check("a denomination with active=\"1\" is active (every one read as "
+          "inactive, so the editor started from an empty set)",
+          a.game_play["1"]["activeDenoms"] == ["1000"],
+          a.game_play["1"]["activeDenoms"])
+
+    print("— the cabinet, and the handpay settings")
+    host.enqueue_set_cabinet_state(a, enable=False, disable_text="off")
+    drain(host, a)
+    answer_to(egm, "cabinet", "setCabinetState",
+              '<g2s:cabinetStatus g2s:hostEnabled="0" g2s:egmEnabled="1" '
+              'g2s:logicDoorOpen="1" g2s:egmState="G2S_hostDisabled"/>')
+    check("a machine disable answered hostEnabled=\"0\" is confirmed, and "
+          "a door written \"1\" is open",
+          a.cabinet_state_change.get("result") == "confirmed"
+          and a.cabinet["hostEnabled"] == "false"
+          and a.cabinet["logicDoorOpen"] == "true", a.cabinet_state_change)
+    host._maybe_arm_remote_handpay_on_join(a)
+    drain(host, a)
+    mark = len(host.sent)
+    answer_to(egm, "optionConfig", "getOptionList", handpay_options(
+        tuple((p, "true", "1") for p, _m, _v in HANDPAY_PARAMS)))
+    check("handpay settings already on, written \"1\": nothing is sent "
+          "(a change went out at every join and each was marked as not "
+          "verified), and the page's lamp reads on",
+          values_sent(sent_since(host, mark)) is None
+          and a.snapshot().get("handpayRemoteCreditAllowed") == "true",
+          a.snapshot().get("handpayRemoteCreditAllowed"))
+
+    print("— the same spelling in the other classes' answers")
+    host.enqueue_get_wat_status(a, "1")
+    drain(host, a)
+    answer_to(egm, "wat", "getWatStatus",
+              '<g2s:watStatus g2s:cashOutToWat="1" g2s:hostEnabled="0"/>')
+    w = a.wat_devices["1"]
+    check("transfers: cash-out to the host \"1\" is on, hostEnabled "
+          "\"0\" is off", w["cashOutToWat"] == "true"
+          and w["hostEnabled"] == "false" and w["egmEnabled"] == "true", w)
+    host.enqueue_get_note_acceptor_status(a, "1")
+    drain(host, a)
+    answer_to(egm, "noteAcceptor", "getNoteAcceptorStatus",
+              '<g2s:noteAcceptorStatus g2s:hostEnabled="0" '
+              'g2s:doorOpen="1" g2s:stackerFull="0"/>')
+    n = a.note_acceptor["status"]
+    check("note acceptor: a fault written \"1\" is raised",
+          n["doorOpen"] == "true" and n["stackerFull"] == "false"
+          and n["hostEnabled"] == "false", n)
+    host.enqueue_get_note_acceptor_profile(a, "1")
+    drain(host, a)
+    answer_to(egm, "noteAcceptor", "getNoteAcceptorProfile",
+              '<g2s:noteAcceptorProfile g2s:noteEnabled="true" '
+              'g2s:voucherEnabled="true" g2s:requiredForPlay="1">'
+              '<g2s:noteAcceptorData g2s:currencyId="USD" '
+              'g2s:denomId="100000" g2s:baseCashableAmt="100000" '
+              'g2s:noteActive="1"/><g2s:noteAcceptorData '
+              'g2s:currencyId="USD" g2s:denomId="500000" '
+              'g2s:baseCashableAmt="500000" g2s:noteActive="0"/>'
+              "</g2s:noteAcceptorProfile>")
+    check("a note with noteActive=\"1\" is one it takes",
+          len(a.note_acceptor.get("activeNotes") or []) == 1
+          and a.note_acceptor["profile"]["requiredForPlay"] == "true",
+          a.note_acceptor.get("activeNotes"))
+    egm.get_validation_data(5)
+    got = egm.send(
+        "voucher",
+        f'<g2s:getValidationData g2s:configurationId="0" '
+        f'g2s:validationListId="{egm.val_list}" g2s:numValidationIds="5" '
+        'g2s:valIdListExpired="1"/>')
+    data = egm.answer(got, "validationData") or {}
+    check("a ticket id list the machine reports expired with \"1\" is "
+          "replaced", gh.g2s_true(data.get("deleteCurrent")), data)
+
+
+def item_16_a_currency_without_two_decimal_places():
+    print("— audit item 16: amounts are in thousandths of the currency's "
+          "minor unit, and the decimal places are the currency's own "
+          "(§3.2; the 100000 = $1.00 table is \"an example for US "
+          "Dollars\")")
+    check("the hub says by how much such a machine's figures are off",
+          "100 times too small" in (gh.currency_scale_note("JPY") or "")
+          and "10 times too large" in (gh.currency_scale_note("kwd") or "")
+          and gh.currency_scale_note("USD") is None
+          and gh.currency_scale_note("EUR") is None
+          and gh.currency_scale_note("XYZ") is None
+          and gh.currency_scale_note(None) is None)
+    host = make_host()
+    egm = online(joined(host, "BTB_yen"))
+    a = egm.assoc
+    try:
+        host.enqueue_get_cabinet_profile(a)
+        drain(host, a)
+        answer_to(egm, "cabinet", "getCabinetProfile",
+                  '<g2s:cabinetProfile g2s:currencyId="JPY" '
+                  'g2s:localeId="ja_JP"/>')
+        check("a machine in yen: its record says so, and the yen sign is "
+              "not put in front of figures that are 100 times out",
+              "JPY" in a.cabinet.get("currencyNote", "")
+              and gh.money_symbol() != "¥",
+              (a.cabinet.get("currencyNote"), gh.money_symbol()))
+        host.enqueue_get_cabinet_profile(a)
+        drain(host, a)
+        answer_to(egm, "cabinet", "getCabinetProfile",
+                  '<g2s:cabinetProfile g2s:currencyId="EUR" '
+                  'g2s:localeId="de_DE"/>')
+        check("a machine in euros: no note, and its sign is used as before",
+              "currencyNote" not in a.cabinet and gh.money_symbol() == "€",
+              (a.cabinet.get("currencyNote"), gh.money_symbol()))
+    finally:
+        gh._MONEY["symbol"], gh._MONEY["source"] = "$", "default"
+
+
 
 def main():
     logging.basicConfig(level=logging.CRITICAL + 1)
@@ -2052,6 +2869,16 @@ def main():
     item_22_the_order_the_answers_arrive_in()
     item_26_a_set_the_hub_gives_up_on()
     items_21_24_25_37_the_ownership_claim()
+    item_6_the_credit_figure_counts_all_three()
+    item_18_a_meter_answer_belongs_to_its_read()
+    item_19_a_breakdown_is_not_the_device_total()
+    item_7_a_range_of_denominations()
+    item_20_a_game_whose_configuration_changed()
+    item_20_a_machine_whose_game_was_replaced()
+    item_20_no_reading_in_a_loop()
+    item_52_a_game_the_machine_needs()
+    item_27_booleans_written_as_1_and_0()
+    item_16_a_currency_without_two_decimal_places()
     print("=" * 50)
     print(f"RESULT: {_p} passed, {_f} failed")
     return 1 if _f else 0

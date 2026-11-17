@@ -1,5 +1,58 @@
 # Changelog
 
+## v0.3.21
+Fourth batch from the G2S audit: meters and game play. Eight items.
+- **The credit on a machine is all three kinds of credit.** A machine
+  keeps cashable, promotional and restricted credit on separate meters,
+  and what the player sees is the total. The hub looked at the cashable
+  meter alone. A machine holding only restricted or promotional credit
+  read as empty: the tournament's clear step passed it and put the stake
+  on top, and the figure on the machine's own screen under-read. A pull
+  now asks for each kind and credits each as what it is. This is for
+  machines whose money moves over G2S; a machine with a SAS link is
+  unchanged.
+- **A denomination range is read as the denominations in it.** A machine
+  may list its denominations as a range (1¢ to 5¢, say) instead of one by
+  one. The hub kept ranges aside and showed nothing for them, and a
+  denomination change sent only the single entries, which switched off
+  every active denomination in the range. A range the hub cannot list is
+  said, and a change for that game is refused.
+- **An empty machine is confirmed by the answer to the hub's own
+  question.** Before funding a tournament seat the hub asks the machine
+  for its credit meters. Any meter report arriving afterwards was taken
+  as the answer, including a routine report sent before the question and
+  an answer about other meters.
+- **Breakdown meters no longer replace a device's totals.** A meter
+  report can also carry figures per wager category, per denomination and
+  per currency under the same names as the totals. They were stored over
+  the totals. They are now left out.
+- **A game whose paytable or settings change is read again.** The hub
+  read a game's profile once and kept it for good. After a change at the
+  machine the Games page showed the new paytable with the old payback
+  and maximum bet.
+- **When a machine's game is replaced, all of its entries are read
+  again.** On a single-game machine the entries on the Games page are
+  that game's paytables. Only the one the machine is set to reports
+  anything, so the others kept the old game's name: a Bluebird running
+  Dr. Jackpot still listed eleven Wizard of Oz II paytables four months
+  after the change. The hub does this by itself at most three times a
+  day per machine. A player moving between the games of a multi-game
+  machine does not trigger it.
+- **Yes/no values written 1 and 0 are understood**, as well as true and
+  false, everywhere the hub reads one. A machine that writes them that
+  way could be left in a configuration mode, have every denomination
+  shown as off, and be sent the same handpay settings at every join.
+- A machine can mark one entry on its Games page (a game, or one
+  paytable of its game) as one it will not run without. Disabling that
+  entry takes the whole machine out of play (still powered, shown as
+  disabled). The Games page now says so on that entry's Disable button.
+  For every other entry Disable only makes it unavailable, as before.
+- A machine whose currency does not have two decimal places (yen, for
+  one) gets a note on its tile saying its amounts are off and by how
+  much; the hub does not rescale them, and does not put that currency's
+  sign in front of them.
+- The join's log line for the handpay settings names what was sent.
+
 ## v0.3.20
 Third batch from the G2S audit: configuration changes. Eight items.
 - **A machine is not left in a configuration mode.** While a machine is

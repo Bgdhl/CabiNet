@@ -2141,6 +2141,11 @@ function floorTile(s){
     if(String(cab.hostEnabled)==="false") st.push(chip("host disabled","bad"));
     else if(String(cab.egmEnabled)==="false") st.push(chip("machine-side disabled","warn"));
   }
+  /* A machine whose currency does not have two decimal places: the hub
+     reads every amount as if it had, so this machine's figures are off by
+     the factor the hub states (absent for every other machine and on an
+     older hub). */
+  if(cab.currencyNote) st.push(chip(String(cab.currencyNote),"warn"));
   for(const k in cab){
     if(/doorOpen$/i.test(k) && String(cab[k])==="true")
       st.push(chip(k.replace(/DoorOpen$/i," door open").replace(/^cabinet/,"main"),"warn"));
@@ -3143,11 +3148,18 @@ function renderGames(){
       const hOff=String(g.hostEnabled)==="false", eOff=String(g.egmEnabled)==="false";
       const state=hOff?chip("off · host","warn"):eOff?chip("off · machine",""):chip("live","ok");
       const da=`data-egm="${esc(e)}" data-dev="${esc(d)}"`;
+      /* requiredForPlay (the machine's own setting for this game): with
+         this game disabled the machine disables itself as a whole: out of
+         play, not powered down. Most games do not have it set, and for
+         those Disable only makes the title unavailable. Said on the
+         button, before the tap. Absent on an older hub = no line. */
+      const reqd=String(g.requiredForPlay)==="true";
       const tog=hOff
         ? `<button class="btn slim" ${da} data-en="1" onclick="gpState(this)">
              <span class="bl">Enable</span></button>`
         : `<button class="btn slim danger" ${da} data-en="0" onclick="gpState(this)">
-             <span class="bl">Disable</span></button>`;
+             <span class="bl">Disable</span>${reqd
+               ?'<span class="ba">this machine goes out of play without it</span>':""}</button>`;
       /* DENOMS — every supported denom is an always-visible toggle chip;
          lit = active (a player can pick it). Tapping enters edit mode for
          THIS device (GM.denomEdit, module-level so the 2s repaint keeps
