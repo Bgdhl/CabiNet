@@ -33,12 +33,21 @@ machine might stray from §3.2 and §15.10 (marking a record read when it is
 SENT, counting a look-ahead as the read, treating a repeated poll as a new
 one), so a test can show the host copes with those too.
 
-`counts_idle_general_polls=False` relaxes ONE rule, for tests that run the
-poller's idle loop: the poller still sends the same general poll over and
-over with no acknowledgement between (audit item 4, not fixed yet), which
-this machine would answer twice and then ignore. Relaxed, a repeated
-general poll re-sends an exception that is waiting for its ACK and
-otherwise counts as a new poll. Remove the switch when item 4 is fixed.
+With a `clock` it also keeps time (audit batch 4):
+
+  §2.3.3 polling rate — a poll that comes less than `min_gap` seconds after
+        this machine's last exchange is ignored, as an over-polled machine
+        ignores it. The two exemptions the document gives are kept: the
+        same poll again as a NACK (§3.2), and a long poll that is the next
+        poll after a priority exception (§2.2.1).
+  §3.3  synchronisation — after five seconds with no address byte the
+        machine ignores polls to itself until it sees another address
+        polled (`must_resync`).
+  §4.2  loop break — in that state it chirps its own address (`chirps`).
+
+`general_faults` spoils the answers to general polls the same way `faults`
+does for long polls (only DROP makes sense for a one-byte answer).
+
 StrictMachine in test_sas_implied_ack.py is the older, narrower relative:
 it models what a tester's Ainsworth A560 was seen to do with three 0x73
 polls, which is not quite the document either.
@@ -46,6 +55,12 @@ polls, which is not quite the document either.
 
 from core.sas_meters import int_to_bcd
 from core.sas_protocol import sas_crc
+
+# §2.2.1: the priority exceptions. A long poll that is the next poll after
+# one of these need not wait for the polling rate.
+PRIORITY_EXCEPTIONS = frozenset({
+    0x57, 0x67, 0x68, 0x3F, 0x6A, 0x6B, 0x6F, 0x56, 0x3D, 0x3E, 0x69, 0x6C,
+    0x6D, 0x51, 0x52, 0x8F, 0x70})
 
 DAMAGE = "damage"        # the answer arrives with a bad CRC
 DROP = "drop"            # the answer is sent and never arrives
@@ -62,11 +77,21 @@ def frame(address, command, data=b""):
 class ByTheBookMachine:
     def __init__(self, address=1, mark_read_on="ack", peek_marks_read=False,
                  knows_look_ahead=True, speaks_4d=True,
-                 counts_idle_general_polls=True, resends_on_nack=True,
-                 answers_4d_with_zeros=False):
+                 resends_on_nack=True, answers_4d_with_zeros=False,
+                 clock=None, min_gap=0.0):
         self.address = address
-        self.counts_idle_general_polls = counts_idle_general_polls
         self.resends_on_nack = resends_on_nack      # True per §3.2
+        # timekeeping (only with a clock)
+        self.clock = clock
+        self.min_gap = min_gap       # §2.3.3: 0.2, or 0.04 where supported
+        self.too_soon = []           # polls ignored for coming too early
+        self.must_resync = False     # §3.3: waiting to see another address
+        self.chirps = 0              # §4.2: read windows that held a chirp
+        self._heard_at = None        # last address byte, any address
+        self._polled_at = None       # end of our last exchange
+        self._last_raw = None        # the last poll to us, byte for byte
+        self._after_priority = False
+        self.general_faults = []     # one entry per upcoming general answer
         # standard validation, the other way §15.10 allows: answer 0x4D,
         # with "all zeros in the Validation Number field"
         self.answers_4d_with_zeros = answers_4d_with_zeros
@@ -133,18 +158,41 @@ class ByTheBookMachine:
             return b""
         general = len(raw) == 1
         polled = raw[0] & 0x7F
+        now = self.clock() if self.clock is not None else None
+        if now is not None:
+            # §3.3 / §4.2: five seconds with no address byte at all
+            if self._heard_at is not None and now - self._heard_at >= 5.0:
+                self.must_resync = True
+                self._on_ack = None      # a lost sync is an implied NACK
+            self._heard_at = now
         if polled != self.address:
             # another machine's poll, or address 0: Table 3.1's "poll to a
             # different gaming machine address" / global broadcast
-            self._implied_ack()
+            if self.must_resync:
+                self.must_resync = False
+            else:
+                self._implied_ack()
             self._last, self._run = None, 0
             return b""
+        if self.must_resync:
+            self.chirps += 1
+            return bytes([self.address])             # still chirping
         kind = "general" if general else raw[1]
-        if general and kind == self._last \
-                and not self.counts_idle_general_polls:
-            if self._on_ack is None:                 # nothing waiting: new poll
-                self._answer = self._general()
-            return self._answer
+        if now is not None and self.min_gap:
+            exempt = (raw == self._last_raw            # §3.2: a NACK
+                      or (not general and self._after_priority))
+            if self._polled_at is not None and not exempt \
+                    and now - self._polled_at < self.min_gap - 1e-9:
+                self.too_soon.append(raw)
+                return b""                           # over-polled: ignored
+            self._polled_at = now
+        self._last_raw = raw
+        answer = self._count(raw, general, kind)
+        self._after_priority = (general and len(answer) == 1
+                                and answer[0] in PRIORITY_EXCEPTIONS)
+        return answer
+
+    def _count(self, raw, general, kind):
         if kind == self._last:
             self._run += 1
             if self._run == 2:
@@ -166,9 +214,10 @@ class ByTheBookMachine:
             self.acks += 1
 
     def _spoil(self, answer, general):
-        if general or not answer or not self.faults:
+        faults = self.general_faults if general else self.faults
+        if not answer or not faults:
             return answer
-        fault = self.faults.pop(0)
+        fault = faults.pop(0)
         if fault == DROP:
             return b""
         if fault == CUT:
@@ -279,14 +328,10 @@ class ByTheBookAFTMachine(ByTheBookMachine):
 
     The transfer stays PENDING until the test calls complete(), or until
     `complete_after` general polls have come in after a declined cancel —
-    which is exactly when our host has given up on it.
-
-    counts_idle_general_polls defaults to False here: the transfer wait
-    still sends bare general polls in a row (audit item 4)."""
+    which is exactly when our host has given up on it."""
 
     def __init__(self, credits=0, honours_cancel=False, complete_after=None,
                  hears_initiate=True, restricted=0, complete_in=None, **kw):
-        kw.setdefault("counts_idle_general_polls", False)
         super().__init__(**kw)
         self.asset = bytes([0x92, 0x10, 0x00, 0x00])
         self.key = bytes(range(20))

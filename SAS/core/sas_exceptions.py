@@ -11,17 +11,16 @@ Every entry in EXCEPTIONS is guide-cited. Codes the FULL IGT SAS spec defines
 but the guide does NOT (the on-disk guide is a supplement, not the spec) are
 deliberately ABSENT from EXCEPTIONS rather than guessed:
 
-  0x51/0x52: bench 2026-07-08 (BB2), added to BENCH_EXCEPTIONS below.
-  0x51 is the EGM ACTIVELY REQUESTING the host complete a handpay reset NOW:
-  a real handpay happened, the attendant keyed off the physical LOCKUP, but
-  the SAS host never sent the reset — so the EGM re-reports 0x51 until the
-  host acknowledges it. The machine stays PLAYABLE (not a live lock), but
-  0x51 is a live REQUEST, not a passive flag — the answer is to RUN the reset
-  (0xA8 select method -> 0x94 reset, core/sas_handpay_reset.py / the UI 🔑
-  button), which is exactly what the machine is asking for; 0x52 is the EGM
-  confirming the reset happened. (LP 0x1B "Send Handpay Information" is a
-  SEPARATE read poll — do NOT conflate reading the info with resetting the
-  handpay; that conflation was the wrong theory.) AJ-corrected 2026-07-08.
+  0x51/0x52: in BENCH_EXCEPTIONS below. SAS 6.02 §7.8.1: 0x51 "handpay is
+  pending" is answered by READING long poll 1B (send handpay information),
+  and the machine re-issues 0x51 every fifteen seconds until that read is
+  acknowledged. It is not a request for a reset: a remote reset (0x94) on a
+  machine that is no longer locked up answers code 02, "not currently in a
+  handpay condition", and does not stop the 0x51s. 0x52 follows the reset.
+  (An earlier version of this note said the opposite, that 0x51 asks for
+  the reset and that reading 1B was "the wrong theory". The poller has read
+  1B on every 0x51 since then, which is what stopped the endless 0x51s on
+  the BB2.)
 
   TODO(bench): likewise $50/$100 "bill accepted" exception codes: the guide
   documents only $1/$5/$10/$20 (0x47-0x4A, non-RTE). Larger denominations
@@ -214,6 +213,62 @@ BENCH_EXCEPTIONS: Dict[int, SASExceptionInfo] = {e.code: e for e in [
                      "aft_game_locked"),
 ]}
 
+# --------------------------------------------------------------------------
+# SAS 6.02 Appendix A, codes 80-9B that the guide's table above leaves out.
+# Kept apart so the guide-cited table stays what it says it is. 86 and 8C
+# are already above.
+#
+# Why they need names (audit item 9): each machine's address ORed with 0x80
+# falls in this range, and the poller used to take that one byte for a NACK
+# and drop it. At address 2 that was 82, every trip into the attendant
+# menu.
+APPENDIX_A_EXCEPTIONS: Dict[int, SASExceptionInfo] = {e.code: e for e in [
+    SASExceptionInfo(0x80, "hopper full detected", _C.TILT, "hopper_full"),
+    SASExceptionInfo(0x81, "hopper level low detected", _C.TILT,
+                     "hopper_low"),
+    SASExceptionInfo(0x82, "display meters or attendant menu entered",
+                     _C.SYSTEM, "attendant_menu_entered"),
+    SASExceptionInfo(0x83, "display meters or attendant menu exited",
+                     _C.SYSTEM, "attendant_menu_exited"),
+    SASExceptionInfo(0x84, "self test or operator menu entered", _C.SYSTEM,
+                     "operator_menu_entered"),
+    SASExceptionInfo(0x85, "self test or operator menu exited", _C.SYSTEM,
+                     "operator_menu_exited"),
+    SASExceptionInfo(0x87, "player has requested draw cards", _C.GAME,
+                     "draw_requested"),
+    SASExceptionInfo(0x88, "reel has stopped", _C.GAME, "reel_stopped"),
+    SASExceptionInfo(0x89, "coin/credit wagered", _C.GAME, "credit_wagered"),
+    SASExceptionInfo(0x8A, "game recall entry displayed", _C.GAME,
+                     "game_recall"),
+    SASExceptionInfo(0x8B, "card held/not held", _C.GAME, "card_held"),
+    SASExceptionInfo(0x8E, "component list changed", _C.SYSTEM,
+                     "component_list_changed"),
+    SASExceptionInfo(0x8F, "authentication complete", _C.SYSTEM,
+                     "authentication_complete"),
+    SASExceptionInfo(0x98, "power off card cage access", _C.DOOR,
+                     "power_off_card_cage_access"),
+    SASExceptionInfo(0x99, "power off slot door access", _C.DOOR,
+                     "power_off_slot_door_access"),
+    SASExceptionInfo(0x9A, "power off cashbox door access", _C.DOOR,
+                     "power_off_cashbox_door_access"),
+    SASExceptionInfo(0x9B, "power off drop door access", _C.DOOR,
+                     "power_off_drop_door_access"),
+]}
+
+# Every code Table A-1 defines, as numbers only. This is NOT the naming
+# table: the 52 codes with no entry above still come out as "exception
+# 0xNN" (audit item 29, open). It exists for one question the link layer
+# has to answer: is a lone byte equal to a machine's own address its
+# loop-break chirp, or an exception? Asking the naming tables got that
+# wrong for every address whose value they happen to leave out (20-25,
+# 31-3B, 40-46 and so on).
+APPENDIX_A_CODES = frozenset(
+    list(range(0x11, 0x26)) + list(range(0x27, 0x2F))
+    + list(range(0x31, 0x58)) + [0x60, 0x61]
+    + list(range(0x66, 0x73)) + list(range(0x74, 0x7D)) + [0x7E, 0x7F]
+    + list(range(0x80, 0x8D)) + [0x8E, 0x8F] + list(range(0x98, 0x9C))
+    + [0x00])
+
 # Convenience: bill-accepted exception code -> denomination in cents
 # (guide §3.1: 47=$1.00, 48=$5.00, 49=$10.00, 4A=$20.00, all non-RTE mode).
 BILL_DENOM_CENTS: Dict[int, int] = {
@@ -227,12 +282,15 @@ EXCEPTION_NAMES: Dict[int, str] = {c: e.name for c, e in EXCEPTIONS.items()}
 
 def lookup(code: int) -> SASExceptionInfo:
     """Return the table entry for a code — guide-cited EXCEPTIONS first, then
-    the quarantined VERIFY_ON_BENCH table — or a synthesized UNKNOWN entry.
+    the quarantined VERIFY_ON_BENCH table, then the SAS 6.02 Appendix A
+    codes the guide leaves out — or a synthesized UNKNOWN entry.
     Never raises, so an uncited real-spec code still flows through the event
     path with its raw value visible."""
     info = EXCEPTIONS.get(code)
     if info is None:
         info = BENCH_EXCEPTIONS.get(code)
+    if info is None:
+        info = APPENDIX_A_EXCEPTIONS.get(code)
     if info is not None:
         return info
     return SASExceptionInfo(code, f"exception 0x{code:02X}",

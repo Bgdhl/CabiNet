@@ -55,7 +55,8 @@ from core.sas_machine_info import (parse_enabled_game_numbers,
                                    build_extended_game_info_poll,
                                    parse_extended_game_info,
                                    denom_code_cents)
-from core.sas_meters import (SAS_POLL_FLOOR, build_meter_poll,
+from core.sas_meters import (SAS_FAST_POLL, SAS_POLL_FLOOR,
+                             build_meter_poll,
                              parse_enabled_features, parse_meters_10_15,
                              parse_single_meter, parse_total_games)
 from core.sas_handpay_reset import (HANDPAY_PENDING_EXCEPTION,
@@ -117,7 +118,7 @@ MACHINE_INFO_RETRY_SEC = 30  # a FAILED machine-info/census attempt retries on
 #                              offline drop, an LP09 toggle, a 0x3C/0x8C
 #                              machine event, or the hub's read_machine_info
 #                              command. See machine_info_read in main().
-MACHINE_INFO_BUSY_SEC = 2.0  # §2.2 busy-frame answer to the 0x1F -> retry
+MACHINE_INFO_BUSY_SEC = 2.0  # busy-frame (SAS 6.02 §4.1) answer to the 0x1F -> retry
 #                              SOON: the boot-busy chirp window rides the
 #                              first online flip, so the bringup census can
 #                              land on a machine that is awake but not ready
@@ -185,12 +186,13 @@ MAX_AFT_CENTS = 9_999_999_999   # 5-byte BCD max = $99,999,999.99
 #   0x46  bills-in          (credit amount of accepted bills — the B term)
 #
 # All three are type-R frames issued by SASPoller._sweep_meters on the POLL
-# thread (the only transport toucher), back-to-back within one sweep —
-# back-to-back long polls are live-proven on this BB2 (general->0x1A every
-# sweep since day one, 0x51->0x1B, the 0x70/0x71 TITO chain). The park loop
+# thread (the only transport toucher), one after another within one sweep.
+# They used to go out about 25 ms apart, which a BB2 takes; since v0.3.13
+# the transport holds every poll to the machine's polling rate (SAS 6.02
+# §2.3.3: 200 ms, or 40 ms where the machine supports it). The park loop
 # in stop_or_heartbeat holds the poll thread BEFORE poll_once, so a
 # hub-disabled machine sweeps nothing (no wire traffic while parked). Per
-# §2.7.4 a machine that doesn't implement 0x0F/0x46 answers dead silence and
+# SAS 6.02 §4.4 a machine that doesn't implement 0x0F/0x46 answers silence and
 # the sweep simply skips those readings (BENCH #5 decides the
 # fallback-to-singles question — nothing breaks meanwhile).
 #
@@ -390,6 +392,19 @@ def _restricted_moved(res) -> int:
             or final.restricted_cents is None:
         return 0
     return int(final.restricted_cents)
+
+
+def link_down_reason(state):
+    """Why a command must not be sent to this machine right now, or None.
+
+    `state` is the poller's MachineState. Not answering polls is reason
+    enough; a machine that is chirping gets the more useful sentence."""
+    if getattr(state, "chirp_run", 0) > 0:
+        return ("the machine is not hearing the Pi (it is sending its "
+                "loop-break chirp): check the Pi's transmit line")
+    if not state.online:
+        return "the machine is not answering polls"
+    return None
 
 
 def late_transfer_record(ended):
@@ -1478,12 +1493,16 @@ def main():
                        "machine may ignore polls this fast", args.interval)
 
     protocol = SASProtocol()
-    # Every poll this host sends goes through the implied-ACK guard: a long
-    # poll the machine already answered is ACKed before the same command is
-    # sent again (SAS 6.02 §3.1-3.2; an A560 goes silent on the third
-    # un-ACKed 0x73 — see core/sas_implied_ack.py).
+    # Every poll this host sends goes through the link-rules guard (see
+    # core/sas_implied_ack.py): an answered poll is ACKed before the same
+    # poll is sent again (SAS 6.02 §3.1-3.2; an A560 goes silent on the
+    # third un-ACKed 0x73), a sync poll leads after a silence (§3.3), and
+    # polls to the machine are held to the polling rate (§2.3.3). The rate
+    # starts at 200 ms; the games census lowers it to 40 ms when the
+    # machine's A0 answer says it may be.
     port = ImpliedAckTransport(
-        open_port(args.port, args.mock, args.address, protocol))
+        open_port(args.port, args.mock, args.address, protocol),
+        poll_gap=SAS_POLL_FLOOR)
 
     # ---- state-edge callbacks: log transitions, never per-poll noise ------
     stats = {"events": 0, "meter_changes": 0, "last_meters": {}}
@@ -1770,6 +1789,22 @@ def main():
             result["result"] = "rejected: sas disabled"
             logger.info("⛔ hub command {} ({}): refused — SAS disabled",
                         cmd_id, cmd.get("type"))
+            return result
+        down = link_down_reason(poller.state)
+        if down:
+            # Every command is a poll to the machine, and several take a
+            # lone address byte back as "done". A machine that cannot hear
+            # the Pi sends exactly that byte, unasked, every 200 ms (the
+            # loop-break chirp, SAS 6.02 §4.2), and the receive side cannot
+            # see the ninth bit that marks it. So with the link down a
+            # bonus or a lock could be reported as done on a machine that
+            # never heard it (audit item 10). Nothing is sent.
+            result["ok"] = False
+            result["outcome"] = "machine_offline"
+            result["detail"] = down
+            result["result"] = "rejected: machine not answering"
+            logger.info("⛔ hub command {} ({}): refused — {}",
+                        cmd_id, cmd.get("type"), down)
             return result
         try:
             if cmd.get("type") == "handpay_reset":
@@ -2172,7 +2207,7 @@ def main():
                     + (b"\x01" if enable else b"\x00"))
                 reply = poller.transport.transact(frame)
                 # Classify the 1-byte reply. NOTE the BUSY frame is the
-                # 2-byte [addr][0x00] (§2.2) — its FIRST byte equals the
+                # 2-byte [addr][0x00] (SAS 6.02 §4.1) — its FIRST byte equals the
                 # bare address, so a naive reply[:1]==addr check would call
                 # a machine that DECLINED the command an "ack". Rule out
                 # busy (len 2, second byte 0x00) before the ack test.
@@ -2953,10 +2988,13 @@ def main():
         # Coming back from a park we have sent nothing for as long as it
         # lasted, and a machine that hears no address byte for 5 s will not
         # answer its own address again until it sees the sync poll (SAS 6.02
-        # §3.3) — so ask the poller to lead with one now, rather than find
-        # out a second later by missing five polls.
+        # §3.3) — so send one NOW. Until v0.3.13 this only asked the poller
+        # to lead its next poll with one, and the rest of this pass (the
+        # AFT status read, a pending cash-out) polled the machine first:
+        # every poll read silence and the hub was told "not registered"
+        # for the next thirty seconds (audit item 27).
         if parked:
-            poller.state.synced = False
+            poller.sync_now()
         # Machine-initiated host-cashout (0x6A) answered here, between polls
         # (poll thread, same window as the AFT cache — never races a wire
         # exchange). No-op unless a 0x6A was flagged while armed. Gated ONLINE
@@ -3085,7 +3123,7 @@ def main():
                 time.sleep(SAS_POLL_FLOOR)
                 resp = port.transact(build_meter_poll(args.address, 0x1F))
                 if resp and len(resp) == 2 and resp[1] == 0x00:
-                    # §2.2 busy frame: awake but can't service the read yet
+                    # busy frame (SAS 6.02 §4.1): awake but can't service the read yet
                     # (the boot-busy chirp window rides the first online
                     # flip — "online" precedes readiness). NOT a consumed
                     # attempt: retry soon, and skip the census singles too
@@ -3153,12 +3191,34 @@ def main():
                         except Exception as ce:       # noqa: BLE001
                             logger.debug("census {:02X} skipped: {}",
                                          cmd_b, ce)
+                    def _features(d):
+                        f = parse_enabled_features(d)
+                        mi["multiDenom"] = f.multi_denom_extensions
+                        # §2.3.3: 40 ms between polls where the machine
+                        # supports it, 200 ms otherwise. Only ever lowered
+                        # on the machine's own word.
+                        fast = f.supports_fast_polling
+                        # (min: a test run shrinks SAS_POLL_FLOOR to keep
+                        # the wall clock short, and 40 ms must not then
+                        # be the slower of the two)
+                        gap = min(SAS_FAST_POLL, SAS_POLL_FLOOR) if fast \
+                            else SAS_POLL_FLOOR
+                        mi["pollRateMs"] = int(round(
+                            (SAS_FAST_POLL if fast else 0.2) * 1000))
+                        if port.poll_gap != gap:
+                            port.poll_gap = gap
+                            logger.info(
+                                "⏱️ polling rate: {} ms between polls to "
+                                "this machine ({})",
+                                mi["pollRateMs"],
+                                "its A0 answer sets the 40 ms bit"
+                                if f.polling_40ms else
+                                f"{f.validation_style} validation requires "
+                                "40 ms support" if fast else
+                                "it does not say it supports 40 ms")
                     _census(0xA0, protocol.build_packet(
                                 args.address, 0xA0, b"\x00\x00"),
-                            lambda d: mi.__setitem__(
-                                "multiDenom",
-                                parse_enabled_features(d)
-                                .multi_denom_extensions))
+                            _features)
                     _census(0x51, build_meter_poll(args.address, 0x51),
                             lambda d: mi.__setitem__(
                                 "totalGames", parse_total_games(d)))

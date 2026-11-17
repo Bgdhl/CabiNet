@@ -420,7 +420,7 @@ class TestOnlyATicketIsStored:
     def test_a_handpay_with_no_receipt_through_the_poller(self, tmp_path):
         """Exception 0x3E (handpay validated) used to end as an 'issued'
         ticket for the handpay amount on the hub."""
-        machine = ByTheBookMachine(counts_idle_general_polls=False)
+        machine = ByTheBookMachine()
         machine.print_ticket(VN, 125000, validation_type=0x60,
                              ticket_number=None)
         assert machine.exceptions == [0x3E]
@@ -455,7 +455,7 @@ class TestOnlyATicketIsStored:
 # ---------------------------------------------------------------------------
 
 def _handpay_rig():
-    machine = ByTheBookMachine(counts_idle_general_polls=False)
+    machine = ByTheBookMachine()
     machine.handpay()
     port = _line(machine)
     got = []

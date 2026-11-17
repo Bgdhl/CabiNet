@@ -1,5 +1,49 @@
 # Changelog
 
+## v0.3.13
+Fourth batch from the SAS audit: the link rules. This changes the rhythm
+on the wire for every SAS machine. A WMS Bluebird 2 took the old rhythm
+without complaint; a machine that keeps the document's rules would not.
+- **An idle machine is no longer sent the same poll over and over.** While
+  nothing was happening the satellite sent one general poll every 200 ms
+  and nothing else, about twenty in a row. The document counts the second
+  as "send that again" and lets a machine stop answering at the third.
+  Every answered poll is now acknowledged (one extra byte, a poll to
+  address 0) before the next. A poll that got no answer is still repeated
+  as it was, because that repeat is how the machine is asked to send
+  again.
+- **Polls keep the polling rate.** The meter reads, the exception drain,
+  the AFT status read and hub commands went out about 25 ms after the
+  previous poll. The document allows 200 ms between polls to one machine,
+  or 40 ms where the machine says it supports that. The satellite starts
+  at 200 ms and drops to 40 ms once the machine's own answer allows it
+  (it says so, or it validates tickets, which requires it). The two cases
+  the document exempts are kept: asking again after a damaged answer, and
+  answering a priority exception. The Machines status shows the rate in
+  use (`pollRateMs`).
+- **After a silence the machine gets its sync poll first.** When SAS was
+  switched back on in Settings, the status polls in the same pass went
+  out before the sync poll, to a machine still ignoring its own address,
+  and the hub showed it as not registered for the next thirty seconds.
+  The same now holds after any four seconds with nothing sent.
+- **A command is not sent to a machine that is not answering.** A machine
+  whose receive line is dead sends one stray byte every 200 ms, and that
+  byte is also what "done" looks like for a bonus award, a lock or a game
+  enable. About one such command in four was reported done on a machine
+  that never heard it. The command is refused with the reason.
+- **Exception 81 to 8F at the matching address is reported.** A byte
+  equal to the machine's address plus 0x80 was dropped as a refusal. It
+  is an ordinary exception: at address 2, every entry to the attendant
+  menu went unreported. These codes have their names now. If the same
+  byte comes on the very next poll again it is counted, not reported
+  twice (a Bluebird 2 once sent 81 about twenty times in a row).
+- The waits for a handpay reset, a ticket redemption and an AFT transfer
+  no longer report "no activity" and stray address bytes as events, and
+  the twentieth exception taken in one pass is acknowledged like the
+  rest.
+- Not tried on a machine that enforces these rules; the tests run against
+  a pretend one that does.
+
 ## v0.3.12
 Restricted promotional credit, end to end. Every player wallet has two
 balances: cash and restricted. Restricted credit has to be played and is

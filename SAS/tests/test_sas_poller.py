@@ -100,12 +100,14 @@ class TestSASPoller:
         assert codes == [0x12, 0x8C]   # each dispatched exactly ONCE
         assert exception_name(0x8C) == "game selected"
 
-    def test_busy_nack_chirp_not_dispatched(self):
-        # addr|0x80 (Table 7.4b busy/NACK). Live-seen 2026-07-10 on the WMS
-        # BB2 at addr 1: a ~1 s run of 0x81 answers was dispatched as 21
-        # phantom "exception 0x81" events on the floor UI. The poller must
-        # count the chirps (state.nacks), never dispatch, never FIFO-drain —
-        # and a chirping machine is an ANSWERING machine (stays online).
+    def test_a_run_of_the_own_address_code_is_reported_once(self):
+        # addr|0x80 is an exception code like any other (Appendix A: 0x81 is
+        # "hopper level low detected"), so it is reported. Until 2026-11-17
+        # it was taken for the NACK of Table 7.4b and dropped (audit item
+        # 9). What is kept: on 2026-07-10 a WMS BB2 at addr 1 sent 0x81 on
+        # some twenty polls in a row, which put 21 lines on the floor UI.
+        # The first of such a run is reported, the rest counted
+        # (state.nacks), and the machine stays online.
         machine = ScriptedMachine(address=1)
         machine.queue(0x81, 0x81, 0x81)
         port = MockSASSerialPort(machine)
@@ -114,8 +116,8 @@ class TestSASPoller:
                            on_event=lambda a, c, n: events.append((a, c, n)))
         for _ in range(3):
             poller.poll_once()
-        assert events == []
-        assert poller.state.nacks == 3
+        assert events == [(1, 0x81, "hopper level low detected")]
+        assert poller.state.nacks == 2
         assert poller.state.online is True
 
     def test_nack_byte_is_address_relative(self):
@@ -148,21 +150,22 @@ class TestSASPoller:
         assert exception_name(0x86) == "game out of service"
         assert poller.state.nacks == 0         # NOT counted as a chirp
 
-    def test_chirp_still_folded_when_not_a_documented_exception(self):
-        # The disambiguation only rescues DOCUMENTED codes: an undocumented
-        # 0x80|addr byte is still a busy/NACK chirp. At address 12 that is
-        # 0x8C "game selected" (documented -> dispatched), but at address 3
-        # the chirp 0x83 has no EXCEPTIONS entry and must still fold.
+    def test_attendant_menu_exit_at_address_3_is_reported(self):
+        # At address 3 the byte 0x83 (= 0x80|3) is "display meters or
+        # attendant menu has been exited" (Appendix A). It used to be
+        # dropped as a NACK because the guide's table does not list it.
+        # Reported once; the same byte on the very next poll is counted.
         machine = ScriptedMachine(address=3)
-        machine.queue(0x83, 0x83)              # 0x80|3, not in the guide table
+        machine.queue(0x83, 0x83)
         port = MockSASSerialPort(machine)
         events = []
         poller = SASPoller(port, address=3,
                            on_event=lambda a, c, n: events.append((a, c, n)))
         for _ in range(2):
             poller.poll_once()
-        assert events == []
-        assert poller.state.nacks == 2
+        assert [c for _, c, _ in events] == [0x83]
+        assert "attendant menu" in events[0][2]
+        assert poller.state.nacks == 1
 
     def test_implied_ack_no_duplicate_events(self):
         """Against a machine that re-sends until ACKed (real semantics), the

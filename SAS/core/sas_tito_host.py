@@ -63,6 +63,7 @@ from typing import Callable, Optional
 
 from .sas_protocol import SASProtocol
 from .sas_implied_ack import transact_reread
+from .sas_wait import await_exception
 from .sas_meters import (
     SAS_POLL_FLOOR, bcd_to_int, int_to_bcd,
     build_enhanced_validation_info_poll, build_set_validation_id_poll,
@@ -1300,26 +1301,11 @@ def _redeem_status(resp: bytes, address: int,
 
 def _await_transfer_complete(transport, address, proto, pace, sleep,
                              confirm_polls, on_exception, on_frame) -> bool:
-    """General-poll (paced, implied-ACK aware — the handpay module's loop)
-    until the believed 0x68 'ticket transfer complete' exception."""
-    for _ in range(confirm_polls):
-        sleep(pace)
-        resp = transport.transact(proto.build_general_poll(address))
-        if not resp:
-            continue
-        if len(resp) > 1:
-            if on_frame is not None:
-                on_frame(resp)
-            continue
-        code = resp[0]
-        if code == 0x00:
-            continue
-        transport.transact(proto.build_general_poll(0))   # implied ACK
-        if code == TICKET_TRANSFER_COMPLETE_EXCEPTION:
-            return True
-        if on_exception is not None:
-            on_exception(code)
-    return False
+    """General-poll (paced) until the 0x68 'ticket transfer complete'
+    exception. The loop itself is core/sas_wait.await_exception."""
+    return await_exception(transport, address, proto,
+                           (TICKET_TRANSFER_COMPLETE_EXCEPTION,), pace, sleep,
+                           confirm_polls, on_exception, on_frame)
 
 
 # --------------------------------------------------------------------------
