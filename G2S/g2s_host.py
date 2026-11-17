@@ -125,7 +125,7 @@ if "tournament_names" not in _hub_store_mod.HOST_SETTING_KEYS:
 # the MINOR bump per the repo's version rule). Surfaced in engine_meta() ->
 # /api/status ["_engine"]["version"]; bump this and add a CHANGELOG.md
 # section on every commit with a user-visible change.
-CABINET_VERSION = "0.3.12"
+CABINET_VERSION = "0.3.13"
 
 WSDL_NS = "http://www.gamingstandards.com/wsdl/g2s/v1.0"
 SCHEMA_NS = "http://www.gamingstandards.com/g2s/schemas/v1.0.3"
@@ -6047,6 +6047,10 @@ class G2SHost:
                 # present-tense truth). Absent on an old satellite.
                 "readAt": _ms(mi.get("readAt"), 32),
                 "censusAt": _ms(mi.get("censusAt"), 32),
+                # milliseconds the satellite leaves between polls to this
+                # machine: 40 where the machine's A0 answer allows it, 200
+                # otherwise (SAS 6.02 §2.3.3). Absent on an old satellite.
+                "pollRateMs": _mbi(mi.get("pollRateMs"), 5000),
             }
         # pendingHandpay: the satellite's 0x51 handpay latch (C3) — rides
         # the entry into /api/status verbatim so the UI can raise the

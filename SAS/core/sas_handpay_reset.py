@@ -61,6 +61,7 @@ from typing import Callable, Optional
 
 from .sas_protocol import SASProtocol
 from .sas_meters import SAS_POLL_FLOOR
+from .sas_wait import await_exception
 
 __all__ = [
     "CMD_SET_HANDPAY_RESET_METHOD", "CMD_REMOTE_HANDPAY_RESET",
@@ -278,28 +279,8 @@ def reset_handpay_to_credits(transport, address: int,
 
 def _await_confirmation(transport, address, proto, pace, sleep,
                         confirm_polls, on_exception, on_frame) -> bool:
-    """General-poll (paced) until the believed 0x52 confirmation, honoring
-    implied-ACK semantics: every non-zero exception read here is ACKed with
-    an address-0 poll (a poll to a different address) so the machine does
-    not re-send it to the main poll loop afterwards."""
-    for _ in range(confirm_polls):
-        sleep(pace)
-        resp = transport.transact(proto.build_general_poll(address))
-        if not resp:
-            continue
-        if len(resp) > 1:
-            # pending long-poll result delivered instead of an exception
-            # (guide §3 p.8) — hand it up rather than losing it
-            if on_frame is not None:
-                on_frame(resp)
-            continue
-        code = resp[0]
-        if code == 0x00:
-            continue
-        # ACK the exception before anything else (implied-ACK rule)
-        transport.transact(proto.build_general_poll(0))
-        if code in CONFIRM_EXCEPTIONS:
-            return True
-        if on_exception is not None:
-            on_exception(code)
-    return False
+    """General-poll (paced) until the believed 0x52 confirmation. The loop
+    itself is core/sas_wait.await_exception, shared with the ticket and
+    AFT waits."""
+    return await_exception(transport, address, proto, CONFIRM_EXCEPTIONS,
+                           pace, sleep, confirm_polls, on_exception, on_frame)

@@ -42,6 +42,7 @@ __all__ = [
     "parse_single_meter", "parse_meters_10_15", "parse_meters_11_15",
     "parse_games_since", "parse_bill_meters", "parse_last_bill",
     "parse_date_time", "parse_enabled_features", "parse_total_games",
+    "SAS_FAST_POLL",
     "parse_game_meters", "parse_selected_meters_6f", "parse_selected_meters_2f",
     "parse_rom_signature", "parse_validation_meters",
     "parse_cashout_ticket_info", "parse_enhanced_validation_info",
@@ -57,6 +58,10 @@ __all__ = [
 # firmware. Defined here so the multi-poll sweeps below can pace themselves;
 # sas_poller re-exports it as its loop interval.
 SAS_POLL_FLOOR = 0.200
+# §2.3.3 / Table 7.14e: the rate a machine may say it supports in long poll
+# A0 (Features3 bit 0). Machines with secure enhanced or system validation
+# "must also support a 40 ms polling rate" (§15).
+SAS_FAST_POLL = 0.040
 
 
 # --------------------------------------------------------------------------
@@ -425,6 +430,19 @@ class EnabledFeatures:
     component_authentication: bool
     aft: bool
     multi_denom_extensions: bool
+    # Features3 (Table 7.14e) bit 0: "Maximum polling rate ... 1 = 40
+    # milliseconds". Older machines that support 40 ms "are not guaranteed
+    # to set this bit"; see supports_fast_polling.
+    polling_40ms: bool = False
+
+    @property
+    def supports_fast_polling(self) -> bool:
+        """May this machine be polled every 40 ms instead of every 200?
+        Yes when it says so, and yes when it validates tickets the secure
+        enhanced or system way: §15 says such machines "must also support
+        a 40 ms polling rate"."""
+        return self.polling_40ms or self.validation_style in ("system",
+                                                               "enhanced")
 
 
 _VALIDATION_STYLES = ("standard", "system", "enhanced", "reserved")
@@ -432,7 +450,8 @@ _VALIDATION_STYLES = ("standard", "system", "enhanced", "reserved")
 
 def parse_enabled_features(data: bytes) -> EnabledFeatures:
     """§4.4.28 (0xA0): game# (2-byte BCD, 0000 = whole machine), feature
-    codes (2 bytes, Table 4.5.36), 4 reserved bytes."""
+    codes (2 bytes, Table 4.5.36), 4 reserved bytes. SAS 6.02 Table 7.14b
+    makes the first of those four Features3."""
     _require_len(data, 8, "A0 enabled features")
     lsb, msb = data[2], data[3]      # see TODO(bench) on EnabledFeatures
     return EnabledFeatures(
@@ -449,6 +468,7 @@ def parse_enabled_features(data: bytes) -> EnabledFeatures:
         component_authentication=bool(msb & 0x10),
         aft=bool(msb & 0x40),
         multi_denom_extensions=bool(msb & 0x80),
+        polling_40ms=bool(data[4] & 0x01),
     )
 
 

@@ -48,8 +48,9 @@ from .sas_exceptions import (           # noqa: F401 (re-exports)
 # Idle general-poll responses (spec §12.6): $00 = no activity, $1F = no
 # activity and waiting for player. Both mean "FIFO empty" — neither is an
 # event, so neither dispatches nor triggers a FIFO drain (a BB2 in attract
-# streams $1F at full poll rate; live-proven 2026-07-08).
-IDLE_EXCEPTIONS = frozenset({0x00, 0x1F})
+# streams $1F at full poll rate; live-proven 2026-07-08). Defined in
+# sas_wait, with the chirp test, so the wait loops use the same two.
+from .sas_wait import IDLE_EXCEPTIONS, is_chirp   # noqa: F401 (re-export)
 # Exception 0x51 "handpay pending" is a PRIORITY/interactive exception (SAS
 # 6.01 §2.2.1 + §7.8.1): the machine re-issues it every 15 s until the host
 # reads its paired long poll — LP 0x1B "Send Handpay Information" — to service
@@ -113,10 +114,11 @@ class MachineState:
     polls: int = 0
     answers: int = 0
     last_exception: Optional[int] = None
-    # Busy/NACK chirps: the machine answering a general poll with its own
-    # address ORed with 0x80 (spec Table 7.4b ACK/NACK byte). Counted, never
-    # dispatched as an exception — see the guard in _general_poll.
+    # Repeats of the exception byte equal to our address ORed with 0x80,
+    # on general polls in a row: the first is reported, the rest are only
+    # counted here — see _repeat_of_own_address_code.
     nacks: int = 0
+    own_code_run: int = 0
     # Loop-break chirps (SAS 6.02 §4.2): a machine that has heard NO address
     # byte for five seconds transmits its own address, unprompted, every
     # 200 ms. It is not an answer — it means our polls are not reaching the
@@ -226,6 +228,16 @@ class SASPoller:
             self._last_meter_sweep = now
         return code
 
+    def sync_now(self) -> None:
+        """Send the sync poll at once (§3.3), for a caller that knows this
+        host has been silent: after five seconds with no address byte a
+        machine ignores polls to itself until it sees another address
+        polled. poll_once does this by itself for a machine that is
+        offline; this is for the caller about to send long polls BEFORE
+        the next poll_once (coming back from a park)."""
+        self._ack_poll()
+        self.state.synced = True
+
     def _ack_poll(self) -> None:
         """Poll address 0 (single byte 0x80). No machine has address 0, so
         nothing answers — but it both resets a desynced machine's poll-state
@@ -268,43 +280,56 @@ class SASPoller:
             self._handle_long_poll_result(resp)
             return 0x00                  # no exception came off the FIFO
         code = resp[0]
-        if code == (0x80 | self.address) and code not in EXCEPTIONS:
-            # Busy/NACK chirp, NOT an exception: a machine answers with its
-            # address ORed with 0x80 (spec Table 7.4b) when it can't service
-            # the poll right now. Live-seen 2026-07-10 on the WMS BB2 (addr 1
-            # -> 0x81): a ~1 s run of these at poll cadence, then a 2 s
-            # silence, then normal — an internal-busy blip that our dispatch
-            # spammed onto the floor UI as 21 phantom "exception 0x81" events.
-            # AMBIGUITY, disambiguated (portability, 2026-07-21): 0x80|addr
-            # collides with a REAL documented exception at two addresses on a
-            # larger multidrop floor — 0x86 "game out of service" (addr 6) and
-            # 0x8C "game selected" (addr 12) are both in EXCEPTIONS. We fold
-            # the byte as a busy chirp ONLY when it is NOT a documented
-            # exception code, so a spec-compliant machine at addr 6/12 has its
-            # GAME event DISPATCHED instead of silently swallowed. AJ's addr-1
-            # BB2 is unaffected: its chirp 0x81 is the full-spec A-1 "hopper
-            # level low" code, absent from the guide table, so it still folds
-            # (a hopperless collector cabinet — the NACK reading is correct).
-            # We count every occurrence (state.nacks, edge-logged) so nothing
-            # goes silent.
-            self.state.nacks += 1
-            if self.state.nacks == 1 or self.state.last_exception != code:
-                logging.getLogger("sas.poller").info(
-                    "addr %d busy/NACK chirp 0x%02X (Table 7.4b; run start, "
-                    "%d total) — not dispatched as an exception",
-                    self.address, code, self.state.nacks)
-            self.state.last_exception = code
-            return 0x00                  # treat like idle: no FIFO drain
+        if self._repeat_of_own_address_code(code):
+            return 0x00                  # counted, not reported again
         self.state.last_exception = code
         if code not in IDLE_EXCEPTIONS:
             self._dispatch_and_service(code)
         return code
 
+    def _repeat_of_own_address_code(self, code: int) -> bool:
+        """True when `code` is our address ORed with 0x80 arriving on a
+        second or later general poll in a row.
+
+        That byte is an exception code like any other. Appendix A has 80
+        to 8C, 8E and 8F: 81 is "hopper level low", 82 "display meters or
+        attendant menu has been entered". Until 2026-11-17 this poller took
+        it for the NACK of Table 7.4b, which is a machine's answer to a
+        type S LONG poll and never to a general poll, and dropped it: at
+        address 2 every trip into the attendant menu went unreported
+        (SAS 6.02 audit, item 9).
+
+        What is kept from that reading is one observation. On 2026-07-10 a
+        WMS Bluebird 2 at address 1 answered 0x81 on some twenty polls in
+        a row, each one acknowledged, then went quiet for two seconds, and
+        the floor page filled with twenty-one "exception 0x81" lines. A
+        queued exception does not come twenty times, so whatever that was
+        (it has not been seen since), the first of such a run is reported
+        and the rest are counted in state.nacks."""
+        st = self.state
+        if code != (0x80 | self.address):
+            st.own_code_run = 0
+            return False
+        st.own_code_run += 1
+        if st.own_code_run == 1:
+            return False
+        st.nacks += 1
+        if st.own_code_run == 2:
+            logging.getLogger("sas.poller").info(
+                "addr %d sent exception 0x%02X again on the very next poll "
+                "(%d repeats so far) — reported once, repeats only counted",
+                self.address, code, st.nacks)
+        st.last_exception = code
+        return True
+
     def _drain_fifo(self, max_drains: int = 20) -> None:
         """Drain the exception FIFO. Each iteration ACKs the previous exception
         (address-0 poll) THEN general-polls for the next one — without the ACK
         a conforming machine re-sends the same exception forever (implied
-        NACK). Stops on no-activity or the spec's min-20 FIFO bound."""
+        NACK). Stops on no-activity or after max_drains exceptions. (Twenty
+        is the SMALLEST queue the document allows a machine, not the largest,
+        and priority exceptions come on top; whatever is left is taken on
+        the next cycle.)"""
         for _ in range(max_drains):
             self._ack_poll()                 # ACK the exception just dispatched
             resp = self.transport.transact(
@@ -323,10 +348,17 @@ class SASPoller:
                 self._handle_long_poll_result(resp)
                 return
             code = resp[0]
+            if self._repeat_of_own_address_code(code):
+                continue
             self.state.last_exception = code
             if code in IDLE_EXCEPTIONS:
                 return
             self._dispatch_and_service(code)
+        # Out of passes with an exception just taken: acknowledge it now.
+        # Left for the next cycle's general poll, that poll would be a
+        # repeat with no ACK between and the machine would send the same
+        # exception again (audit item 28).
+        self._ack_poll()
 
     def _handle_long_poll_result(self, resp: bytes) -> None:
         """Route a multi-byte (CRC-bearing) frame that answered a GENERAL
@@ -515,10 +547,9 @@ class SASPoller:
         documented exception code (it cannot be told apart at addresses
         0x11 and up, so there it stays an exception, as before). Two or more
         bytes that are ALL our address are always a chirp: no exception is
-        longer than one byte and no long-poll result looks like that."""
-        if not resp or any(b != self.address for b in resp):
-            return False
-        return len(resp) > 1 or self.address not in EXCEPTIONS
+        longer than one byte and no long-poll result looks like that. The
+        test itself is sas_wait.is_chirp, shared with the wait loops."""
+        return is_chirp(resp, self.address)
 
     def _register_chirp(self) -> None:
         st = self.state

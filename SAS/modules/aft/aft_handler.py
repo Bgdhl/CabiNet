@@ -76,6 +76,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from core.sas_protocol import SASProtocol, sas_crc
 from core.sas_meters import SAS_POLL_FLOOR, bcd_to_int, int_to_bcd
+from core.sas_wait import await_exception
 from modules.aft.open_transfer import OpenTransferJournal
 # The registration-INDEPENDENT asset source (CONTRACT assetSource): a 0x7B
 # extended-validation-status READ (all-zero control -> never reconfigures)
@@ -1136,26 +1137,11 @@ def _settle(status_data: Optional[AFTTransferStatusData],
 
 def _await_aft_complete(transport, address, proto, pace, sleep,
                         confirm_polls, on_exception, on_frame) -> bool:
-    """General-poll (paced, implied-ACK aware — the handpay loop) until the
-    believed 0x69 'AFT transfer complete' exception."""
-    for _ in range(confirm_polls):
-        sleep(pace)
-        resp = transport.transact(proto.build_general_poll(address))
-        if not resp:
-            continue
-        if len(resp) > 1:
-            if on_frame is not None:
-                on_frame(resp)
-            continue
-        code = resp[0]
-        if code == 0x00:
-            continue
-        transport.transact(proto.build_general_poll(0))   # implied ACK
-        if code == AFT_TRANSFER_COMPLETE_EXCEPTION:
-            return True
-        if on_exception is not None:
-            on_exception(code)
-    return False
+    """General-poll (paced) until the 0x69 'AFT transfer complete'
+    exception. The loop itself is core/sas_wait.await_exception."""
+    return await_exception(transport, address, proto,
+                           (AFT_TRANSFER_COMPLETE_EXCEPTION,), pace, sleep,
+                           confirm_polls, on_exception, on_frame)
 
 
 # --------------------------------------------------------------------------

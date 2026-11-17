@@ -162,12 +162,21 @@ class _HubHandler(http.server.BaseHTTPRequestHandler):
             srv.reports.append(json.loads(body))
         except ValueError:
             pass
-        # Two batches (8 then the rest) served TWICE each — the batch
-        # split just exercises multi-reply delivery + the dedupe-under-
-        # re-send contract; it is unrelated to MAX_PENDING (now 32).
-        batch = (COMMANDS[:8] if srv.replies < 2
-                 else COMMANDS[8:] if srv.replies < 4 else [])
-        srv.replies += 1
+        # Nothing is handed out until the satellite has reported its
+        # bringup census. The census tests look at that first report, and
+        # which came first used to be decided by a race the satellite's
+        # first poll cycle happened to win: it now spaces its polls
+        # (SAS 6.02 §2.3.3), which was enough to lose it.
+        if not any(isinstance(r.get("machineInfo"), dict)
+                   for r in srv.reports):
+            batch = []
+        else:
+            # Two batches (8 then the rest) served TWICE each — the batch
+            # split just exercises multi-reply delivery + the dedupe-under-
+            # re-send contract; it is unrelated to MAX_PENDING (now 32).
+            batch = (COMMANDS[:8] if srv.replies < 2
+                     else COMMANDS[8:] if srv.replies < 4 else [])
+            srv.replies += 1
         payload = json.dumps({"ok": True, "commands": batch}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
