@@ -1859,6 +1859,10 @@ class EgmAssociation:
         # asked for again because the machine said its configuration
         # changed (one such re-read per device per GP_REREAD_DEBOUNCE_SEC).
         self.gp_reread_at = {}
+        # when a sweep of this machine's game devices last started (the
+        # Games page's Refresh, or the hub's own on finding the game under
+        # one of them replaced: _game_replaced_resweep)
+        self.gp_resweep_at = 0.0
         # gamePlay read state (G2S-21): per-deviceId dict keyed by the string
         # deviceId (a multi-game cabinet exposes several gamePlay devices, one
         # per theme+paytable, §6.1). Each holds themeId/paytableId/enabled/
@@ -13968,6 +13972,8 @@ class G2SHost:
         ids_before = self.game_play_device_ids(assoc)
         if not online:
             return {"ok": False, "error": "machine offline", "devices": 0}
+        with assoc.lock:
+            assoc.gp_resweep_at = time.time()
         self.enqueue_get_descriptor(assoc, epoch=epoch)
 
         def pass_once():
@@ -14920,6 +14926,7 @@ class G2SHost:
                    gp.get("themeId"), gp.get("paytableId"))
             gp.update(data)
             stale = self._game_profile_outdated(gp)
+            replaced = self._game_replaced(was[2], data["themeId"])
             assoc.game_play_as_of = now_iso()
             now_t = (data["egmEnabled"], data["hostEnabled"],
                      data["themeId"], data["paytableId"])
@@ -14934,7 +14941,46 @@ class G2SHost:
             self._schedule_game_play_persist(assoc)
         if stale:
             self._reread_game_profile(assoc, dev, stale)
+        if replaced:
+            self._game_replaced_resweep(assoc, dev, replaced)
         return moved
+
+    #: One sweep of a machine's game devices in this many seconds on
+    #: finding the game under one of them replaced.
+    GP_REPLACED_SWEEP_DEBOUNCE_SEC = 600
+
+    @staticmethod
+    def _game_replaced(theme_was, theme_now):
+        """(old theme, new theme) when a device that had a theme reports
+        another one, else None."""
+        if theme_was and theme_now and theme_was != theme_now:
+            return (theme_was, theme_now)
+        return None
+
+    def _game_replaced_resweep(self, assoc, dev, replaced):
+        """The game under a known device id is not the one the hub had
+        there, so what it holds for the machine's OTHER devices is in
+        doubt too: read them all again, once (the Games page's Refresh).
+
+        A WMS Bluebird 2 holds one game, and its game devices are that
+        game's paytables. The one it is set to sends events, and each
+        carries its status, so the hub learned of a new game there on the
+        first spin. The paytables the machine is not set to send nothing,
+        and nothing read them: four months after the game was changed the
+        Games page still listed eleven of the old game's paytables beside
+        the new game's one (seen 2026-11-17: Wizard of Oz II entries last
+        read on 07-10, on a machine running Dr. Jackpot)."""
+        now = time.time()
+        with assoc.lock:
+            last = getattr(assoc, "gp_resweep_at", 0.0)
+            if now - last < self.GP_REPLACED_SWEEP_DEBOUNCE_SEC:
+                return False
+        log.info("🎰 [%s] gamePlay dev=%s now reports %s where the hub "
+                 "held %s — the game was replaced; reading every game "
+                 "device on the machine again", assoc.egm_id, dev,
+                 replaced[1], replaced[0])
+        self.refresh_game_play_status(assoc)
+        return True
 
     #: One re-read of a game device's profile and denominations per device
     #: in this many seconds, however many times the machine says it changed.
@@ -21072,6 +21118,8 @@ class G2SHost:
             verdict = want = None
             with assoc.lock:
                 gp = assoc.game_play.setdefault(dev, {})
+                replaced = self._game_replaced(gp.get("themeId"),
+                                               data["themeId"])
                 gp.update(data)
                 stale = self._game_profile_outdated(gp)
                 assoc.game_play_as_of = now_iso()  # GR-28: live-parse stamp
@@ -21104,6 +21152,8 @@ class G2SHost:
             self._schedule_game_play_persist(assoc)  # GR-28 (debounced)
             if stale:
                 self._reread_game_profile(assoc, dev, stale)
+            if replaced:
+                self._game_replaced_resweep(assoc, dev, replaced)
 
         elif cmd == "gamePlayProfile" and stype == "G2S_response":
             # Response to getGamePlayProfile (spec §6.13, Tables 6.6-6.11).

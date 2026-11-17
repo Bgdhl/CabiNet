@@ -30,15 +30,21 @@ Fourth batch from the G2S audit: meters and game play. Eight items.
   read a game's profile once and kept it for good. After a change at the
   machine the Games page showed the new paytable with the old payback
   and maximum bet.
+- **When a machine's game is replaced, all of its entries are read
+  again.** On a single-game machine the entries on the Games page are
+  that game's paytables. Only the one the machine is set to reports
+  anything, so the others kept the old game's name: a Bluebird running
+  Dr. Jackpot still listed eleven Wizard of Oz II paytables four months
+  after the change.
 - **Yes/no values written 1 and 0 are understood**, as well as true and
   false, everywhere the hub reads one. A machine that writes them that
   way could be left in a configuration mode, have every denomination
   shown as off, and be sent the same handpay settings at every join.
-- A machine can mark a game as one it will not run without. Disabling
-  such a game takes the whole machine out of play (still powered, shown
-  as disabled). The Games page now says so on that game's Disable
-  button. For every other game Disable only makes the title unavailable,
-  as before.
+- A machine can mark one entry on its Games page (a game, or one
+  paytable of its game) as one it will not run without. Disabling that
+  entry takes the whole machine out of play (still powered, shown as
+  disabled). The Games page now says so on that entry's Disable button.
+  For every other entry Disable only makes it unavailable, as before.
 - A machine whose currency does not have two decimal places (yen, for
   one) gets a note on its tile saying its amounts are off and by how
   much; the hub does not rescale them, and does not put that currency's

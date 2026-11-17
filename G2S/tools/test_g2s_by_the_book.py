@@ -2431,6 +2431,110 @@ def item_20_a_game_whose_configuration_changed():
           names(sent_since(host, mark)))
 
 
+def paytable_options(dev):
+    """One game device as the machine's option list names it."""
+    return ('<g2s:deviceOptions g2s:deviceClass="G2S_gamePlay" '
+            f'g2s:deviceId="{dev}"><g2s:optionGroup '
+            'g2s:optionGroupId="G2S_gamePlayOptions"><g2s:optionItem '
+            'g2s:optionId="G2S_protocolOptions"><g2s:optionCurrentValues>'
+            '<g2s:complexValue g2s:paramId="G2S_protocolParams">'
+            '<g2s:booleanValue g2s:paramId="G2S_requiredForPlay">false'
+            "</g2s:booleanValue></g2s:complexValue>"
+            "</g2s:optionCurrentValues></g2s:optionItem></g2s:optionGroup>"
+            "</g2s:deviceOptions>")
+
+
+def item_20_a_machine_whose_game_was_replaced():
+    print("— audit item 20, as it stood on the floor: one game on the "
+          "machine, its game devices that game's paytables, and the game "
+          "replaced")
+    host = make_host()
+    egm = online(joined(host, "BTB_replaced"))
+    a = egm.assoc
+    egm.send("optionConfig", "<g2s:optionList>" + "".join(
+        paytable_options(d) for d in "123") + "</g2s:optionList>")
+    for dev, pay in (("1", "OLD-88"), ("2", "OLD-92"), ("3", "OLD-96")):
+        host.enqueue_get_game_play_status(a, dev)
+        drain(host, a)
+        answer_to(egm, "gamePlay", "getGamePlayStatus",
+                  game_status(theme="OLD", paytable=pay), device=dev)
+    a.gp_resweep_at = 0.0
+    kept = gh.GP_RESCAN_DESC_WAIT_SEC
+    gh.GP_RESCAN_DESC_WAIT_SEC = 0.3
+    try:
+        # the paytable the machine is set to is played: its status comes
+        # with the event, naming the new game
+        egm.event_id = getattr(egm, "event_id", 5000) + 1
+        mark = len(host.sent)
+        egm.send(
+            "eventHandler",
+            '<g2s:eventReport g2s:deviceClass="G2S_gamePlay" '
+            f'g2s:deviceId="3" g2s:eventCode="G2S_GPE113" '
+            f'g2s:eventId="{egm.event_id}" '
+            f'g2s:eventDateTime="{egm.stamp()}" g2s:transactionId="0">'
+            '<g2s:deviceList><g2s:statusInfo g2s:deviceClass="G2S_gamePlay" '
+            'g2s:deviceId="3">' + game_status(theme="NEW", paytable="NEW-96")
+            + "</g2s:statusInfo></g2s:deviceList></g2s:eventReport>")
+        time.sleep(0.9)
+        drain(host, a)
+        asked = [name for name in names(sent_since(host, mark))
+                 if name in ("getDescriptor", "getGamePlayStatus")]
+        check("the other paytables are read again too: they send no "
+              "events of their own, and went on showing the old game "
+              "(eleven of them for four months on a Bluebird)",
+              asked.count("getDescriptor") == 1
+              and asked.count("getGamePlayStatus") == 3, asked)
+        # the answers name the new game as well; no second sweep follows
+        mark = len(host.sent)
+        for dev, pay in (("1", "NEW-88"), ("2", "NEW-92")):
+            host.enqueue_get_game_play_status(a, dev)
+            drain(host, a)
+            answer_to(egm, "gamePlay", "getGamePlayStatus",
+                      game_status(theme="NEW", paytable=pay), device=dev)
+        time.sleep(0.5)
+        drain(host, a)
+        check("and their own answers, naming the new game, do not start "
+              "it over", "getDescriptor" not in names(sent_since(host, mark))
+              and [a.game_play[d]["themeId"] for d in "123"]
+              == ["NEW"] * 3, names(sent_since(host, mark)))
+        a.gp_resweep_at = 0.0
+        mark = len(host.sent)
+        host.enqueue_get_game_play_status(a, "1")
+        drain(host, a)
+        answer_to(egm, "gamePlay", "getGamePlayStatus",
+                  game_status(theme="NEW", paytable="NEW-90"), device="1")
+        time.sleep(0.5)
+        drain(host, a)
+        check("a paytable changed under the same game is not a replaced "
+              "game", "getDescriptor" not in names(sent_since(host, mark)),
+              names(sent_since(host, mark)))
+        mark = len(host.sent)
+        host.enqueue_get_game_play_status(a, "2")
+        drain(host, a)
+        answer_to(egm, "gamePlay", "getGamePlayStatus",
+                  game_status(theme="THIRD", paytable="T-92"), device="2")
+        time.sleep(0.9)
+        drain(host, a)
+        got = names(sent_since(host, mark))
+        check("a replaced game found in the answer to a read, not in an "
+              "event, starts the same sweep",
+              got.count("getDescriptor") == 1
+              and got.count("getGamePlayStatus") == 4, got)
+        a.gp_resweep_at = 0.0
+        mark = len(host.sent)
+        host.enqueue_get_game_play_status(a, "9")
+        drain(host, a)
+        answer_to(egm, "gamePlay", "getGamePlayStatus",
+                  game_status(theme="THIRD", paytable="T-99"), device="9")
+        time.sleep(0.5)
+        drain(host, a)
+        check("a device heard from for the first time is not a replaced "
+              "game", "getDescriptor" not in names(sent_since(host, mark)),
+              names(sent_since(host, mark)))
+    finally:
+        gh.GP_RESCAN_DESC_WAIT_SEC = kept
+
+
 def item_52_a_game_the_machine_needs():
     print("— audit item 52: requiredForPlay (Table 6.6: \"the EGM MUST be "
           "disabled if either egmEnabled or hostEnabled is set to false\")")
@@ -2676,6 +2780,7 @@ def main():
     item_19_a_breakdown_is_not_the_device_total()
     item_7_a_range_of_denominations()
     item_20_a_game_whose_configuration_changed()
+    item_20_a_machine_whose_game_was_replaced()
     item_52_a_game_the_machine_needs()
     item_27_booleans_written_as_1_and_0()
     item_16_a_currency_without_two_decimal_places()
