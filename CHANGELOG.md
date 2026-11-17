@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.3.10
+Third batch from the SAS audit, first part: a ticket redemption is
+followed to its end.
+- **A slow ticket no longer stays "pending" for good.** After a machine
+  accepts a ticket it stacks it or hands it back, and says so. The SAS box
+  waited about two seconds for that and then gave up, so a slower stacker
+  left the ticket "redeem pending" on the hub with the player already
+  credited, and a ticket handed back could then only be used at that one
+  machine. Now the SAS box keeps asking: at once when the machine says
+  the ticket is done, otherwise after 2, 5 and then every 15 seconds, and
+  before it reads the next ticket. The machine's answer names the ticket,
+  so this also closes one left open by a restart.
+- **An answer that says nothing about the ticket is no longer read as a
+  refusal.** "Not compatible with the current redemption" and "no
+  validation information" used to put the ticket back to "issued" while
+  the machine might still be stacking it. Only a real refusal does that
+  now.
+- **Damaged answers during a redemption are asked for again**, and a
+  machine that says it is still waiting for our approval is sent it once
+  more.
+- **Tickets from a machine in standard validation that answers the newer
+  read with zeros are captured.** The document allows that answer; such a
+  machine never got the older read that holds its ticket number.
+- The SAS log no longer says "ticket issued" for a read that found
+  nothing.
+- **System validation: a lost answer no longer ends the cash-out.** The
+  machine asks for a validation number, gives the host ten seconds, and
+  stops asking once the host has started. A garbled answer to either of
+  the host's two polls used to end it there with no ticket. Both are now
+  asked for again.
+- **System validation: the machine's reply to the number is read.** It
+  can say "not in a cash-out" or "improper validation rejected"; both
+  used to be reported as an approval. A refusal now gets one more try and
+  is then reported as refused.
+
 ## v0.3.9
 Second batch from the SAS audit: an AFT transfer always ends in a known
 result.

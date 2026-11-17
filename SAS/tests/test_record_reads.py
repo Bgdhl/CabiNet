@@ -297,9 +297,27 @@ class TestTicketRecordSurvivesADamagedAnswer:
 
     def test_an_empty_buffer_is_still_no_data(self, tmp_path):
         port = _line(ByTheBookMachine())
-        assert _capture(port, _store(tmp_path)).outcome \
-            is TicketCaptureOutcome.NO_DATA
-        assert READ_3D not in _sent(port)
+        result = _capture(port, _store(tmp_path))
+        assert result.outcome is TicketCaptureOutcome.NO_DATA
+        # the 0x3D read is tried too now: a standard-validation machine may
+        # answer 0x4D with zeros (see the next test)
+        assert _sent(port)[-1] == READ_3D
+        assert "nothing to capture" in result.detail
+
+    def test_standard_validation_that_answers_4d_with_zeros(self, tmp_path):
+        """§15.10: such a machine "must either not respond to long poll 4D
+        or return all zeros in the Validation Number field". The second
+        kind never got the 0x3D read, so its tickets were never captured
+        (audit item 20)."""
+        machine = ByTheBookMachine(answers_4d_with_zeros=True)
+        machine.print_ticket("00123456", 777)
+        port = _line(machine)
+        port.transact(GENERAL)
+        store = _store(tmp_path)
+        result = _capture(port, store)
+        assert (result.outcome, result.via) == (TicketCaptureOutcome.RECORDED,
+                                                "3D")
+        assert store.get("0000000000123456")["amountCents"] == 777
 
     def test_standard_validation_still_falls_back_to_the_3d_read(self,
                                                                  tmp_path):
