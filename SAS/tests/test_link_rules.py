@@ -424,12 +424,16 @@ class TestPollingRate:
         assert clock.slept == [pytest.approx(0.2)]
 
     def test_polls_to_address_zero_are_not_held_and_do_not_count(self):
+        """The rate is per machine. A poll to address 0 neither waits for
+        it nor restarts it."""
         clock, machine, port = _paced()
         port.transact(GENERAL)
+        clock.pass_(0.15)
         port.send_frame(ACK_POLL)
         assert clock.slept == []
-        port.transact(GENERAL)
-        assert clock.slept == [pytest.approx(0.2)]
+        port.transact(GENERAL)                   # 0.05 s is all that is left
+        assert clock.slept == [pytest.approx(0.05)]
+        assert machine.too_soon == []
 
     def test_with_no_rate_set_nothing_ever_waits(self):
         clock = FakeClock()
