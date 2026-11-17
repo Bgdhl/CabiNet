@@ -125,7 +125,7 @@ if "tournament_names" not in _hub_store_mod.HOST_SETTING_KEYS:
 # the MINOR bump per the repo's version rule). Surfaced in engine_meta() ->
 # /api/status ["_engine"]["version"]; bump this and add a CHANGELOG.md
 # section on every commit with a user-visible change.
-CABINET_VERSION = "0.3.19"
+CABINET_VERSION = "0.3.20"
 
 WSDL_NS = "http://www.gamingstandards.com/wsdl/g2s/v1.0"
 SCHEMA_NS = "http://www.gamingstandards.com/g2s/schemas/v1.0.3"
@@ -580,6 +580,24 @@ FLEET_ACTIONS = (
 # your class here when you add its first handler, and the replay gate pins
 # both sides (unknown cabinet command -> APX008; licensing stays APX007 —
 # the wire-proven stable getSecurityData loop. NEVER add licensing here).
+# Device classes whose OWNER has duties this hub does not carry out. "By
+# default, an EGM will direct all EGM-originated requests related to a
+# device to the owner of the device" (§1.9.1): a progressive hit waits for
+# the owner's setProgressiveWin and otherwise ends in a zero-amount handpay
+# (§17.18), and the owner's silence disables the device and its games
+# (§17.6); a central device waits on the owner for every outcome. The hub
+# answers those classes "class not supported", so it does not ask to own
+# them (start_ownership_cycle).
+UNSERVED_OWNER_CLASSES = frozenset((
+    "G2S_progressive", "G2S_player", "G2S_central",
+))
+
+# What a machine holds for a host besides its device lists (Table 8.7), and
+# hands back in setHostItem (Table 8.14): sent back as the machine reported
+# it, so that changing who owns what does not also reset these to defaults.
+HOST_ITEM_CARRIED = ("useDefaultConfig", "requiredForPlay", "timeToLive",
+                     "noResponseTimer", "allowMulticast", "displayCommFault")
+
 SPOKEN_CLASSES = frozenset((
     "communications", "cabinet", "commConfig", "eventHandler", "gamePlay",
     "meters", "noteAcceptor", "optionConfig", "voucher", "handpay", "wat",
@@ -1364,6 +1382,17 @@ WAT_REPROBE_DELAY_SEC = 8
 # same night: a cabinet with no live config mode (every WMS Bluebird) then goes
 # silent forever with host commands parked on it. See start_denom_ceremony.
 CEREMONY_MODE_TTL_MS = 300000
+# A configuration mode (§8.7 commConfig, §9.7 optionConfig) keeps the machine
+# out of play for as long as it is on: "the EGM MUST NOT allow game play".
+# The hub therefore never leaves one on that nothing is driving.
+MODE_EXIT_RESEND_SEC = 20         # an exit that has not taken is sent again
+#                                   this often, while the machine still says
+#                                   the mode is on
+CEREMONY_WRITE_DEADLINE_SEC = 60  # a denomination change that has had no
+#                                   verdict on its write for this long is
+#                                   closed: the exit is sent
+CEREMONY_EXIT_TRIES = 15          # exits sent before the hub says, loudly,
+#                                   that it cannot get the machine out
 
 # enableRemoteHandpay (G2S-25/27): the handpay params a remote reset-to-
 # credits needs flipped, per §11.26.4/Table 11.46 and the live 2026-07-02
@@ -1791,6 +1820,30 @@ class EgmAssociation:
         self.post_took = 0.0          # seconds the last POST took
         # parts of a response sent in several commands (sessionMore, §1.18.3.2)
         self.partial = {}
+        # Config modes entered by hand through the API ("optionConfig",
+        # "commConfig"): the person who entered one owns its exit, so the
+        # hub leaves it alone. Any other mode found on with no ceremony or
+        # cycle driving it is exited (_exit_config_mode).
+        self.mode_manual = set()
+        self.mode_exit_sent = {}        # class -> when an exit last went out
+        self.mode_read_epoch = -1       # the join that read both modes
+        # canModRemote per parameter, "deviceClass/deviceId/paramId" -> bool,
+        # as the machine stated it in answer to a getOptionList that asked
+        # for the definitions (optionDetail=true). §9.15: "If set to false,
+        # the host MUST NOT change the value of the parameter"; an absent
+        # attribute is false (Tables 9.15-9.21). A parameter that is not in
+        # here has not been asked about: nothing is known, and it is treated
+        # as it always was.
+        self.config_can_mod = {}
+        # The devices ("deviceClass/deviceId") whose read WITH the
+        # definitions has been answered, or refused, since the join last
+        # asked for it. Each of the two re-asserts a join makes waits for
+        # its own device to be in here before it sends anything: the
+        # handpay one used to run when the ticket read's answer landed,
+        # before the handpay definitions had been read, and asked a WMS
+        # Bluebird 2 for parameters it keeps to itself (G2S_OCX015 at
+        # every join, v0.3.20 on the floor, 2026-11-17).
+        self.option_detail_settled = set()
         self.vouchers = []
         self.voucher_count = 0
         # voucher redemption tier-2 (G2S-26): redemptions is a bounded ring
@@ -2182,8 +2235,12 @@ class EgmAssociation:
         # ops) surfaces as result=timeout. Only intermediate/awaiting states
         # time out — never a terminal applied/cancelled/aborted/error. The COPY
         # is stamped; a late optionChangeStatus still advances the live record.
-        if option_change.get("result") in ("sent", "acked", "pending",
-                                            "authorized") and \
+        # A set the machine has AUTHORIZED is not timed out here: it is
+        # waiting for its apply condition (idle, zero credits, a time
+        # window, an operator: applyCondition G2S_disable or G2S_egmAction),
+        # which can take as long as it takes. Until v0.3.20 it read
+        # "timeout" after 30 s and could be replaced two minutes later.
+        if option_change.get("result") in ("sent", "acked", "pending") and \
                 time.time() - option_change.get("progressTs", 0) > 30:
             option_change["result"] = "timeout"
         # G2S-22: same lazy-timeout treatment for an unanswered
@@ -14027,6 +14084,7 @@ class G2SHost:
             if not c or c.get("stage") != "entering":
                 return
             c["stage"] = "writing"
+            c["writingTs"] = time.time()
             dev, denoms = c["dev"], [int(d) for d in c["denoms"]]
         log.info("[%s] 🎰 DENOM CEREMONY mode open — getGameDenoms then "
                  "setActiveDenoms dev=%s", assoc.egm_id, dev)
@@ -14042,9 +14100,168 @@ class G2SHost:
                 return
             c["stage"] = "exiting"
             c["outcome"] = outcome
+            c["exitTs"] = time.time()
+            c["exitsSent"] = 1
+            assoc.mode_exit_sent["optionConfig"] = time.time()
         log.info("[%s] 🎰 DENOM CEREMONY dev=%s outcome=%s — exiting "
                  "optionConfig mode", assoc.egm_id, dev, outcome)
         self.enqueue_enter_option_config_mode(assoc, enable=False)
+
+    # ------------------------------------------------------------------
+    # The watch on configuration modes (audit items 5 and 8).
+    #
+    # While a config mode is on, "the EGM MUST NOT allow game play" (§8.7,
+    # §9.7). Until v0.3.20 the hub left a machine in one whenever its own
+    # bookkeeping lost the thread: the write of a denomination change drew
+    # no answer (nothing ever sent the exit), the exit was answered with an
+    # error or lost (nothing sent it again), the machine entered the mode
+    # after first answering "not yet" (§9.7 lets it wait for zero credits
+    # and an idle cabinet; nothing looked at the event that says it has
+    # entered), or the hub restarted in the middle. Each left the cabinet
+    # out of play until someone posted the exit by hand.
+    #
+    # Now: a mode found ON that no ceremony or cycle is driving, and that
+    # was not entered by hand through the API, is exited. "Found" is the
+    # mode status (asked for at every join as well as answering our own
+    # requests) and the events G2S_OCE101 / G2S_CCE101. An exit that has
+    # not taken is sent again; a write with no verdict has a deadline.
+    # ------------------------------------------------------------------
+
+    def _exit_config_mode(self, assoc, cls, why):
+        """Send the exit for a config mode, no more often than
+        MODE_EXIT_RESEND_SEC. True when one went out."""
+        now = time.time()
+        with assoc.lock:
+            if now - assoc.mode_exit_sent.get(cls, 0) < MODE_EXIT_RESEND_SEC:
+                return False
+            assoc.mode_exit_sent[cls] = now
+        log.warning("[%s] ⚙️  %s mode is ON and %s — sending the exit so "
+                    "the machine can go back into play", assoc.egm_id, cls,
+                    why)
+        if cls == "optionConfig":
+            self.enqueue_enter_option_config_mode(
+                assoc, enable=False, ttl_ms=CEREMONY_MODE_TTL_MS)
+        else:
+            self.enqueue_enter_comm_config_mode(assoc, enable=False)
+        return True
+
+    def _option_config_mode_seen(self, assoc, enabled, source):
+        """The machine says its option-config mode is on or off (a mode
+        status, or the event G2S_OCE101 / G2S_OCE102)."""
+        if enabled:
+            with assoc.lock:
+                stage = (assoc.denom_ceremony or {}).get("stage")
+                manual = "optionConfig" in assoc.mode_manual
+            if stage == "entering":
+                self._denom_ceremony_mode_open(assoc)
+            elif stage == "writing":
+                pass                        # ours, and in hand
+            elif stage == "exiting":
+                self._exit_config_mode(
+                    assoc, "optionConfig",
+                    "the exit sent for the denomination change has not "
+                    "taken")
+            elif not manual:
+                self._exit_config_mode(
+                    assoc, "optionConfig",
+                    f"nothing on the hub is driving it ({source})")
+            return
+        done = None
+        with assoc.lock:
+            assoc.mode_manual.discard("optionConfig")
+            c = assoc.denom_ceremony
+            if c and c.get("stage") in ("exiting", "stuck"):
+                c["stage"] = "done"
+                c["finishedAt"] = now_iso()
+                done = (c.get("dev"), c.get("outcome"))
+        if done:
+            log.info("[%s] 🎰 DENOM CEREMONY COMPLETE dev=%s "
+                     "outcome=%s — cabinet returned to play",
+                     assoc.egm_id, done[0], done[1])
+
+    def _comm_config_mode_seen(self, assoc, enabled, source):
+        """The commConfig twin: a mode status, or G2S_CCE101 / G2S_CCE102.
+        The ownership cycle itself advances in the commConfigModeStatus
+        branch of dispatch; this only catches a mode nobody is driving."""
+        with assoc.lock:
+            if not enabled:
+                assoc.mode_manual.discard("commConfig")
+                return
+            driven = assoc.commconfig_stage in ("entering", "changing",
+                                                "authorizing")
+            manual = "commConfig" in assoc.mode_manual
+        if not driven and not manual:
+            self._exit_config_mode(
+                assoc, "commConfig",
+                f"no ownership change is in flight ({source})")
+
+    def _config_mode_event(self, assoc, ev):
+        """G2S_OCE101/102 and G2S_CCE101/102: the machine entered or left a
+        config mode. §9.7 and §8.7 let it enter LATER than it answered our
+        request (once credits are zero and the cabinet is idle), and these
+        events are then the only word of it."""
+        code = ev.get("eventCode")
+        if code in ("G2S_OCE101", "G2S_OCE102"):
+            with assoc.lock:
+                assoc.optionconfig_mode = code == "G2S_OCE101"
+                assoc.optionconfig_mode_at = now_iso()
+            self._option_config_mode_seen(assoc, code == "G2S_OCE101", code)
+        elif code in ("G2S_CCE101", "G2S_CCE102"):
+            self._comm_config_mode_seen(assoc, code == "G2S_CCE101", code)
+
+    def sweep_config_modes(self, now=None):
+        """Watchdog pass over the denomination ceremonies. A write that has
+        had no verdict for CEREMONY_WRITE_DEADLINE_SEC is closed (the exit
+        is sent); an exit the machine has not confirmed is sent again every
+        MODE_EXIT_RESEND_SEC with the mode status asked for alongside, and
+        after CEREMONY_EXIT_TRIES the hub says it cannot get the machine
+        out and keeps saying so in /api/status (stage 'stuck')."""
+        now = time.time() if now is None else now
+        for assoc in list(self.associations.values()):
+            act = None
+            with assoc.lock:
+                c = assoc.denom_ceremony
+                if not c or assoc.comms_state != "onLine":
+                    continue
+                stage = c.get("stage")
+                if stage == "writing" and \
+                        now - c.get("writingTs", now) \
+                        > CEREMONY_WRITE_DEADLINE_SEC:
+                    c["stage"] = "exiting"
+                    c["outcome"] = "timeout:no verdict on the write"
+                    c["exitTs"] = now
+                    c["exitsSent"] = 0
+                    assoc.mode_exit_sent.pop("optionConfig", None)
+                    act = "deadline"
+                elif stage == "exiting" and \
+                        now - assoc.mode_exit_sent.get("optionConfig", 0) \
+                        >= MODE_EXIT_RESEND_SEC:
+                    if c.get("exitsSent", 0) >= CEREMONY_EXIT_TRIES:
+                        c["stage"] = "stuck"
+                        act = "stuck"
+                    else:
+                        act = "again"
+                dev = c.get("dev")
+            if act == "stuck":
+                log.critical(
+                    "[%s] 🎰 DENOM CEREMONY dev=%s — the machine has not "
+                    "left option-config mode after %d exits. It stays out "
+                    "of play until it does: exit the mode at the machine, "
+                    "or POST /api/command {\"action\": "
+                    "\"exitOptionConfigMode\"}.", assoc.egm_id, dev,
+                    CEREMONY_EXIT_TRIES)
+            elif act:
+                if self._exit_config_mode(
+                        assoc, "optionConfig",
+                        "the denomination change has had no verdict on its "
+                        "write" if act == "deadline" else
+                        "the exit sent for the denomination change has not "
+                        "taken"):
+                    with assoc.lock:
+                        c = assoc.denom_ceremony
+                        if c:
+                            c["exitsSent"] = c.get("exitsSent", 0) + 1
+                    self.enqueue_get_option_config_mode_status(assoc)
 
     def enqueue_get_game_denoms(self, assoc, device_id="1"):
         """gamePlay.getGameDenoms (spec §6.14) — empty request element; the
@@ -17030,10 +17247,18 @@ class G2SHost:
 
     # ------------------------------------- commConfig ownership cycle — G2S-19
 
-    def enqueue_enter_comm_config_mode(self, assoc, enable=True):
+    def enqueue_enter_comm_config_mode(self, assoc, enable=True,
+                                       manual=False):
         """commConfig.enterCommConfigMode (spec §8.7). Owner-only. When enabled,
         the EGM enters config mode and DISABLES game play (needs idle/0 credits)
-        — deliberate and disruptive. Responds with commConfigModeStatus."""
+        — deliberate and disruptive. Responds with commConfigModeStatus.
+        manual=True (the API): a person is driving the mode and owns its
+        exit (see mode_manual)."""
+        if manual:
+            with assoc.lock:
+                (assoc.mode_manual.add if enable
+                 else assoc.mode_manual.discard)("commConfig")
+
         def build(a):
             sid = a.next_session_id()
             inner, cid = self.build_inner_request(
@@ -17063,27 +17288,59 @@ class G2SHost:
             # build() runs under assoc.lock (the FIFO worker holds it while
             # allocating commandIds) — read host_items directly, never
             # re-acquire the non-reentrant lock here.
-            host_index = (a.host_items.get(self.host_id) or {}).get(
-                "hostIndex") or "1"
-            owned_xml = "".join(
-                f'<g2s:ownedDevice g2s:deviceClass="{dc}" '
-                f'g2s:deviceId="{di}" g2s:deviceActive="true"/>'
-                for dc, di in owned)
-            config_xml = "".join(
-                f'<g2s:configDevice g2s:deviceClass="{dc}" '
-                f'g2s:deviceId="{di}" g2s:deviceActive="true"/>'
-                for dc, di in owned)
-            guest_xml = "".join(
-                f'<g2s:guestDevice g2s:deviceClass="{dc}" '
-                f'g2s:deviceId="{di}" g2s:deviceActive="true"/>'
-                for dc, di in guest)
+            # The setHostItem REPLACES what the machine holds for this
+            # host (§8.15: "the new attributes for the host, the list of
+            # owned devices and the list of guest devices overwrite any
+            # previous settings"), so everything that is not being changed
+            # goes back exactly as the machine reported it in commHostList:
+            # its own hostIndex, the hostLocation it reaches us at, the
+            # host's other attributes, each device's deviceActive, and the
+            # devices we are configurator of only. Until v0.3.20 the
+            # location was the hub's own idea of its address (wrong on an
+            # install where they differ, which would point the machine's
+            # only host at nothing), requiredForPlay was forced false, the
+            # rest fell to defaults, and every device was written active.
+            item = a.host_items.get(self.host_id) or {}
+            host_index = item.get("hostIndex") or "1"
+            location = item.get("hostLocation") or self.host_uri
+            was = item.get("active") or {}
+            claimed = set(owned)
+
+            def active_of(tag, dc, di):
+                # as the machine has it: in this list, else in whichever
+                # list the device is in now (one going from guest to owned
+                # keeps the state it had)
+                for t in (tag, "ownedDevice", "configDevice", "guestDevice"):
+                    state = was.get(f"{t}:{dc}/{di}")
+                    if state:
+                        return state
+                return "true"
+
+            def devs(tag, pairs):
+                return "".join(
+                    f'<g2s:{tag} g2s:deviceClass="{dc}" g2s:deviceId="{di}" '
+                    f'g2s:deviceActive="{active_of(tag, dc, di)}"/>'
+                    for dc, di in pairs)
+            config_only = []
+            for dev in item.get("config") or []:
+                dc, _, di = str(dev).partition("/")
+                if dc and di and (dc, di) not in claimed:
+                    config_only.append((dc, di))
+            owned_xml = devs("ownedDevice", owned)
+            config_xml = devs("configDevice", list(owned) + config_only)
+            guest_xml = devs("guestDevice", guest)
+            carried = dict(item.get("attrs") or {})
+            carried.setdefault("requiredForPlay", "false")
+            carried_xml = "".join(
+                f' g2s:{k}="{html.escape(str(v), quote=True)}"'
+                for k, v in carried.items())
             cmd = (
                 f'<g2s:setCommChange g2s:configurationId="{config_id}" '
                 f'g2s:applyCondition="G2S_immediate" g2s:restartAfter="false">'
                 f'<g2s:setHostItem g2s:hostIndex="{host_index}" '
                 f'g2s:hostId="{self.host_id}" '
-                f'g2s:hostLocation="{self.host_uri}" g2s:hostRegistered="true" '
-                f'g2s:requiredForPlay="false">'
+                f'g2s:hostLocation="{html.escape(location, quote=True)}" '
+                f'g2s:hostRegistered="true"{carried_xml}>'
                 f'{owned_xml}{config_xml}{guest_xml}'
                 f'</g2s:setHostItem>'
                 f'<g2s:authorizeList>'
@@ -17125,7 +17382,8 @@ class G2SHost:
         """Kick off the commConfig ownership cycle (G2S-19). Builds the device
         list to claim as the UNION of the live commHostList truth (host 1's
         owned+guest devices) and the optionConfig.optionList config-sync
-        inventory (assoc.config_devices), else DEFAULT_OWN_CLAIM. The union
+        inventory (assoc.config_devices). Refuses when the machine's host
+        list has not been read. The union
         matters: §8.15 setHostItem OVERWRITES the prior owned list, and the
         commHostList carries devices the config-sync never mentions
         (G2S_communications/1, G2S_meters/1, GTK_storage/1 on the live AVP) —
@@ -17136,27 +17394,45 @@ class G2SHost:
         the stage machine to 'entering' and enqueues enterCommConfigMode; the
         inbound commConfigModeStatus/commChangeStatus handlers advance it
         through setCommChange -> authorizeCommChange -> applied."""
+        # The claim is built ON TOP of what the machine holds for this host
+        # now: its setHostItem replaces that entry whole (§8.15), so without
+        # the machine's own commHostItem for us there is no telling what a
+        # claim would take away, starting with the communications device
+        # this link runs on. Until v0.3.20 a claim went ahead without it,
+        # from a guessed list. Ask for the list first.
+        with assoc.lock:
+            have_item = bool((assoc.host_items.get(self.host_id) or {}).get(
+                "hostIndex"))
+        if not have_item:
+            return {"ok": False, "error": "the machine's host list has not "
+                    "been read yet, so what this hub holds on it now is not "
+                    "known and a claim could take devices away from it. "
+                    "Send getCommHostList, then claim again."}
+        left = []
         if owned is None:
             devs = set()
             with assoc.lock:
                 h = assoc.host_items.get(self.host_id) or {}
-                wire = list(h.get("owned") or []) + list(h.get("guest") or [])
+                mine = list(h.get("owned") or [])
+                wire = mine + list(h.get("guest") or [])
                 cfg = [(d["deviceClass"], d["deviceId"])
                        for d in assoc.config_devices.values()
                        if d.get("deviceClass") and d.get("deviceId")]
+            mine = {tuple(str(d).partition("/")[::2]) for d in mine}
             for dev in wire:
                 dc, _, di = str(dev).partition("/")
                 if dc and di:
                     devs.add((dc, di))
             devs.update(cfg)
-            if devs:
-                owned = sorted(devs)
-                src = (f"commHostList owned+guest + config-sync union "
-                       f"({len(owned)} devices)")
-            else:
-                owned = list(self.DEFAULT_OWN_CLAIM)
-                src = (f"DEFAULT_OWN_CLAIM guess ({len(owned)} devices) — no "
-                       "commHostList or optionList config-sync received yet")
+            # A class whose owner has duties the hub does not carry out is
+            # not claimed (UNSERVED_OWNER_CLASSES). One the hub owns
+            # already stays as it is; one it is guest of stays guest.
+            left = sorted(d for d in devs if d[0] in UNSERVED_OWNER_CLASSES
+                          and d not in mine)
+            devs -= set(left)
+            owned = sorted(devs)
+            src = (f"commHostList owned+guest + config-sync union "
+                   f"({len(owned)} devices)")
         else:
             src = f"explicit ({len(owned)} devices)"
         config_id = self.next_config_id()
@@ -17186,11 +17462,16 @@ class G2SHost:
             log.info("    claim %s/%s (owner+config)", dc, di)
         for dc, di in guest:
             log.info("    keep  %s/%s (guest)", dc, di)
+        for dc, di in left:
+            log.info("    leave %s/%s (the hub does not serve its class)",
+                     dc, di)
         log.info("⚠️  enterCommConfigMode DISABLES play until the change applies "
                  "or is cancelled.")
         log.info("=" * 64)
         self.enqueue_enter_comm_config_mode(assoc, enable=True)
-        return config_id, owned
+        return {"ok": True, "configId": config_id,
+                "claimed": [f"{dc}/{di}" for dc, di in owned],
+                "left": [f"{dc}/{di}" for dc, di in left]}
 
     # ------------------------------- optionConfig change cycle — G2S-27
     #
@@ -17203,7 +17484,8 @@ class G2SHost:
     # parks and snapshot() times it out). Nothing here fires automatically.
 
     def enqueue_enter_option_config_mode(self, assoc, enable=True,
-                                         disable_text="", ttl_ms=None):
+                                         disable_text="", ttl_ms=None,
+                                         manual=False):
         """optionConfig.enterOptionConfigMode (spec §9.7, Table 9.3). Owner-only.
         Rides under <g2s:optionConfig> at deviceId = hostId (§9.1) like the rest
         of the class. When enabled, the EGM is placed into the mode "that allows
@@ -17220,7 +17502,13 @@ class G2SHost:
         a DIFFERENT mode and does NOT satisfy it (entered live the same day, the
         EGM confirmed CCE101, and gamePlay/option writes were unaffected).
         Deliberate and DISRUPTIVE — API-triggered ONLY, never automatic, and the
-        caller owns the exit (enable=false)."""
+        caller owns the exit (enable=false). manual=True (the API): a person
+        is driving the mode and owns its exit (see mode_manual)."""
+        if manual:
+            with assoc.lock:
+                (assoc.mode_manual.add if enable
+                 else assoc.mode_manual.discard)("optionConfig")
+
         def build(a):
             sid = a.next_session_id()
             text = ""
@@ -17349,8 +17637,9 @@ class G2SHost:
         (the getDescriptor pattern) but may be scoped to one device;
         optionGroupId/optionId take G2S_all; optionDetail=false asks for
         current VALUES only — the same shape the unsolicited config-sync
-        push carries and all the optionList parser stores (optionDetail=true
-        would add optionParameters/defaults, which it skips). The EGM
+        push carries; optionDetail=true adds the parameter definitions,
+        from which the optionList parser keeps canModRemote (what the
+        machine lets a host change) and nothing else. The EGM
         answers with the same optionList command in RESPONSE form (§9.13
         'sent in response to a getOptionList'), which the widened optionList
         handler parses + persists; a response draws NO optionListAck. Wired
@@ -17490,6 +17779,21 @@ class G2SHost:
         gid = opt["optionGroupId"]
         cur = opt["currentValues"]
         param_ids = option_value_param_ids(cur)
+        # What the machine does not let a host change. §9.15: "If set to
+        # false, the host MUST NOT change the value of the parameter", and
+        # the machine answers a set that does with G2S_OCX015 and rejects
+        # ALL of it. Until v0.3.20 the hub never read canModRemote: a WMS
+        # Bluebird 2 marks G2S_disabledRemoteCredit false, so the handpay
+        # set sent at every join was refused whole, the parameters it does
+        # allow included. Such a parameter is now left at the machine's own
+        # value (the set still carries it, unchanged, as §9.15 requires the
+        # complete set) and the rest of the edit goes ahead. A parameter
+        # the machine has not been asked about is treated as before.
+        with assoc.lock:
+            fixed = {pid for pid in param_ids
+                     if assoc.config_can_mod.get(
+                         f"{device_class}/{device_id}/{pid}") is False}
+        not_modifiable = []
         if values:
             # Multi-param form: every requested paramId must exist; edit each
             # in turn (edit_option_current_value deep-copies, so chaining the
@@ -17499,6 +17803,20 @@ class G2SHost:
                 return {"ok": False, "error": f"unknown paramId(s) "
                         f"{unknown} for option {option_id} — available: "
                         f"{sorted(param_ids)}"}
+            not_modifiable = sorted(set(values) & fixed)
+            values = {p: v for p, v in values.items() if p not in fixed}
+            if not_modifiable:
+                log.warning("[%s] ⚙️  %s on %s/%s: the machine does not let "
+                            "a host change %s (canModRemote=false) — left "
+                            "as the machine has %s", assoc.egm_id,
+                            option_id, device_class, device_id,
+                            ", ".join(not_modifiable),
+                            "it" if len(not_modifiable) == 1 else "them")
+            if not values:
+                return {"ok": False, "notModifiable": not_modifiable,
+                        "error": "this machine does not let a host change "
+                        + ", ".join(not_modifiable)
+                        + " (canModRemote=false); set it at the machine"}
             new_cv, edits = cur, {}
             for pid, val in values.items():
                 new_cv, n, old = edit_option_current_value(new_cv, pid, val)
@@ -17522,6 +17840,11 @@ class G2SHost:
             else:
                 return {"ok": False, "error": f"option {option_id} has multiple "
                         f"params {sorted(param_ids)} — pass paramId to pick one"}
+            if target_param in fixed:
+                return {"ok": False, "notModifiable": [target_param],
+                        "error": f"this machine does not let a host change "
+                        f"{target_param} (canModRemote=false); set it at "
+                        "the machine"}
             new_cv, n, old_value = edit_option_current_value(cur, target_param,
                                                              value)
             if n != 1:  # defensive: param_ids said it exists exactly once
@@ -17548,6 +17871,16 @@ class G2SHost:
                                             "cancelling"):
                 age = time.time() - (assoc.option_change.get("progressTs")
                                      or 0)
+                if assoc.option_change.get("result") == "authorized":
+                    # the machine holds it and will apply it when its apply
+                    # condition is met; it is not ours to overwrite
+                    return {"ok": False, "error": "an option change is "
+                            "authorized on the machine and waiting to apply "
+                            f"(configId {assoc.option_change.get('configId')}"
+                            f", applyCondition "
+                            f"{assoc.option_change.get('applyCondition')}) "
+                            "— cancel it first or let it apply",
+                            "stage": assoc.optionconfig_stage}
                 if age <= OPTION_CHANGE_ABANDON_SEC:
                     return {"ok": False, "error": "an optionConfig change is "
                             "already in flight (stage="
@@ -17601,10 +17934,13 @@ class G2SHost:
         self.enqueue_set_option_change(
             assoc, config_id, device_class, str(device_id), gid, option_id,
             cur_xml, apply_condition, disable_condition)
-        return {"ok": True, "configId": config_id, "optionId": option_id,
-                "paramId": target_param, "oldValue": old_value,
-                "newValue": value if not values else None, "params": edits,
-                "applyCondition": apply_condition, "stage": "setting"}
+        out = {"ok": True, "configId": config_id, "optionId": option_id,
+               "paramId": target_param, "oldValue": old_value,
+               "newValue": value if not values else None, "params": edits,
+               "applyCondition": apply_condition, "stage": "setting"}
+        if not_modifiable:
+            out["notModifiable"] = not_modifiable
+        return out
 
     def cancel_option_change(self, assoc):
         """Abort the in-flight optionConfig change (§9.16) — initiator-owner,
@@ -17682,13 +18018,33 @@ class G2SHost:
         # option_values_equal is the SAME comparator the post-apply verify
         # uses — the guard and the verify can never disagree about 'at
         # target' (post-review 2026-07-02).
+        # A parameter the machine does not let a host change (canModRemote
+        # false, see start_option_change_cycle) is not ours to set: it is
+        # left out of the change, whatever its value. A WMS Bluebird 2
+        # keeps G2S_disabledRemoteCredit and G2S_disabledRemoteHandpay to
+        # itself; asking for them had the whole set refused at every join.
+        with assoc.lock:
+            fixed = {pid for pid in targets if assoc.config_can_mod.get(
+                f"{dc}/{di}/{pid}") is False}
         changes = {pid: want for pid, want in targets.items()
-                   if not option_values_equal(vals.get(pid), want)}
+                   if pid not in fixed
+                   and not option_values_equal(vals.get(pid), want)}
+        left = sorted(pid for pid in fixed
+                      if not option_values_equal(vals.get(pid), targets[pid]))
+        if "G2S_enabledRemoteCredit" in left:
+            return {"ok": False, "notModifiable": left, "before": before,
+                    "error": "G2S_enabledRemoteCredit is off and this "
+                    "machine does not let a host change it "
+                    "(canModRemote=false); turn remote key-off to credits "
+                    "on in the machine's own menu"}
         if not changes:
             log.info("[%s] 💰 enableRemoteHandpay: nothing to do — %s already "
-                     "at target", assoc.egm_id, before)
+                     "at target%s", assoc.egm_id,
+                     {p: v for p, v in before.items() if p not in left},
+                     f"; the machine keeps {', '.join(left)} to itself"
+                     if left else "")
             return {"ok": True, "alreadyEnabled": True, "before": before,
-                    "target": dict(targets)}
+                    "target": dict(targets), "notModifiable": left}
         result = self.start_option_change_cycle(
             assoc, device_class=dc, device_id=di, option_id=oid,
             option_group_id=gid, values=changes)
@@ -17851,18 +18207,25 @@ class G2SHost:
                 return
             assoc.ticket_push_epoch = assoc.epoch
             assoc.ticket_push_pending = True
+            assoc.option_detail_settled.discard("G2S_voucher/1")
         log.info("🎫 [%s] join: re-asserting the hub ticket header — reading "
                  "G2S_voucher/1 options first (a RAM clear silently restores "
                  "the EGM's factory ticket text)", assoc.egm_id)
+        # with the definitions, so that what the machine does not let a
+        # host change (canModRemote) is known before anything is pushed
         self.enqueue_get_option_list(assoc=assoc, device_class="G2S_voucher",
-                                     device_id="1")
+                                     device_id="1", option_detail=True)
 
     def _ticket_push_after_option_list(self, assoc):
-        """The voucher optionList landed — run the armed join push, if any.
-        Called from the optionList handler AFTER the inventory is folded in,
-        so push_ticket_header_g2s sees current values."""
+        """An optionList landed — run the armed join push, if any, once the
+        join's own read of G2S_voucher/1 is the one that has been answered
+        (option_detail_settled). Called from the optionList handler AFTER
+        the inventory is folded in, so push_ticket_header_g2s sees current
+        values and what the machine lets a host change."""
         with assoc.lock:
             if not assoc.ticket_push_pending:
+                return
+            if "G2S_voucher/1" not in assoc.option_detail_settled:
                 return
             assoc.ticket_push_pending = False
         for v in self.push_ticket_header_g2s(only=assoc):
@@ -17893,23 +18256,29 @@ class G2SHost:
                 return
             assoc.handpay_arm_epoch = assoc.epoch
             assoc.handpay_arm_pending = True
+            assoc.option_detail_settled.discard("G2S_handpay/1")
         log.info("💰 [%s] join: re-asserting remote handpay key-off — "
                  "reading G2S_handpay/1 options first (a RAM clear silently "
                  "resets G2S_enabledRemoteCredit)", assoc.egm_id)
         self.enqueue_get_option_list(assoc=assoc, device_class="G2S_handpay",
-                                     device_id="1")
+                                     device_id="1", option_detail=True)
 
     def _remote_handpay_arm_after_option_list(self, assoc):
         """A (any) optionList landed — run the armed remote key-off
-        re-assert once the handpay inventory is actually present. Stays
-        armed across landings that did not carry it (the voucher read from
-        the ticket twin lands on this same hook), so ordering between the
-        two join reads can never lose the arm; a machine that never
+        re-assert once the join's own read of G2S_handpay/1 has been
+        answered and the handpay inventory is actually present. Stays
+        armed across landings that were not that answer (the voucher read
+        from the ticket twin lands on this same hook), so ordering between
+        the two join reads can never lose the arm, and can never run it on
+        an inventory kept from an earlier join before this join's
+        definitions say what may be changed; a machine that never
         advertises the option costs one dict probe per landing and nothing
         on the wire."""
         key = "G2S_handpay/1/G2S_handpayOptions/G2S_handpayOptions"
         with assoc.lock:
             if not assoc.handpay_arm_pending:
+                return
+            if "G2S_handpay/1" not in assoc.option_detail_settled:
                 return
             has_opt = key in assoc.config_options
             if has_opt:
@@ -18403,7 +18772,8 @@ class G2SHost:
                 with assoc.lock:
                     c = assoc.denom_ceremony
                     if c and c.get("stage") == "entering" \
-                            and ans_cmd == "enterOptionConfigMode":
+                            and ans_cmd == "enterOptionConfigMode" \
+                            and ans_attrs.get("enable") != "false":
                         c["stage"] = "failed"
                         c["outcome"] = f"error:{rerr}"
                         c["errorCode"] = rerr
@@ -18604,6 +18974,7 @@ class G2SHost:
             # (§9.15). Fail the tracked record loudly with the OCX hint.
             elif req["class"] == "optionConfig":
                 oc_rejected = False
+                held = None
                 with assoc.lock:
                     oc = assoc.option_change
                     if assoc.optionconfig_stage in (
@@ -18618,11 +18989,41 @@ class G2SHost:
                         oc["progressTs"] = time.time()
                         oc_rejected = True
                         oid = oc.get("optionId")
+                        # If it was the AUTHORIZE that was refused, the
+                        # machine still holds the validated set (§9.17: the
+                        # set "MUST retain the same status") and waits on
+                        # it; it is cancelled rather than left there.
+                        held = (ans_cmd == "authorizeOptionChange"
+                                and oc.get("transactionId")
+                                and (oc.get("configId"),
+                                     oc.get("transactionId")))
+                if oc_rejected and held:
+                    log.warning("[%s] ⚙️  cancelling the option change the "
+                                "machine still holds (cfg=%s txn=%s)",
+                                assoc.egm_id, held[0], held[1])
+                    self.enqueue_cancel_option_change(assoc, held[0], held[1])
                 if oc_rejected:
                     hint = OPTION_CONFIG_ERRORS.get(rerr, "")
                     log.warning("[%s] ⚙️ OPTION CHANGE REJECTED (option=%s) — "
                                 "%s%s", assoc.egm_id, oid, rerr,
                                 f" ({hint})" if hint else "")
+                # A read that asked for the definitions, refused. What the
+                # machine lets a host change stays unknown for that device,
+                # and it is read once more the way every version before
+                # v0.3.20 read it (values only); the join's re-assert for
+                # it runs when that answer lands, and does not run at all
+                # if that is refused too, as before.
+                if ans_cmd == "getOptionList" and \
+                        ans_attrs.get("optionDetail") == "true":
+                    dc = ans_attrs.get("deviceClass")
+                    di = ans_attrs.get("deviceId")
+                    with assoc.lock:
+                        assoc.option_detail_settled.add(f"{dc}/{di}")
+                    log.warning("[%s] ⚙️  the read of %s/%s with its "
+                                "definitions was refused (%s) — reading the "
+                                "values alone", assoc.egm_id, dc, di, rerr)
+                    self.enqueue_get_option_list(
+                        assoc=assoc, device_class=dc, device_id=di)
             # G2S-39: a wat-class error is the verdict on a transfer only
             # when the request it refuses is that transfer's own: our
             # initiateRequest (found by its requestId) or our cancelRequest
@@ -19196,6 +19597,16 @@ class G2SHost:
             # the hub's ticket header. A RAM-cleared cabinet rejoins printing
             # its FACTORY voucher text with nothing on the wire to say so.
             self._maybe_push_ticket_header_on_join(assoc)
+            # Is the machine sitting in a configuration mode? Asked once
+            # per join: a mode left on by a hub that restarted, or an exit
+            # that a rejoin dropped from the queue, shows here and nowhere
+            # else (the watch on configuration modes).
+            with assoc.lock:
+                read_modes = assoc.mode_read_epoch != assoc.epoch
+                assoc.mode_read_epoch = assoc.epoch
+            if read_modes:
+                self.enqueue_get_option_config_mode_status(assoc)
+                self.enqueue_get_comm_config_mode_status(assoc)
             # And its 2026-07-29 twin: re-assert remote handpay key-off.
             # A RAM clear resets G2S_enabledRemoteCredit, and a lockup
             # born key-only stays key-only (Table 11.6) — arming on join
@@ -19287,6 +19698,12 @@ class G2SHost:
                 f = {k.rsplit('}', 1)[-1]: v for k, v in it.attrib.items()}
                 hid = f.get("hostId")
                 owned, config, guest = [], [], []
+                # deviceActive as the machine has it, per list and device
+                # (Table 8.9: required on all three): sent back unchanged
+                # by setCommChange, which until v0.3.20 wrote "true" for
+                # every device and so re-activated whatever had been made
+                # inactive.
+                active = {}
                 for child in it:
                     cf = {k.rsplit('}', 1)[-1]: v for k, v in child.attrib.items()}
                     dev = f'{cf.get("deviceClass")}/{cf.get("deviceId")}'
@@ -19297,14 +19714,41 @@ class G2SHost:
                         config.append(dev)
                     elif tag == "guestDevice":
                         guest.append(dev)
+                    else:
+                        continue
+                    active[f"{tag}:{dev}"] = (
+                        "true" if g2s_true(cf.get("deviceActive", "true"))
+                        else "false")
                 if hid is not None:
                     parsed[hid] = {
                         "hostIndex": f.get("hostIndex"),
                         "hostLocation": f.get("hostLocation"),
                         "hostRegistered": f.get("hostRegistered"),
+                        # the host's other attributes, as reported
+                        "attrs": {k: v for k, v in f.items()
+                                  if k in HOST_ITEM_CARRIED},
+                        "active": active,
                         "owned": owned, "config": config, "guest": guest}
+            # The answer to our getCommHostList is the whole table and
+            # replaces what we hold. One the machine sends unasked carries
+            # "only affected hosts" (§8.13): it is merged in. Until v0.3.20
+            # it replaced the table too, so a change to another host's entry
+            # made the hub forget what it owns itself.
             with assoc.lock:
-                assoc.host_items = parsed
+                if stype == "G2S_response":
+                    assoc.host_items = parsed
+                else:
+                    assoc.host_items = dict(assoc.host_items, **parsed)
+                ours = assoc.host_items.get(self.host_id) or {}
+            unserved = sorted(d for d in ours.get("owned") or []
+                              if d.split("/")[0] in UNSERVED_OWNER_CLASSES)
+            if unserved:
+                log.warning("[%s] the machine lists this hub as OWNER of %s. "
+                            "The hub does not serve that class: requests the "
+                            "machine sends its owner (a progressive hit, a "
+                            "player session, a central outcome) are answered "
+                            "\"class not supported\".", assoc.egm_id,
+                            ", ".join(unserved))
             log.info("=" * 64)
             log.info("[%s] 🗺️  COMM HOST LIST — %d host(s) [the ownership map!]",
                      assoc.egm_id, len(parsed))
@@ -19510,6 +19954,8 @@ class G2SHost:
                 # GR-31: gamePlay events keep the games list fresh on
                 # their own — see _game_play_event_refresh.
                 self._game_play_event_refresh(assoc, ev)
+                # a config mode entered or left (the watch on config modes)
+                self._config_mode_event(assoc, ev)
                 log.info("🔔 [%s] EVENT #%d %s [%s] from %s/%s (eventId=%s "
                          "txn=%s)%s%s",
                          assoc.egm_id, total, code, ev["label"],
@@ -19872,6 +20318,11 @@ class G2SHost:
                          "(%d owned+config, %d guest kept)", assoc.egm_id,
                          config_id, len(owned), len(guest))
                 self.enqueue_set_comm_change(assoc, config_id, owned, guest)
+            else:
+                # on with no change in flight, or off: see the watch on
+                # configuration modes
+                self._comm_config_mode_seen(assoc, enabled,
+                                            "commConfigModeStatus")
 
         elif cmd == "commChangeStatus":
             # Response to setCommChange/authorizeCommChange, OR an unsolicited
@@ -19925,14 +20376,21 @@ class G2SHost:
                 # cycle (the "ownership gate" was a symptom of the
                 # double-wrap ack bug). This branch stays functional for a
                 # hypothetical virgin machine that really does need claiming.
+                # §8.7: the host exits config mode once the change applies —
+                # leaving the EGM parked on its config-mode screen strands it
+                # (observed live 2026-07-07). The exit goes FIRST: applying
+                # an ownership change makes the machine restart our session
+                # (§8.4), and a new commsOnLine drops whatever is still
+                # queued. Until v0.3.20 the exit was third in the queue,
+                # behind the two reads below. If it is dropped all the
+                # same, the mode read at the next join finds the mode on
+                # and sends it again.
+                with assoc.lock:
+                    assoc.mode_exit_sent["commConfig"] = time.time()
+                self.enqueue_enter_comm_config_mode(assoc, enable=False)
                 self.enqueue_get_comm_host_list(assoc)
                 if self.subscribe:
                     self.enqueue_set_event_sub(assoc)
-                # §8.7: the host exits config mode once the change applies —
-                # leaving the EGM parked on its config-mode screen strands it
-                # (observed live 2026-07-07). Rides the FIFO after the
-                # ownership-map re-read.
-                self.enqueue_enter_comm_config_mode(assoc, enable=False)
                 # G2S-23: noteAcceptor read path — status (doors/stacker/
                 # enabled) then profile (notes-table readback).
                 self.enqueue_get_note_acceptor_status(assoc)
@@ -20538,12 +20996,36 @@ class G2SHost:
             # the durable inventory store, then ack (request form only).
             el = req["commandEl"]
             synced = []
+            # Is this the answer to a getOptionList of ours that asked for
+            # the parameter definitions? Only then are the definitions read:
+            # the config-sync push a machine sends unasked can carry bare
+            # definition elements with no attributes at all (a WMS Bluebird
+            # 2 does), and reading those would mark every parameter as not
+            # changeable.
+            with assoc.lock:
+                asked = assoc.sent_requests.get(str(req["sessionId"])) or {}
+            detailed = (stype == "G2S_response"
+                        and asked.get("command") == "getOptionList"
+                        and (asked.get("attrs") or {}).get("optionDetail")
+                        == "true")
             for dev in el:
                 if localname(dev.tag) != "deviceOptions":
                     continue
                 dcls = attr(dev, "deviceClass")
                 did = attr(dev, "deviceId")
                 groups, items, value_rows = [], [], 0
+                if detailed:
+                    can_mod = {}
+                    for sub in dev.iter():
+                        if localname(sub.tag) != "optionParameters":
+                            continue
+                        for p in sub.iter():
+                            pid = attr(p, "paramId")
+                            if pid and localname(p.tag).endswith("Parameter"):
+                                can_mod[f"{dcls}/{did}/{pid}"] = g2s_true(
+                                    attr(p, "canModRemote"))
+                    with assoc.lock:
+                        assoc.config_can_mod.update(can_mod)
                 # G2S-27: harvest each option's COMPLETE current-value set,
                 # keyed by the addressing 4-tuple, so setOption can validate
                 # the option exists and copy+edit the whole set (§9.15).
@@ -20817,6 +21299,16 @@ class G2SHost:
                 # The inventory is folded in by now, so an armed join-time
                 # ticket-header push can finally read current values and
                 # decide whether the machine drifted (RAM clear) or matches.
+                # Each of the two waits for the answer to its own read:
+                # the device that read named, and any device the answer
+                # carried, are marked here, after their definitions are in.
+                if detailed:
+                    asked_attrs = asked.get("attrs") or {}
+                    with assoc.lock:
+                        assoc.option_detail_settled.update(synced)
+                        assoc.option_detail_settled.add(
+                            f"{asked_attrs.get('deviceClass')}/"
+                            f"{asked_attrs.get('deviceId')}")
                 self._ticket_push_after_option_list(assoc)
                 self._remote_handpay_arm_after_option_list(assoc)
 
@@ -20836,21 +21328,10 @@ class G2SHost:
                      "%s option configuration mode%s", assoc.egm_id, enabled,
                      "IN" if enabled else "OUT of",
                      " (GAME PLAY LOCKED OUT, §9.7)" if enabled else "")
-            # denomApply ceremony stages ride the mode transitions.
-            if enabled:
-                self._denom_ceremony_mode_open(assoc)
-            else:
-                done = None
-                with assoc.lock:
-                    c = assoc.denom_ceremony
-                    if c and c.get("stage") == "exiting":
-                        c["stage"] = "done"
-                        c["finishedAt"] = now_iso()
-                        done = (c.get("dev"), c.get("outcome"))
-                if done:
-                    log.info("[%s] 🎰 DENOM CEREMONY COMPLETE dev=%s "
-                             "outcome=%s — cabinet returned to play",
-                             assoc.egm_id, done[0], done[1])
+            # denomApply ceremony stages ride the mode transitions, and a
+            # mode that is on with nothing driving it is exited.
+            self._option_config_mode_seen(assoc, enabled,
+                                          "optionConfigModeStatus")
 
         elif cmd == "optionChangeStatus":
             # Response to setOptionChange/authorizeOptionChange/cancelOption-
@@ -20886,6 +21367,23 @@ class G2SHost:
             else:
                 failed = (change_exc not in (None, "0", "")) or \
                     "error" in st or "abort" in st
+                # The machine says the set is PENDING (validated, held,
+                # waiting for our authorization) and we are not going to
+                # authorize it: it carries an exception, or this cycle has
+                # already been ended here (cancelled before the
+                # transactionId was known, or failed). §9.16 lets the host
+                # that started a pending set cancel it; left alone, a
+                # machine that has met its apply condition waits on an
+                # authorization that is not coming (G2S_OCE109).
+                orphaned = ("pend" in st and txn and txn != "0" and (
+                    failed or assoc.optionconfig_stage not in (
+                        "setting", "authorizing", "cancelling")))
+                if orphaned:
+                    log.warning("[%s] ⚙️  the machine holds option change "
+                                "cfg=%s txn=%s pending and this hub is not "
+                                "going to authorize it — cancelling it",
+                                assoc.egm_id, cfg, txn)
+                    self.enqueue_cancel_option_change(assoc, cfg, txn)
                 if failed:
                     hint = OPTION_CHANGE_EXCEPTIONS.get(str(change_exc), "")
                     with assoc.lock:
@@ -24604,6 +25102,11 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
             kwargs["enable"] = False
         if action == "exitOptionConfigMode":
             kwargs["enable"] = False
+        if action in ("enterCommConfigMode", "exitCommConfigMode",
+                      "enterOptionConfigMode", "exitOptionConfigMode"):
+            # entered by hand: whoever did owns the exit, and the hub's
+            # watch on config modes leaves this one alone
+            kwargs["manual"] = True
         if action == "enterOptionConfigMode":
             # §9.7 disableText is player-facing while play is locked out.
             kwargs["enable"] = True
@@ -26845,6 +27348,11 @@ def watchdog(engine):
             engine.sweep_glass_pushes()
         except Exception as e:  # noqa: BLE001 — never take the watchdog down
             log.error("glass-push sweep failed: %s", e)
+        # a denomination change whose write or exit has gone unanswered
+        try:
+            engine.sweep_config_modes()
+        except Exception as e:  # noqa: BLE001 — never take the watchdog down
+            log.error("config-mode sweep failed: %s", e)
         for assoc in list(engine.associations.values()):
             if assoc.comms_state == "onLine":
                 # The host keepAlive pinger POSTs every HOST_KEEPALIVE_SEC and
