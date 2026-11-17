@@ -4386,6 +4386,15 @@ class G2SHost:
         # is never taken while holding companion_lock/assoc.lock.
         self._glass_cash_out_pin = {}
         self._glass_pin_lock = threading.Lock()
+        # {egmId: accountId} for SAS-linked machines whose CASH OUT BUTTON a
+        # player armed (cashOutToWallet). The pin above is also set by the
+        # hub's own pull (cashOutNow), so the pin alone cannot say whether
+        # the button is armed; a page that showed "TO WALLET ON" from it
+        # would be lying after every pull. A machine reads as armed only
+        # while this names the same account as its pin (see
+        # _glass_data_cashout), so every pop of the pin disarms the display
+        # with it.
+        self._glass_cash_out_armed = {}
         # Tournament mode (board v2): the phase machine's state + its LEAF
         # lock (see the "tournament mode" section for the full law: nothing
         # — no _enqueue, no sas_enqueue_command, no store, no other engine
@@ -6576,6 +6585,14 @@ class G2SHost:
                          "restricted" if restricted else "cashable",
                          bal / 100000)
 
+    def _cash_out_armed(self):
+        """The armed-button map (see __init__). getattr, not attribute
+        access: __new__-built harness engines predate it."""
+        armed = getattr(self, "_glass_cash_out_armed", None)
+        if armed is None:
+            armed = self._glass_cash_out_armed = {}
+        return armed
+
     def _drop_refused_cashout_arms(self, command_results, key):
         """Un-pin a cash-out arm the satellite answered it could NOT make.
 
@@ -6613,6 +6630,8 @@ class G2SHost:
                 with self._glass_pin_lock:
                     dropped = [o for o in owners
                                if self._glass_cash_out_pin.pop(o, None)]
+                    for o in owners:
+                        self._cash_out_armed().pop(o, None)
                 log.warning("🏦 [sas:%s] cash-out arm %s refused by the "
                             "machine (%s)%s", key, rid,
                             str(r.get("detail") or r.get("outcome"))[:200],
@@ -7818,6 +7837,7 @@ class G2SHost:
         # gets swept here — its late write can't outlive the card-out.
         with self._glass_pin_lock:
             had_pin = self._glass_cash_out_pin.pop(egm_id, None)
+            self._cash_out_armed().pop(egm_id, None)
         # DISARM the cash-out routing so an un-carded machine reverts to its
         # DEFAULT (a ticket): pair the pin pop with a protocol-correct disarm
         # (AJ — keep it simple). Fired only when a pin was actually armed (never
@@ -9417,10 +9437,17 @@ class G2SHost:
                     acct.get("nonCashMillicents") or 0)
         except Exception:  # noqa: BLE001 — no wallet, not a fault
             pass
-        # cashOutToWat: this session's own pin (armed here) OR the wat device
+        # cashOutToWat: is this machine's own CASH OUT button going to the
+        # wallet? A SAS-linked machine: only while a player ARMED it and
+        # the pin still names them (the pin alone is also set by a pull).
+        # Otherwise: this session's own pin (armed here) OR the wat device
         # state the machine reported — either proves cash-outs route to WAT.
         try:
-            if egm_id in self._glass_cash_out_pin:
+            if (getattr(self, "sas_links", None) or {}).get(egm_id):
+                who = self._cash_out_armed().get(egm_id)
+                out["cashOutToWat"] = bool(
+                    who and self._glass_cash_out_pin.get(egm_id) == who)
+            elif egm_id in self._glass_cash_out_pin:
                 out["cashOutToWat"] = True
             elif assoc is not None:
                 with assoc.lock:
@@ -9626,9 +9653,11 @@ class G2SHost:
           enabled       cashout to host is on: a press raises exception 6A
                         and the satellite answers it (takes it for an armed
                         wallet, declines it otherwise).
-          controllable  the host may switch that on and off. The satellite
-                        switches it on when a player arms and off again
-                        when they disarm.
+          controllable  the machine is set to HOST CONTROLLED: the host
+                        switches that on and off. This is the setting to
+                        use. The satellite switches it on when a player
+                        arms and off again when they disarm or card out,
+                        so the button prints a ticket for everyone else.
           hard          with it on, a cashout the host does not answer
                         tilts the machine instead of printing a ticket."""
         aft = (entry or {}).get("aft") or {}
@@ -9808,8 +9837,9 @@ class G2SHost:
                                  "setting yet. Try again in a moment."
                                  if hc is None else
                                  "This machine's CASH OUT button prints a "
-                                 "ticket: cashout to host is off in its "
-                                 "operator menu.")}
+                                 "ticket. To send it to your wallet, cashout "
+                                 "to host has to be set to host controlled "
+                                 "in the machine's operator menu.")}
             smib = entry.get("smibId") or str(leg).split("/", 1)[0]
             cmd = {"id": f"coarm{next(self._fob_seq)}-{int(time.time())}",
                    "type": "aft_set_host_cashout", "enable": bool(enable),
@@ -9836,6 +9866,11 @@ class G2SHost:
                         "id": f"codis{next(self._fob_seq)}-{int(time.time())}",
                         "type": "aft_set_host_cashout", "enable": False})
                 return refused
+            with self._glass_pin_lock:
+                if enable:
+                    self._cash_out_armed()[egm_id] = account_id
+                else:
+                    self._cash_out_armed().pop(egm_id, None)
             log.info("🏦 [glass:%s] cashOutToWallet=%s via SAS leg %s (%s)",
                      egm_id, str(bool(enable)).lower(), smib,
                      account_id if enable else "ticket default")

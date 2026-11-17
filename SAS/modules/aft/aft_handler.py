@@ -1334,11 +1334,6 @@ class AFTHost:
             else OpenTransferJournal(None)
         self.clock = clock
         self.complete_seen = False     # exception 69 came off the FIFO
-        # True while the machine's host cashout enable is on because THIS
-        # host switched it on (set_host_cashout); a disarm then switches it
-        # off again. Not kept across a restart: a machine left enabled by a
-        # satellite that restarted has its 6A declined like any other.
-        self.enabled_by_host = False
         self._ended = []               # verdicts waiting for service_open()
         self._ask_at = 0.0             # clock time of the next 72/FF
         self._asked = 0                # times asked without a final answer
@@ -1432,51 +1427,50 @@ class AFTHost:
     def set_host_cashout(self, enable: bool) -> Optional[AFTGameLockStatus]:
         """Arm or disarm the machine's CASH OUT button for cashout to host
         (SAS 6.02 §8.7). Returns the machine's 0x74 status as it stands
-        afterwards (None on silence, or on a disarm that had nothing to
-        undo); the caller reads `host_cashout_status` from it.
+        afterwards (None on silence); the caller reads
+        `host_cashout_status` from it.
+
+        The setting this is built for is HOST CONTROLLED: the machine
+        leaves the enable to the host (status bit 0). Then the button
+        prints a ticket until a player arms it, goes to the host while they
+        are armed, and prints a ticket again once they disarm or card out.
 
         Arming, by what the host cashout status byte says:
 
-          enabled already      nothing to do. The button raises exception
-                               6A and the caller answers it.
-          off, controllable    switch it on: a 0x72 for a total of zero
-                               whose flags carry "set the enable" and
-                               "enable", soft mode. `enabled_by_host`
-                               remembers that we did.
-          off, not ours to set nothing is sent. The caller must tell the
-                               owner the button will not cash out to the
-                               host until it is turned on at the machine.
+          off, host controlled  switch it on: a 0x72 for a total of zero
+                                whose flags carry "set the enable" and
+                                "enable", soft mode.
+          on already            nothing to do. The button raises exception
+                                6A and the caller answers it.
+          off, set at the       nothing is sent. The caller tells the owner
+          machine               the button will keep printing a ticket
+                                until the machine is set to host
+                                controlled.
 
-        Disarming switches it off again only if this host switched it on.
-        A machine whose operator enabled it stays as the operator left it;
-        a 6A it raises while nobody is armed is declined by the caller with
-        a zero-amount transfer, so the player gets a ticket at once.
+        Disarming switches it off again wherever the host controls it,
+        whoever switched it on (a satellite that restarted while a player
+        was armed does not remember that it did). A machine whose operator
+        fixed it ON stays on; a 6A it raises while nobody is armed is
+        declined by the caller with a zero-amount transfer, so the player
+        gets a ticket at once.
 
-        What this used to do (until v0.3.14): one read of 0x74, and the
-        caller took "available transfers" bit 1 for the answer. That bit is
-        "a transfer from the machine might be accepted right now", so a
-        machine with host cashout off was reported ready, the page said
-        cash-out goes to the wallet, and the button printed a ticket.
-        Earlier still it sent a game LOCK here, which locked the cabinet
-        and expired in five seconds."""
+        What this used to do (until v0.3.14): one read of 0x74 on an arm,
+        and the caller took "available transfers" bit 1 for the answer.
+        That bit is "a transfer from the machine might be accepted right
+        now", so a machine with host cashout off was reported ready, the
+        page said cash-out goes to the wallet, and the button printed a
+        ticket. Earlier still it sent a game LOCK here, which locked the
+        cabinet and expired in five seconds."""
         p = self.poller
-        if not enable:
-            if not self.enabled_by_host:
-                return None
-            self._request_host_cashout(False)
-            self.enabled_by_host = False
-            return _read_lock(p.transport, p.address, p.protocol,
-                              LOCK_CODE_INTERROGATE)
         ls = _read_lock(p.transport, p.address, p.protocol,
                         LOCK_CODE_INTERROGATE)
         if ls is None:
             return None
         status = ls.host_cashout_status
-        if status & HOST_CASHOUT_ENABLED \
-                or not status & HOST_CASHOUT_CONTROLLABLE:
-            return ls
-        if self._request_host_cashout(True):
-            self.enabled_by_host = True
+        if not status & HOST_CASHOUT_CONTROLLABLE \
+                or bool(status & HOST_CASHOUT_ENABLED) == bool(enable):
+            return ls                   # not ours to set, or already there
+        self._request_host_cashout(enable)
         self.sleep(self.pace)
         return _read_lock(p.transport, p.address, p.protocol,
                           LOCK_CODE_INTERROGATE) or ls

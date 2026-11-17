@@ -458,6 +458,17 @@ def main():
         sas_host_cashout = staticmethod(G.G2SHost.sas_host_cashout)
         sas_from_egm_ready = staticmethod(G.G2SHost.sas_from_egm_ready)
         _drop_refused_cashout_arms = G.G2SHost._drop_refused_cashout_arms
+        _cash_out_armed = G.G2SHost._cash_out_armed
+        _glass_data_cashout = G.G2SHost._glass_data_cashout
+
+        def _session_account(self, uid):
+            return None, None
+
+        def _machine_credits_mc(self, assoc):
+            return 0
+
+        def shows_on(self):
+            return self._glass_data_cashout("EGM1", None, "u1")["cashOutToWat"]
 
         def __init__(self, aft):
             import itertools, threading
@@ -482,8 +493,10 @@ def main():
           "queued, nothing pinned",
           code == 400 and body["cashOutToWat"] is False and not a.sent
           and a._glass_cash_out_pin == {})
-    check("...and the refusal says what the button does",
+    check("...and the refusal says what the button does, and the setting "
+          "that changes it",
           "prints a ticket" in body["error"]
+          and "host controlled" in body["error"]
           and "operator menu" in body["error"])
     a = ArmStub({"registered": True, "availXfers": 0x17})
     code, body = a.glass_cash_out_to_wallet("EGM1", "p1", True)
@@ -515,7 +528,7 @@ def main():
                 "detail": "cashout to host is off on this machine"}]
     a._drop_refused_cashout_arms(refusal, "bb2/1")
     check("an arm the satellite could not make drops the pin (no fake ON)",
-          a._glass_cash_out_pin == {})
+          a._glass_cash_out_pin == {} and a.shows_on() is False)
     a.glass_cash_out_to_wallet("EGM1", "p2", True)       # a later, good arm
     a._drop_refused_cashout_arms(refusal, "bb2/1")       # re-reported
     check("the same refusal reported again does not drop a later arm",
@@ -527,6 +540,26 @@ def main():
           "outcome": "no_credits"}, "junk", None], "bb2/1")
     check("a good arm, another kind of result and junk leave the pin alone",
           a._glass_cash_out_pin == {"EGM1": "p2"})
+
+    print("— the page shows the button armed only when it is")
+    a = ArmStub({"registered": True, "availXfers": 0x17,
+                 "hostCashoutStatus": 0x01})
+    check("nothing armed: the switch reads OFF", a.shows_on() is False)
+    a.glass_sessions = None
+    a.glass_cash_out_now("EGM1", "p1")
+    check("a pull pins the wallet but arms nothing: still OFF (it used to "
+          "read ON from the pin)",
+          a._glass_cash_out_pin == {"EGM1": "p1"} and a.shows_on() is False)
+    a.glass_cash_out_to_wallet("EGM1", "p1", True)
+    check("armed: ON", a.shows_on() is True)
+    a.glass_cash_out_now("EGM1", "p1")
+    check("a pull by the armed player leaves the button armed",
+          a.shows_on() is True)
+    a._glass_cash_out_pin["EGM1"] = "house"          # a tournament sweep
+    check("someone else's pin on the machine: OFF", a.shows_on() is False)
+    a._glass_cash_out_pin["EGM1"] = "p1"
+    a.glass_cash_out_to_wallet("EGM1", "p1", False)
+    check("disarmed: OFF", a.shows_on() is False)
 
     print("— the hub's own pull keeps its gate, with honest words")
     a = ArmStub({"registered": True, "availXfers": 0x15,

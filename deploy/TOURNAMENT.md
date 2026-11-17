@@ -18,8 +18,10 @@ left goes back to it. Nobody's wallet is ever debited to play.
   machine holding credits that will not accept a transfer from it parks its
   seat `failed` and blocks the whole floor from reaching *ready* until it's
   emptied. (This is ordinary in-house AFT, the hub pulling the credits. It
-  is not the machine's "cash out to host" setting, which the pull does not
-  need.)
+  does not depend on the machine's "cashout to host" option. That option is
+  for the machine's own CASH OUT button; set it to **host controlled** if
+  you want players to be able to send that button to their wallet, see
+  [`SAS/BENCH_AFT_CASHOUT.md`](../SAS/BENCH_AFT_CASHOUT.md).)
 - **Non-penny SAS machines: set the denomination first.** The leaderboard
   scores a SAS seat off its raw credit meter × its denomination; if the
   denomination is unset the hub scores it at **1¢/credit** (right for a penny

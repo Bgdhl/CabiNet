@@ -252,17 +252,20 @@ class TestArming:
         status = host.set_host_cashout(True)
         assert status.host_cashout_status & HOST_CASHOUT_ENABLED
         assert _transfers(port) == []
-        assert host.enabled_by_host is False
 
-    def test_a_machine_that_lets_the_host_switch_it_is_switched_on(self):
+    def test_a_host_controlled_machine_is_switched_on(self):
+        """The setting to use: HOST CONTROLLED. The button prints a ticket
+        until a player arms it."""
         machine, port, poller, host, requests = _rig(
-            cashout_controllable=True)
+            credits=2500, cashout_controllable=True)
+        machine.press_cashout()                  # nobody armed: a ticket,
+        poller.poll_once()                       # and the host is not asked
+        assert machine.ticketed == [2500] and requests == []
         host.auto_register()
         status = host.set_host_cashout(True)
         assert machine.cashout_enabled is True
         assert status.host_cashout_status == (HOST_CASHOUT_CONTROLLABLE
                                               | HOST_CASHOUT_ENABLED)
-        assert host.enabled_by_host is True
         sent = _transfers(port)
         assert len(sent) == 1
         assert sent[0][5] == TRANSFER_TYPE_HOST_TO_EGM
@@ -275,17 +278,48 @@ class TestArming:
         host.auto_register()
         host.set_host_cashout(True)
         poller.poll_once()
-        host.set_host_cashout(False)
+        status = host.set_host_cashout(False)
         assert machine.cashout_enabled is False
-        assert host.enabled_by_host is False
+        assert status.host_cashout_status == HOST_CASHOUT_CONTROLLABLE
         assert _transfers(port)[-1][21] == 0x01  # set the enable, to off
 
-    def test_a_machine_the_operator_enabled_is_left_enabled(self):
-        machine, port, poller, host, requests = _rig(cashout_enabled=True)
+    def test_the_whole_round_on_a_host_controlled_machine(self):
+        """Arm, press, the credits go to the wallet; disarm, press, a
+        ticket."""
+        machine, port, poller, host, requests = _rig(
+            credits=2500, cashout_controllable=True)
+        host.auto_register()
         host.set_host_cashout(True)
-        before = len(port.sent_frames)
-        assert host.set_host_cashout(False) is None
-        assert len(port.sent_frames) == before   # disarm touched no wire
+        poller.poll_once()
+        machine.press_cashout()
+        poller.poll_once()
+        assert requests == [0x6A]
+        record = _answer(host, requests, armed=True)
+        assert (record["ok"], record["amountCents"]) == (True, 2500)
+        assert machine.ticketed == []
+        poller.poll_once()
+        host.set_host_cashout(False)
+        poller.poll_once()
+        machine.credits = 900
+        machine.press_cashout()
+        poller.poll_once()
+        assert machine.ticketed == [900]
+        assert requests == [0x6A]                # the host was not asked
+
+    def test_one_left_on_by_a_satellite_that_restarted_is_switched_off(self):
+        """A new AFTHost knows nothing of an earlier arm. The machine says
+        host controlled and on, so a disarm switches it off all the same."""
+        machine, port, poller, host, requests = _rig(
+            cashout_controllable=True, cashout_enabled=True)
+        host.auto_register()
+        host.set_host_cashout(False)
+        assert machine.cashout_enabled is False
+
+    def test_a_machine_the_operator_fixed_on_is_left_on(self):
+        machine, port, poller, host, requests = _rig(cashout_enabled=True)
+        status = host.set_host_cashout(False)
+        assert status.host_cashout_status == HOST_CASHOUT_ENABLED
+        assert _transfers(port) == []
         assert machine.cashout_enabled is True
 
     def test_a_machine_with_it_off_and_not_ours_to_set(self):
@@ -296,17 +330,16 @@ class TestArming:
         assert status.available_transfers & 0x02
         assert status.host_cashout_status == 0
         assert _transfers(port) == []
-        assert host.enabled_by_host is False
 
     def test_the_words_for_each(self):
         assert sas_host.describe_host_cashout(0x00) == \
             "off, set at the machine"
         assert sas_host.describe_host_cashout(0x01) == \
-            "off, the host may change it"
+            "off, host controlled"
         assert sas_host.describe_host_cashout(0x02) == \
             "ON, soft, set at the machine"
         assert sas_host.describe_host_cashout(0x07) == \
-            "ON, hard, the host may change it"
+            "ON, hard, host controlled"
         assert sas_host.describe_host_cashout(None) == "unknown"
 
 
@@ -344,6 +377,7 @@ class TestTheArmCommand:
             False, False, "host_cashout_off")
         assert r["hostCashoutStatus"] == 0
         assert "keep printing a ticket" in r["detail"]
+        assert "host controlled" in r["detail"]
 
     def test_an_arm_on_a_controllable_machine_switches_it_on(self):
         run = _run_arm("armctl", cashout_controllable=True)

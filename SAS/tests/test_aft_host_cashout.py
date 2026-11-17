@@ -14,7 +14,9 @@ locked the cabinet and auto-expired in ~5 s. Dropped. Load-bearing guards:
   * a LOCKLESS EGM->host transfer completes with NO 0x74 lock dance;
   * set_host_cashout(True) does a READ-ONLY 0x74/FF interrogate (the gate
     probe — NO game-lock REQUEST/CANCEL, never a second serial writer);
-  * set_host_cashout(False) touches NO wire at all (disarm is hub-side);
+  * set_host_cashout(False) sends one read-only 0x74/FF and nothing else on
+    a machine whose cashout to host is not host controlled (v0.3.14; it
+    used to touch no wire at all);
   * the machine-initiated 0x6A/0x6B host-cashout requests surface via
     AFTHost.on_cashout_request (the flag the between-polls handler reads).
 """
@@ -92,16 +94,20 @@ class TestHostCashoutArm:
                    for f in probes)
         assert ls is not None                        # read-back status parsed
 
-    def test_disarm_touches_no_wire(self):
-        # Disarm is PURELY hub-side (clear the flag) — the CONFIRMED model
-        # sends nothing on the wire; an unanswered 0x6A already tickets.
+    def test_disarm_reads_the_status_and_sends_nothing_else(self):
+        # A disarm reads the machine's 0x74 status once, to see whether its
+        # cashout to host is host controlled and still on (then it is
+        # switched off). On a machine where it is not the host's to set,
+        # that read is all that leaves: no transfer, no game lock.
         machine = AFTMachine(registered=True)
         port = MockSASSerialPort(machine)
         host = AFTHost(SASPoller(port, address=1), ASSET, KEY, POS,
                        sleep=NO_SLEEP)
         ls = host.set_host_cashout(False)
-        assert ls is None
-        assert port.sent_frames == []                # not a single frame left
+        assert ls is not None
+        probes = _locks(port)
+        assert len(port.sent_frames) == len(probes) == 1
+        assert probes[0][2] == LOCK_CODE_INTERROGATE  # no REQUEST / CANCEL
 
     def test_arm_is_a_single_reader_no_transfer_sent(self):
         # Arming must NEVER move money — only the read-only 0x74 probe leaves,

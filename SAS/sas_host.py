@@ -413,7 +413,7 @@ def describe_host_cashout(status) -> str:
         words = "ON, " + ("hard" if status & HOST_CASHOUT_HARD else "soft")
     else:
         words = "off"
-    return words + (", the host may change it"
+    return words + (", host controlled"
                     if status & HOST_CASHOUT_CONTROLLABLE
                     else ", set at the machine")
 
@@ -2296,10 +2296,9 @@ def main():
                     result["accountId"] = acct[:64]
                 ls = None
                 try:
-                    if enable:
-                        # the 0x72 that switches host cashout on needs the
-                        # machine's asset and our key (idempotent)
-                        aft_host.auto_register()
+                    # the 0x72 that switches host cashout on or off needs
+                    # the machine's asset and our key (idempotent)
+                    aft_host.auto_register()
                     ls = aft_host.set_host_cashout(enable)
                 except Exception as ce:            # noqa: BLE001 — best-effort
                     logger.warning("🏦 hub command {}: host-cashout arm wire "
@@ -2330,7 +2329,9 @@ def main():
                         if hc is None else
                         "cashout to host is off on this machine ("
                         + describe_host_cashout(hc) + "); its CASH OUT "
-                        "button will keep printing a ticket")
+                        "button will keep printing a ticket until that "
+                        "option is set to host controlled in the operator "
+                        "menu")
                     result["result"] = "rejected"
                 else:
                     result["ok"] = True
@@ -2342,7 +2343,7 @@ def main():
                             ("NOT armed" if enable else "disarmed"),
                             result.get("accountId") or "-",
                             describe_host_cashout(hc) if hc is not None
-                            else ("not read" if not enable else "no answer"))
+                            else "no answer")
                 return result
             if cmd.get("type") in ("sas_disable", "sas_enable"):
                 # Machine lock/unlock = SAS shutdown 0x01 / startup 0x02

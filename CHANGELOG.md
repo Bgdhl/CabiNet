@@ -1,41 +1,48 @@
 # Changelog
 
 ## v0.3.14
-Fifth batch from the SAS audit: cash-out to the wallet on SAS machines.
+Fifth batch from the SAS audit: the machine's own CASH OUT button to a
+wallet, on SAS machines.
 There are two ways credits leave a SAS machine for a wallet. The hub can
-pull them (the CASH OUT TO WALLET button on the player screen); that is
-unchanged. Or the machine's own CASH OUT button can send them, which only
-works where the machine has "cashout to host" switched on. This release is
-about the second.
-- **Every cash-out request from a machine is answered.** With cashout to
-  host on, each press of CASH OUT asks the hub first and waits up to eight
-  seconds. When nobody was armed for a wallet cash-out the satellite said
-  nothing, so the player stood through the eight seconds before the ticket
-  printed, and a machine set to hard mode tilted instead. The satellite
-  now declines at once and the machine prints its ticket.
-- **A win the machine wants to send to the host is taken as a win.** It
-  was answered as if it were the cash-out button, asking for whatever was
-  on the credit meter, which a machine has to refuse.
+pull them (CASH OUT TO WALLET on the player screen); that is unchanged. Or
+the machine's CASH OUT button can send them, which depends on the
+machine's "cashout to host" option. This release is about the second.
+- **Set the machine's cashout to host option to HOST CONTROLLED.** The
+  docs used to say "soft cash-out to host". Host controlled leaves the
+  on/off to the hub: the button prints a ticket until a carded player
+  switches it to their wallet, and prints a ticket again when they switch
+  it back or card out. `SAS/BENCH_AFT_CASHOUT.md` is rewritten around it.
+- **The SMIB player screen can switch the button.** The CASH OUT page has
+  a new switch, MACHINE CASH OUT BUTTON: TO WALLET ON / OFF, under the
+  existing CASH OUT TO WALLET button (which still sends the credits at
+  once). The digital glass already had the switch.
 - **Arming looks at the right setting.** The hub decided whether a
   machine's button could go to the wallet from a bit that only says the
   hub could pull credits. A machine with cashout to host off was armed,
   the page said cash-out goes to the wallet, and the button printed a
-  ticket. The hub now reads the machine's host cashout status, shown in
-  the Machines status as `sasHostCashout`. Where the machine lets the
-  host switch the setting, the satellite switches it on when a player
-  arms and off again when they disarm. Where it is off and set at the
-  machine, the arm is refused with the reason.
+  ticket. The hub now reads the machine's host cashout status (shown in
+  the Machines status as `sasHostCashout`), the satellite switches the
+  option on and off on a host controlled machine, and where it is off and
+  set at the machine the switch is refused with the reason.
+- **Every cash-out request from a machine is answered.** On a machine set
+  to on (soft or hard) each press asks the hub first and waits up to
+  eight seconds. When nobody was armed the satellite said nothing, so the
+  player stood through the eight seconds, and a machine in hard mode
+  tilted. The satellite now declines at once and the ticket prints.
+- **A win the machine wants to send to the host is taken as a win.** It
+  was answered as if it were the cash-out button, which a machine has to
+  refuse.
+- **A refusal from the hub is shown in its own words** on the SMIB player
+  screen and the digital glass. Both pages read the hub's answer only when
+  it was a yes, so every refusal came out as "try again".
 - The refusal for a pull no longer tells the owner to turn on "soft
   cash-out to host". A pull does not need it.
 - **A refused AFT registration says why.** It was always reported as
   "possibly awaiting operator acknowledgment at the machine". A machine
   cannot ask for that by itself. The usual cause is the asset number not
   matching the one set at the machine, and the message says so.
-- `SAS/BENCH_AFT_CASHOUT.md` and `deploy/TOURNAMENT.md` are corrected on
-  the same point.
-- On a Bluebird 2 here cashout to host is off, so none of the button path
-  could be tried on it; the tests run against a pretend machine that
-  follows the document.
+- None of the button path has been on a real machine yet; the tests run
+  against a pretend machine that follows the document.
 
 ## v0.3.13
 Fourth batch from the SAS audit: the link rules. This changes the rhythm
