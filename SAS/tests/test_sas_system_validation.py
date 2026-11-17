@@ -498,7 +498,10 @@ class TestServiceSystemValidation:
         result = service_system_validation(port, 1, store, sleep=NO_SLEEP)
         assert result.outcome is SystemValidationOutcome.SERVICED
         assert result.ack_confirmed is False
-        assert len(_polls_of(port, RECEIVE_VALIDATION_NUMBER)) == 1
+        # asked for again twice when it is not answered (§3.2), the same
+        # poll each time
+        sent_58 = _polls_of(port, RECEIVE_VALIDATION_NUMBER)
+        assert len(sent_58) == 3 and len(set(sent_58)) == 1
         assert [p["validationNumber"] for p in store.pending_validations()] \
             == [result.validation_number]
 
@@ -512,7 +515,10 @@ class TestServiceSystemValidation:
                                            approve=False)
         assert result.outcome is SystemValidationOutcome.REJECTED
         assert result.ack_confirmed is False
-        assert len(_polls_of(port, RECEIVE_VALIDATION_NUMBER)) == 1
+        # asked for again twice when it is not answered (§3.2), the same
+        # poll each time
+        sent_58 = _polls_of(port, RECEIVE_VALIDATION_NUMBER)
+        assert len(sent_58) == 3 and len(set(sent_58)) == 1
         assert store.pending_validations() == []
 
     def test_ceiling_is_the_wire_max_so_no_valid_frame_can_exceed_it(self):
@@ -558,7 +564,9 @@ class TestServiceSystemValidation:
         assert [p["validationNumber"] for p in store.pending_validations()] \
             == [r1.validation_number]
         sent = _polls_of(port, RECEIVE_VALIDATION_NUMBER)
-        assert len(sent) == 2 and sent[0][3:11] == sent[1][3:11]
+        # two cash-out services, each 0x58 sent three times unanswered:
+        # six sends, one number
+        assert len(sent) == 6 and len({f[3:11] for f in sent}) == 1
 
     def test_type_amount_does_not_mint_no_orphan_pending(self, tmp_path):
         # Finding #10: in the type_amount regime the EGM supplies its own
@@ -657,3 +665,106 @@ class TestPollerIntegration:
                     on_system_validation=boom)
         poller.poll_once()                          # must not raise
         assert poller.state.callback_errors >= 1
+
+
+# ---------------------------------------------------------------------------
+# SAS 6.02 audit 2026-11-16, items 18 and 21
+# ---------------------------------------------------------------------------
+
+class _Scripted58(SysValMachine):
+    """Answers long poll 58 with the statuses given, in order (Table 15.8b:
+    00 acknowledged, 80 not in cashout, 81 improper validation rejected);
+    None means the answer is lost. The first 57 answer can be spoiled."""
+
+    def __init__(self, statuses, spoil_57=0, **kw):
+        super().__init__(**kw)
+        self.statuses = list(statuses)
+        self.spoil_57 = spoil_57
+
+    def __call__(self, frame, wakeup):
+        answer = super().__call__(frame, wakeup)
+        if len(frame) == 2 and frame[1] == SEND_PENDING_CASHOUT \
+                and self.spoil_57 > 0:
+            self.spoil_57 -= 1
+            return answer[:-1] + bytes([answer[-1] ^ 0xFF])
+        if len(frame) > 2 and frame[1] == RECEIVE_VALIDATION_NUMBER \
+                and self.statuses:
+            status = self.statuses.pop(0)
+            if status is None:
+                return b""
+            return _frame(self.address, RECEIVE_VALIDATION_NUMBER,
+                          bytes([status]))
+        return answer
+
+
+CASHOUT = {"type": 0, "amount": 4321}
+
+
+class TestAskedAgainAndTheAnswerRead:
+    def test_a_damaged_57_answer_is_asked_for_again(self, tmp_path):
+        """The machine stops raising exception 57 once it has had a long
+        poll 57, so there is no second chance from that side."""
+        machine = _Scripted58([0x00], spoil_57=1, cashout=dict(CASHOUT))
+        port = MockSASSerialPort(machine)
+        result = service_system_validation(port, 1, _store(tmp_path),
+                                           sleep=NO_SLEEP)
+        assert result.outcome is SystemValidationOutcome.SERVICED
+        assert len(_polls_of(port, SEND_PENDING_CASHOUT)) == 2
+        assert len(machine.approvals) == 1
+
+    def test_a_lost_58_answer_is_asked_for_again(self, tmp_path):
+        machine = _Scripted58([None, 0x00], cashout=dict(CASHOUT))
+        port = MockSASSerialPort(machine)
+        result = service_system_validation(port, 1, _store(tmp_path),
+                                           sleep=NO_SLEEP)
+        assert result.outcome is SystemValidationOutcome.SERVICED
+        assert result.ack_confirmed is True
+        sent = _polls_of(port, RECEIVE_VALIDATION_NUMBER)
+        assert len(sent) == 2 and sent[0] == sent[1]
+
+    def test_cashout_type_80_means_nothing_is_waiting(self, tmp_path):
+        machine = SysValMachine(cashout={"type": 0x80, "amount": 4321})
+        port = MockSASSerialPort(machine)
+        store = _store(tmp_path)
+        result = service_system_validation(port, 1, store, sleep=NO_SLEEP)
+        assert result.outcome is SystemValidationOutcome.NO_DATA
+        assert "not waiting for system validation" in result.detail
+        assert _polls_of(port, RECEIVE_VALIDATION_NUMBER) == []
+        assert store.find_open_pending(1, 4321) is None    # nothing minted
+
+    def test_status_80_is_not_an_approval(self, tmp_path):
+        machine = _Scripted58([0x80], cashout=dict(CASHOUT))
+        port = MockSASSerialPort(machine)
+        result = service_system_validation(port, 1, _store(tmp_path),
+                                           sleep=NO_SLEEP)
+        assert result.outcome is SystemValidationOutcome.NO_DATA
+        assert "no longer in a cash-out" in result.detail
+
+    def test_status_81_gets_one_more_try_after_a_fresh_57(self, tmp_path):
+        machine = _Scripted58([0x81, 0x00], cashout=dict(CASHOUT))
+        port = MockSASSerialPort(machine)
+        result = service_system_validation(port, 1, _store(tmp_path),
+                                           sleep=NO_SLEEP)
+        assert result.outcome is SystemValidationOutcome.SERVICED
+        assert len(_polls_of(port, SEND_PENDING_CASHOUT)) == 2
+        sent = _polls_of(port, RECEIVE_VALIDATION_NUMBER)
+        assert len(sent) == 2 and sent[0][3:11] == sent[1][3:11]
+
+    def test_status_81_twice_is_a_refusal_not_an_approval(self, tmp_path):
+        machine = _Scripted58([0x81, 0x81], cashout=dict(CASHOUT))
+        port = MockSASSerialPort(machine)
+        result = service_system_validation(port, 1, _store(tmp_path),
+                                           sleep=NO_SLEEP)
+        assert result.outcome is SystemValidationOutcome.REFUSED
+        assert "refused validation number" in result.detail
+
+    def test_the_first_byte_of_58_is_the_mints_system_id_in_bcd(self,
+                                                                tmp_path):
+        machine = _Scripted58([0x00], cashout=dict(CASHOUT))
+        port = MockSASSerialPort(machine)
+        result = service_system_validation(port, 1, _store(tmp_path),
+                                           sleep=NO_SLEEP, system_id=42)
+        assert result.outcome is SystemValidationOutcome.SERVICED
+        sent = _polls_of(port, RECEIVE_VALIDATION_NUMBER)
+        assert sent[0][2] == 0x42                  # BCD 42, not a flag
+        assert result.validation_number.startswith("42")

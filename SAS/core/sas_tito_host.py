@@ -130,6 +130,9 @@ CASHOUT_BUTTON_EXCEPTION = 0x66              # informational precursor (no-op)
 # 0x58 validation-ID byte (host -> EGM)
 VALIDATION_APPROVE = 0x01             # approve: print the cash-out ticket
 VALIDATION_REJECT = 0x00             # reject: EGM drops the cash-out to handpay
+CASHOUT_TYPE_NOT_WAITING = 0x80      # Table 15.7b, in the long poll 57 answer
+VALIDATION_STATUS_NOT_IN_CASHOUT = 0x80   # Table 15.8b, the long poll 58
+VALIDATION_STATUS_IMPROPER = 0x81         # answer's status byte
 
 # 0x58 8-byte payload style. "bcd_number" (default) = the minted validation
 # number as packed BCD, big-endian (SPEC-CORRECT: SAS 6.02 §15.8 + saspy, and
@@ -855,6 +858,8 @@ class SystemValidationOutcome(enum.Enum):
     REJECTED = "rejected"        # sent 0x58 ID=00 -> EGM drops to handpay
     NO_DATA = "no_data"          # 0x57 read answered but had no pending cashout
     TIMEOUT = "timeout"          # silence/bad-CRC 0x57 read — NO 0x58 sent
+    REFUSED = "refused"          # the machine refused the number (0x58
+    #                              status 81, twice)
 
 
 @dataclass(frozen=True)
@@ -905,16 +910,30 @@ def service_system_validation(transport, address: int, store: TicketStore,
 
     SILENCE != CONSENT: a silent or bad-CRC 0x57 read returns a typed TIMEOUT
     and NEVER sends 0x58 approve (mint does not run). A zeroed/None amount is
-    NO_DATA — also no approve. The 0x58 ack sub-layout is undocumented, so any
-    well-formed [addr][0x58]… answer is treated as an ack (ack_confirmed); the
-    REAL success signal is the later 0x3D completion, handled by
-    capture_printed_ticket, which reconciles the minted pending into a single
-    recorded ticket. Long polls double as the implied ACK for the triggering
-    exception (guide §3), so calling this from the poller dispatch is safe."""
+    NO_DATA — also no approve. The REAL success signal is the later 0x3D
+    completion, handled by capture_printed_ticket, which reconciles the
+    minted pending into a single recorded ticket. Long polls double as the
+    implied ACK for the triggering exception (guide §3), so calling this from
+    the poller dispatch is safe.
+
+    ⭐ BOTH POLLS ARE ASKED FOR AGAIN, AND THE 0x58 ANSWER IS READ
+    (2026-11-16, audit items 18 and 21). The machine raises exception 57
+    every 800 ms only "until it receives a long poll 57 or 58" (§15.7) and
+    gives up after ten seconds, so a damaged answer to either poll used to
+    end the cash-out: nothing was repeated, and no new exception 57 came to
+    trigger another try. And the answer to long poll 58 carries a status
+    (Table 15.8b) that was never read: 00 acknowledged, 80 "not in
+    cashout", 81 "improper validation rejected". 80 and 81 were reported as
+    an approval. The cashout type in the 57 answer can also say 80, "not
+    waiting for system validation" (Table 15.7b).
+
+    The first byte of long poll 58 is the validation SYSTEM ID in BCD
+    (00 = denied), not an approve flag; it is the mint's own system id."""
     proto = protocol or _PROTO
 
     # -- 1: read the pending cash-out (Type-R, no outbound CRC) --------------
-    resp = transport.transact(build_send_pending_cashout_poll(address))
+    resp, _h, _n = transact_reread(
+        transport, build_send_pending_cashout_poll(address))
     packet = _classify_frame(resp, address, SYSTEM_VALIDATION_REQUEST_EXCEPTION,
                              proto)
     if packet is None:
@@ -931,6 +950,24 @@ def service_system_validation(transport, address: int, store: TicketStore,
             packet.data, None, False,
             f"malformed 0x57 response ({e}) — treated as silence; no 0x58 sent")
 
+    if pend.cashout_type == CASHOUT_TYPE_NOT_WAITING:
+        return SystemValidationResult(
+            SystemValidationOutcome.NO_DATA, pend.cashout_type,
+            pend.amount_cents, None, None, None, packet.data, None, False,
+            "0x57 says the machine is not waiting for system validation "
+            "(cashout type 80) — no approval sent")
+
+    def send_58(id_byte, payload):
+        """Long poll 58, asked for again if its answer is damaged. Returns
+        (raw answer | None, answered, status | None)."""
+        raw, _h2, _n2 = transact_reread(
+            transport, build_receive_validation_number_poll(
+                address, id_byte, payload))
+        pkt = _classify_frame(raw, address, RECEIVE_VALIDATION_NUMBER, proto)
+        if pkt is None:
+            return None, False, None
+        return raw, True, (pkt.data[0] if pkt.data else None)
+
     if pend.amount_cents is None or pend.amount_cents <= 0:
         # A non-BCD/zero amount can never be a valid approve — no 0x58 approve.
         return SystemValidationResult(
@@ -941,14 +978,11 @@ def service_system_validation(transport, address: int, store: TicketStore,
     # -- 2a: explicit reject (host business decision) -----------------------
     if not approve:
         sleep(pace)
-        ack = transport.transact(build_receive_validation_number_poll(
-            address, VALIDATION_REJECT, b"\x00" * 8))
-        ack_pkt = _classify_frame(ack, address, RECEIVE_VALIDATION_NUMBER,
-                                  proto)
+        ack, answered, _st = send_58(VALIDATION_REJECT, b"\x00" * 8)
         return SystemValidationResult(
             SystemValidationOutcome.REJECTED, pend.cashout_type,
             pend.amount_cents, None, VALIDATION_REJECT, None, packet.data,
-            ack if ack_pkt is not None else None, ack_pkt is not None,
+            ack, answered,
             "host rejected the cash-out (0x58 ID=00) — EGM drops to handpay")
 
     # -- 2b: approve path ---------------------------------------------------
@@ -958,14 +992,11 @@ def service_system_validation(transport, address: int, store: TicketStore,
                else getattr(store, "MAX_TICKET_CENTS", DEFAULT_MAX_TICKET_CENTS))
     if pend.amount_cents > ceiling:
         sleep(pace)
-        ack = transport.transact(build_receive_validation_number_poll(
-            address, VALIDATION_REJECT, b"\x00" * 8))
-        ack_pkt = _classify_frame(ack, address, RECEIVE_VALIDATION_NUMBER,
-                                  proto)
+        ack, answered, _st = send_58(VALIDATION_REJECT, b"\x00" * 8)
         return SystemValidationResult(
             SystemValidationOutcome.REJECTED, pend.cashout_type,
             pend.amount_cents, None, VALIDATION_REJECT, None, packet.data,
-            ack if ack_pkt is not None else None, ack_pkt is not None,
+            ack, answered,
             f"cash-out {pend.amount_cents}c exceeds the {ceiling}c ceiling — "
             "rejected to handpay (0x58 ID=00); never minted")
 
@@ -1006,11 +1037,34 @@ def service_system_validation(transport, address: int, store: TicketStore,
 
     payload8 = build_validation_payload(payload_style, vn or "0",
                                         pend.cashout_type, pend.amount_raw)
+    # the validation system ID, BCD (Table 15.8a); 01 for the default
+    id_byte = (int_to_bcd(int(mint_sid), 1)[0]
+               if isinstance(mint_sid, int) and 1 <= mint_sid <= 99
+               else VALIDATION_APPROVE)
     sleep(pace)
-    ack = transport.transact(build_receive_validation_number_poll(
-        address, VALIDATION_APPROVE, payload8))
-    ack_pkt = _classify_frame(ack, address, RECEIVE_VALIDATION_NUMBER, proto)
-    ack_confirmed = ack_pkt is not None
+    ack, ack_confirmed, status58 = send_58(id_byte, payload8)
+    if status58 == VALIDATION_STATUS_IMPROPER:
+        # "Improper validation rejected": a long poll 58 with a number "must
+        # be preceded by a valid long poll 57 within the same cashout"
+        # (§15.8). Read 57 again and send it once more.
+        sleep(pace)
+        transact_reread(transport, build_send_pending_cashout_poll(address))
+        sleep(pace)
+        ack, ack_confirmed, status58 = send_58(id_byte, payload8)
+        if status58 == VALIDATION_STATUS_IMPROPER:
+            return SystemValidationResult(
+                SystemValidationOutcome.REFUSED, pend.cashout_type,
+                pend.amount_cents, vn, id_byte, payload_style, packet.data,
+                ack, ack_confirmed,
+                f"the machine refused validation number {vn} twice (0x58 "
+                "status 81, improper validation) — no ticket will print")
+    if status58 == VALIDATION_STATUS_NOT_IN_CASHOUT:
+        return SystemValidationResult(
+            SystemValidationOutcome.NO_DATA, pend.cashout_type,
+            pend.amount_cents, vn, id_byte, payload_style, packet.data,
+            ack, ack_confirmed,
+            "0x58 answered 80: the machine is no longer in a cash-out — "
+            f"nothing prints against {vn}")
     if payload_style == PAYLOAD_STYLE_TYPE_AMOUNT:
         detail = (f"approved cash-out {pend.amount_cents}c: 0x58 ID=01 sent "
                   "[type_amount] — EGM supplies its own validation number")
@@ -1022,7 +1076,7 @@ def service_system_validation(transport, address: int, store: TicketStore,
         detail += " — no 0x58 ack yet (watch for the 0x3D print completion)"
     return SystemValidationResult(
         SystemValidationOutcome.SERVICED, pend.cashout_type, pend.amount_cents,
-        vn, VALIDATION_APPROVE, payload_style, packet.data,
+        vn, id_byte, payload_style, packet.data,
         ack if ack_confirmed else None, ack_confirmed, detail)
 
 

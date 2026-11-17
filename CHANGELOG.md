@@ -25,6 +25,15 @@ followed to its end.
   machine never got the older read that holds its ticket number.
 - The SAS log no longer says "ticket issued" for a read that found
   nothing.
+- **System validation: a lost answer no longer ends the cash-out.** The
+  machine asks for a validation number, gives the host ten seconds, and
+  stops asking once the host has started. A garbled answer to either of
+  the host's two polls used to end it there with no ticket. Both are now
+  asked for again.
+- **System validation: the machine's reply to the number is read.** It
+  can say "not in a cash-out" or "improper validation rejected"; both
+  used to be reported as an approval. A refusal now gets one more try and
+  is then reported as refused.
 
 ## v0.3.9
 Second batch from the SAS audit: an AFT transfer always ends in a known
