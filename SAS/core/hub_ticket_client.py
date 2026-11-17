@@ -325,6 +325,12 @@ class HubTicketAuthority:
             "ticketNumber": ticket_number, "source": source,
             "issuedAt": issued_at or (None if out["duplicate"]
                                       else out["record"].get("issuedAt"))}
+        # The kind the machine gave the ticket (Table 15.13c), so the hub can
+        # flag a restricted promotional ticket. Rides the journal too, so it
+        # survives a hub outage.
+        vt = (extra or {}).get("validationType")
+        if isinstance(vt, int) and not isinstance(vt, bool):
+            payload["validationType"] = vt
         try:
             r = self._post("issued", payload)
         except (OSError, ValueError) as e:

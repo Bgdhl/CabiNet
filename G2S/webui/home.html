@@ -4469,7 +4469,7 @@ function hubRow(t){
       <span class="ta">${esc(fmtAmt(t.amountMc))}</span>
       <span class="ti"><span class="id">${esc(fmtVid(t.canonical))}</span>
         <span class="mt">${esc(titoName(t.origin))} · ${esc(stateLabel(t.state))}${
-          pendAt?" · redeeming at "+esc(titoName(t.pending.machine)):""}${tkReuseTag(t)}</span>
+          pendAt?" · redeeming at "+esc(titoName(t.pending.machine)):""}${tkReuseTag(t)}${tkKindTag(t)}</span>
         ${cross?xmBadge(t.origin,t.redeemedBy):""}</span>
       <span class="tst">${esc(when?ago(when):"")}</span>
     </button>`;
@@ -4482,6 +4482,13 @@ function hubRow(t){
 function tkReuseTag(t){
   if(!t||!t.reusable) return "";
   return " · reusable"+(t.uses?" ×"+esc(String(t.uses)):"");
+}
+/* What the machine said the ticket is. A restricted promotional ticket
+   (the machine's own wording; it prints PLAYABLE ONLY on them) is flagged
+   here and in the ticket's detail. It still redeems like any other. Only
+   SAS tickets captured by a satellite that reads the kind carry it. */
+function tkKindTag(t){
+  return t&&t.restrictedPromo?" · restricted promotional":"";
 }
 function tkControls(t, kind, reissuable, attrs){
   // kind: "hub" (tito ledger) | "g2s" (voucher store); attrs = data-* string
@@ -4633,6 +4640,8 @@ function renderHubTicketModal(cid){
       +(t.pending.at?" · "+clock(t.pending.at):"")]);
   if(t.vn16) rows.push(["system id (vn16)",fmtVid(t.vn16)]);
   if(t.uses) rows.push(["times redeemed",String(t.uses)]);
+  if(t.restrictedPromo)
+    rows.splice(1,0,["kind","restricted promotional ticket (playable only, not cash)"]);
   const voidable=t.state==="issued"||t.state==="redeemPending";
   const hAttrs=`data-vn="${esc(t.vn16||t.canonical)}" data-cid="${esc(t.canonical)}"`;
   setHTML($("m-body"),`

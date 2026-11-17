@@ -342,6 +342,31 @@ def _int_or_none(v):
         return None
 
 
+# SAS 6.02 Table 15.13c: 01 = restricted promotional ticket from cashout,
+# 03 = restricted ticket from an AFT transfer. A machine prints "PLAYABLE
+# ONLY" on them. The hub flags them on its ticket pages; they redeem like any
+# other ticket (AJ, 2026-11-16: "they act the same in reality but in the cash
+# desk part ... they would be flagged", and "the wording the egm uses is
+# restricted promotional tickets").
+RESTRICTED_PROMO_TYPES = (0x01, 0x03)
+
+
+def _validation_type_of(extra):
+    """The validationType carried in a ticket's extra (a dict, or the
+    extra_json text of a row), or None. Junk is None, never an error."""
+    if isinstance(extra, str):
+        try:
+            extra = json.loads(extra)
+        except ValueError:
+            return None
+    if not isinstance(extra, dict):
+        return None
+    vt = extra.get("validationType")
+    if isinstance(vt, bool) or not isinstance(vt, int) or not 0 <= vt <= 255:
+        return None
+    return vt
+
+
 class HubStore:
     """The hub's SQLite spine. Thread-safe via a single guarding lock."""
 
@@ -2302,10 +2327,14 @@ class HubStore:
                     # recurring number can only belong to a fresh ticket ->
                     # RE-ISSUE the row to it so the paper in hand is redeemable
                     # for ITS real amount. Loud + audited.
-                    note = json.dumps(
-                        {"reissuedFrom": prior_state,
-                         "priorAmountMc": stored_amt, "reissuedAt": now},
-                        separators=(",", ":"))
+                    note = {"reissuedFrom": prior_state,
+                            "priorAmountMc": stored_amt, "reissuedAt": now}
+                    # the NEW paper's kind rides the same note, so a
+                    # restricted promotional ticket keeps its flag when its
+                    # number is one a spent ticket had before
+                    if _validation_type_of(extra) is not None:
+                        note["validationType"] = _validation_type_of(extra)
+                    note = json.dumps(note, separators=(",", ":"))
                     c.execute(
                         "UPDATE tito_tickets SET state='issued', amount_mc=?, "
                         "ticket_number=?, issued_at=?, minted_at=?, "
@@ -2944,6 +2973,13 @@ class HubStore:
             # v15 operator controls — the UI feature-detects on "reusable"
             "reusable": bool(r["reusable"]), "uses": int(r["uses"] or 0),
             "operatorAt": r["operator_at"],
+            # What the MACHINE said the ticket is (SAS 6.02 Table 15.13c),
+            # when a satellite captured it: None for a ticket the hub was
+            # never told the kind of. restrictedPromo is the flag the
+            # ticket pages show.
+            "validationType": _validation_type_of(r["extra_json"]),
+            "restrictedPromo": _validation_type_of(r["extra_json"])
+            in RESTRICTED_PROMO_TYPES,
         } for r in rows]}
 
     def close(self):

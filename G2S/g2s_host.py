@@ -24229,11 +24229,17 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
             issued_at = req.get("issuedAt")
             issued_at = issued_at.strip()[:32] \
                 if isinstance(issued_at, str) else None
+            # What the machine said the ticket IS (SAS 6.02 Table 15.13c),
+            # from a satellite that reads it. Kept with the row so the
+            # ticket pages can flag a restricted promotional ticket.
+            vt = req.get("validationType")
+            vt = {"validationType": vt} if isinstance(vt, int) \
+                and not isinstance(vt, bool) and 0 <= vt <= 255 else None
             try:
                 r = engine.hub_store.tito_record_issued(
                     vn, cents * 1000, f"sas:{smib}", address,
                     ticket_number=tno, source=src or "egm",
-                    issued_at=issued_at)
+                    issued_at=issued_at, extra=vt)
             except ValueError as e:
                 return fail(400, str(e))
             except Exception as e:  # noqa: BLE001

@@ -323,6 +323,71 @@ def operator_controls():
     hs.close()
 
 
+def restricted_promo_flag():
+    """A satellite reports what the machine said a ticket is (SAS 6.02
+    Table 15.13c). 01 and 03 are restricted promotional tickets: flagged in
+    the list, redeemable like any other (2026-11-16)."""
+    print("— restricted promotional tickets are flagged, not refused")
+    hs, _d = fresh()
+
+    def row(c):
+        return hs.tito_list(vid=c)["tickets"][0]
+
+    cash = hs.tito_record_issued("0189157427998805", 942_500_000,
+                                 "sas:smib-a", 1,
+                                 extra={"validationType": 0})["canonical"]
+    promo = hs.tito_record_issued("0189157427998806", 5_000_000,
+                                  "sas:smib-a", 1,
+                                  extra={"validationType": 1})["canonical"]
+    aft = hs.tito_record_issued("0189157427998807", 5_000_000,
+                                "sas:smib-a", 1,
+                                extra={"validationType": 3})["canonical"]
+    plain = hs.tito_record_issued("0189157427998808", 5_000_000,
+                                  "sas:smib-a", 1)["canonical"]
+    check("a cash ticket is not flagged",
+          row(cash)["restrictedPromo"] is False
+          and row(cash)["validationType"] == 0, row(cash))
+    check("a restricted promotional ticket is flagged",
+          row(promo)["restrictedPromo"] is True
+          and row(promo)["validationType"] == 1, row(promo))
+    check("...and so is a restricted ticket from an AFT transfer",
+          row(aft)["restrictedPromo"] is True, row(aft))
+    check("a ticket whose kind the hub was never told is not flagged",
+          row(plain)["restrictedPromo"] is False
+          and row(plain)["validationType"] is None, row(plain))
+    a = hs.tito_authorize("IGT_AVP", "txnP", promo)
+    check("a flagged ticket still redeems, for its amount",
+          a["authorized"] and a["amountMc"] == 5_000_000, a)
+    hs.tito_close("IGT_AVP", "txnP", promo, True)
+    check("...and keeps its flag once redeemed",
+          row(promo)["state"] == "redeemed"
+          and row(promo)["restrictedPromo"] is True, row(promo))
+
+    # a minted number (system validation) that prints as restricted
+    m = hs.tito_mint("sas:smib-a", 1, 7_000_000)
+    r = hs.tito_record_issued(m["validationNumber"], 7_000_000, "sas:smib-a",
+                              1, extra={"validationType": 1})
+    check("a minted number that prints as restricted is flagged",
+          row(r["canonical"])["restrictedPromo"] is True, row(r["canonical"]))
+
+    # the number of a spent ticket comes round again on new paper
+    again = hs.tito_record_issued("0189157427998806", 6_000_000, "sas:smib-a",
+                                  1, extra={"validationType": 0})
+    check("a re-issued number takes the NEW paper's kind",
+          again.get("collision") == "reissued"
+          and row(promo)["restrictedPromo"] is False
+          and row(promo)["validationType"] == 0, (again, row(promo)))
+
+    for junk in ({"validationType": True}, {"validationType": 999},
+                 {"validationType": "1"}, {"other": 1}):
+        c = hs.tito_record_issued(
+            "02" + str(abs(hash(str(junk))) % 10 ** 14).zfill(14), 1_000_000,
+            "sas:smib-a", 1, extra=junk)["canonical"]
+        check(f"junk kind {junk!r} is no kind at all",
+              row(c)["restrictedPromo"] is False
+              and row(c)["validationType"] is None, row(c))
+
+
 def main():
     hs, d = fresh()
 
@@ -701,7 +766,8 @@ def main():
     want_keys = {"canonical", "vn16", "state", "amountMc", "origin",
                  "address", "ticketNumber", "mintedAt", "issuedAt",
                  "redeemedAt", "redeemedBy", "pending",
-                 "reusable", "uses", "operatorAt"}
+                 "reusable", "uses", "operatorAt",
+                 "validationType", "restrictedPromo"}
     check("row keys match the contract exactly",
           all(set(t) == want_keys for t in r["tickets"]),
           [sorted(t) for t in r["tickets"][:1]])
@@ -883,6 +949,7 @@ def main():
     hs.close()
 
     operator_controls()
+    restricted_promo_flag()
 
     print("=" * 50)
     print(f"RESULT: {_p} passed, {_f} failed")

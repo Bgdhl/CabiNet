@@ -119,6 +119,27 @@ def test_record_issued_records_locally_and_pushes(hub, local, tmp_path):
     assert sent["ticketNumber"] == 2
 
 
+def test_record_issued_tells_the_hub_what_kind_of_ticket_it_is(
+        hub, local, tmp_path):
+    """The kind the machine gave the ticket (SAS 6.02 Table 15.13c) goes
+    up with it, so the hub can flag a restricted promotional ticket
+    (2026-11-16). A capture with no kind sends no such key."""
+    c = make_client(hub.url, local, tmp_path)
+    c.record_issued("0100000000000042", 25, 1, source="egm_4D",
+                    extra={"validationType": 1})
+    assert hub.last("issued")["validationType"] == 1
+    assert local.get("0100000000000042")["extra"] == {"validationType": 1}
+    c.record_issued("0100000000000043", 25, 1, source="egm_3D")
+    assert "validationType" not in hub.last("issued")
+
+
+def test_the_kind_survives_a_hub_outage_in_the_journal(local, tmp_path):
+    c = make_client(DEAD, local, tmp_path)
+    c.record_issued("0100000000000042", 25, 1, extra={"validationType": 3})
+    with c._jlock:
+        assert [p.get("validationType") for p in c._issued] == [3]
+
+
 def test_hub_reissue_verdict_mirrors_locally(hub, local, tmp_path):
     # COLLISION containment e2e (2026-07-12): the local mirror holds the vn
     # as a still-'issued' old ticket (it never learns the hub redeemed it at
