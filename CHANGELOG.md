@@ -1,5 +1,49 @@
 # Changelog
 
+## v0.3.14
+Fifth batch from the SAS audit: the machine's own CASH OUT button to a
+wallet, on SAS machines.
+There are two ways credits leave a SAS machine for a wallet. The hub can
+pull them (CASH OUT TO WALLET on the player screen); that is unchanged. Or
+the machine's CASH OUT button can send them, which depends on the
+machine's "cashout to host" option. This release is about the second.
+- **Set the machine's cashout to host option to HOST CONTROLLED.** The
+  docs used to say "soft cash-out to host". Host controlled leaves the
+  on/off to the hub: the button prints a ticket until a carded player
+  switches it to their wallet, and prints a ticket again when they switch
+  it back or card out. `SAS/BENCH_AFT_CASHOUT.md` is rewritten around it.
+- **The SMIB player screen can switch the button.** The CASH OUT page has
+  a new switch, MACHINE CASH OUT BUTTON: TO WALLET ON / OFF, under the
+  existing CASH OUT TO WALLET button (which still sends the credits at
+  once). The digital glass already had the switch.
+- **Arming looks at the right setting.** The hub decided whether a
+  machine's button could go to the wallet from a bit that only says the
+  hub could pull credits. A machine with cashout to host off was armed,
+  the page said cash-out goes to the wallet, and the button printed a
+  ticket. The hub now reads the machine's host cashout status (shown in
+  the Machines status as `sasHostCashout`), the satellite switches the
+  option on and off on a host controlled machine, and where it is off and
+  set at the machine the switch is refused with the reason.
+- **Every cash-out request from a machine is answered.** On a machine set
+  to on (soft or hard) each press asks the hub first and waits up to
+  eight seconds. When nobody was armed the satellite said nothing, so the
+  player stood through the eight seconds, and a machine in hard mode
+  tilted. The satellite now declines at once and the ticket prints.
+- **A win the machine wants to send to the host is taken as a win.** It
+  was answered as if it were the cash-out button, which a machine has to
+  refuse.
+- **A refusal from the hub is shown in its own words** on the SMIB player
+  screen and the digital glass. Both pages read the hub's answer only when
+  it was a yes, so every refusal came out as "try again".
+- The refusal for a pull no longer tells the owner to turn on "soft
+  cash-out to host". A pull does not need it.
+- **A refused AFT registration says why.** It was always reported as
+  "possibly awaiting operator acknowledgment at the machine". A machine
+  cannot ask for that by itself. The usual cause is the asset number not
+  matching the one set at the machine, and the message says so.
+- None of the button path has been on a real machine yet; the tests run
+  against a pretend machine that follows the document.
+
 ## v0.3.13
 Fourth batch from the SAS audit: the link rules. This changes the rhythm
 on the wire for every SAS machine. A WMS Bluebird 2 took the old rhythm

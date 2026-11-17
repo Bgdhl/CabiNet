@@ -9837,30 +9837,38 @@ def main():
           "test)",
           st_ln == 200 and _pj(ln).get("sasLink") == "cosmib/1",
           f"got {st_ln}/{ln[:160]}")
-    # (ii) gate self-determines NOT-ready (the leg reports no from-EGM bit):
-    # arming refuses HONESTLY, verbatim — never a fake ON.
+    # (ii) the gate reads the machine's HOST CASHOUT STATUS byte (SAS 6.02
+    # Table 8.2b), not "available transfers" bit 1 (v0.3.14, audit item 6).
+    # The leg reports that a transfer from it is possible but its host
+    # cashout is OFF and not the host's to switch: arming refuses HONESTLY,
+    # verbatim — never a fake ON.
+    raw_post("/api/sas/report", json.dumps(
+        {"smibId": "cosmib", "address": "1", "port": "/dev/ttyAMA0",
+         "online": True, "polls": 1,
+         "aft": {"registered": True, "availXfers": 0x02, "aftStatus": 0x98,
+                 "hostCashoutStatus": 0x00}}))
     st_g0, dg0 = glass_act(gp_tok, {"action": "cashOutToWallet",
                                     "enable": True})
-    check("cashOutToWallet on the SAS leg, gate self-determines NOT-ready "
-          "(machine not reporting from-EGM): 400 with the honest 'operator "
-          "menu' refusal, cashOutToWat false, path=sas",
+    check("cashOutToWallet on the SAS leg, host cashout OFF at the machine "
+          "(though it reports from-EGM transfers possible): 400 with the "
+          "honest 'operator menu' refusal, cashOutToWat false, path=sas",
           st_g0 == 400 and dg0.get("ok") is False
           and dg0.get("cashOutToWat") is False
           and "operator menu" in str(dg0.get("error", "")),
           f"got {st_g0}/{json.dumps(dg0)[:220]}")
-    # (iii) the MACHINE now reports from-EGM cash-out on its 0x74 (availXfers
-    # bit 0x02 = AVAIL_XFER_FROM_EGM — its operator menu was set to "soft
-    # cash-out to host"): the gate self-determines READY, arming lands (SAS
-    # enqueue). No manual Settings flip — the wire decides.
+    # (iii) the MACHINE now reports host cashout ENABLED (status bit 1 — its
+    # operator menu was set to cash out to the host): the gate reads READY,
+    # arming lands (SAS enqueue). No manual Settings flip — the wire decides.
     raw_post("/api/sas/report", json.dumps(
         {"smibId": "cosmib", "address": "1", "port": "/dev/ttyAMA0",
          "online": True, "polls": 2,
-         "aft": {"registered": True, "availXfers": 0x02, "aftStatus": 0x98}}))
+         "aft": {"registered": True, "availXfers": 0x02, "aftStatus": 0x98,
+                 "hostCashoutStatus": 0x02}}))
     st_g1, dg1 = glass_act(gp_tok, {"action": "cashOutToWallet",
                                     "enable": True})
     check("cashOutToWallet on the SAS leg, gate READY (machine reports "
-          "from-EGM): 200 path=sas, cashOutToWat true (arm enqueued to the "
-          "satellite — no host post)",
+          "host cashout enabled): 200 path=sas, cashOutToWat true (arm "
+          "enqueued to the satellite — no host post)",
           st_g1 == 200 and dg1.get("ok") is True
           and dg1.get("path") == "sas" and dg1.get("cashOutToWat") is True,
           f"got {st_g1}/{json.dumps(dg1)[:220]}")

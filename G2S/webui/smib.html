@@ -78,9 +78,10 @@
          BACK 492..576                                               OK
        cashout: left col mc-l y=140, mc-v y=162(lh42)->204, wl-l y=250,
          wl-v y=272->314, note y=372(lh21 x2)->414;
-         mid col (416) sec2 y=140, toggle y=168..252,
-         hint y=272 (w584, lh19 x2)->310; funding moved to MY WALLET,
-         BACK 492..576                                               OK
+         mid col (416) sec2 y=140, "now" button y=168..252,
+         hint y=272 (w584, lh19 x2)->310; sec3 y=330, the CASH OUT button
+         switch y=358..442, its hint y=454 (w280, up to 5 lines ->549);
+         funding moved to MY WALLET, BACK 492..576                   OK
        machine: 2 label columns (x=32 w320 / x=384 w304), 3 blocks each
          at y=110/182/254 (block = 13px label + 20px value, 72 pitch)
          -> last value ends ~298                                     OK
@@ -332,6 +333,13 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
 #co-toggle { font-size: 17px; letter-spacing: 1px; }
 #co-toggle-hint { position: absolute; left: 416px; top: 272px; width: 584px;
                   font-size: 14px; line-height: 19px; color: #55708a; }
+/* THE MACHINE'S OWN CASH OUT BUTTON: an ON/OFF switch under the "now"
+   button. sec3 y=330, switch y=358..442, hint y=454 (280 wide, so even a
+   five-line refusal from the hub ends ~y=550 and stays left of BACK). */
+#co-sec3 { left: 416px; top: 330px; }
+#co-arm { font-size: 17px; letter-spacing: 1px; }
+#co-arm-hint { position: absolute; left: 416px; top: 454px; width: 280px;
+               font-size: 14px; line-height: 19px; color: #55708a; }
 
 /* --- shared compact list rows (tickets / handpay) ------------------------ */
 .listbox { position: absolute; left: 32px; width: 656px; overflow: hidden; }
@@ -505,7 +513,13 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
                                       line-height: 36px; }
   #co-note { top: 282px; }
   #co-sec2 { top: 96px; }
-  #co-toggle-hint { top: 224px; }
+  #co-toggle-slot { top: 120px !important; }
+  #co-toggle-hint { top: 196px; width: 280px; }
+  /* the switch takes the third column: sec y=96, switch y=120..184,
+     hint y=196 (520 wide), BACK y=300 below it */
+  #co-sec3 { left: 720px; top: 96px; }
+  #co-arm-slot { left: 720px !important; top: 120px !important; }
+  #co-arm-hint { left: 720px; top: 196px; width: 520px; }
 
   /* --- machine info ----------------------------------------------------- */
   #mi-c1, #mi-c2 { top: 68px; }
@@ -651,12 +665,15 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   <div class="cf-note" id="lo-note"></div>
 </div>
 
-<!-- CASH OUT: live machine + wallet balances (left) and the cash-out
-     DESTINATION toggle (mid): OFF = the machine's CASH OUT button prints a
-     ticket (the default); ON = it sends credits to your wallet (cashOutToWallet
-     - the same arm surfaced in MY WALLET). Funding moved to MY WALLET. Greys
-     with a "link a card" note when the fob has no wallet. Polls its data view
-     ~2s while open. -->
+<!-- CASH OUT: live machine + wallet balances (left) and two controls (mid).
+     CASH OUT NOW pulls the machine's credits to your wallet at once
+     (cashOutNow). MACHINE CASH OUT BUTTON is an ON/OFF switch for where the
+     cabinet's own button sends them (cashOutToWallet): OFF = it prints a
+     ticket, ON = it sends them to your wallet, until you switch it off or
+     card out. The switch needs the machine's "cashout to host" option set
+     to host controlled; on any other machine the hub says why not. Greys
+     with a "link a card" note when the fob has no wallet. Polls its data
+     view ~2s while open. -->
 <div class="view" id="v-cashout">
   <div class="vt">CASH OUT</div>
   <div class="co-l" id="co-mc-l">MACHINE CREDITS</div>
@@ -664,10 +681,14 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   <div class="co-l" id="co-wl-l">MY WALLET</div>
   <div class="co-v" id="co-wl-v">&#8212;</div>
   <div id="co-note"></div>
-  <div class="co-sec" id="co-sec2">CASH OUT DESTINATION</div>
-  <div class="btnslot" style="left:416px; top:168px;">
-    <div class="nb" id="co-toggle">TO WALLET&nbsp;&nbsp;OFF</div></div>
+  <div class="co-sec" id="co-sec2">CASH OUT NOW</div>
+  <div class="btnslot" id="co-toggle-slot" style="left:416px; top:168px;">
+    <div class="nb" id="co-toggle">CASH OUT TO WALLET</div></div>
   <div id="co-toggle-hint"></div>
+  <div class="co-sec" id="co-sec3">MACHINE CASH OUT BUTTON</div>
+  <div class="btnslot" id="co-arm-slot" style="left:416px; top:358px;">
+    <div class="nb" id="co-arm">TO WALLET&nbsp;&nbsp;OFF</div></div>
+  <div id="co-arm-hint"></div>
   <div class="backslot"><div class="nb" id="co-back">BACK</div></div>
 </div>
 
@@ -825,6 +846,8 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   var coCanFund = false;             // funding allowed (linked + path available)
   var coHasWallet = false;           // a wallet exists at all (gates the toggle)
   var coCashToWat = false;           // current cash-out-to-wallet arm state
+  var coArmBusy = false;             // a switch tap is waiting on the hub
+  var coArmMsg = '';                 // the hub's last refusal, kept on screen
   var hpCanClear = false;            // handpay CLEAR gate (from the data view)
 
   function $(id) { return document.getElementById(id); }
@@ -883,10 +906,14 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
       if (x.readyState !== 4 || done) { return; }
       done = true;
       window.clearTimeout(dog);
+      // Parse the body whatever the status. The hub answers a refusal
+      // with a 4xx AND a JSON body whose "error" is the reason in plain
+      // words; until 2026-11-17 only a 200 was parsed, so that reason was
+      // thrown away and every refusal read as a generic "try again".
+      // Callers still take success from status 200 alone.
       var data = null;
-      if (x.status === 200) {
-        try { data = JSON.parse(x.responseText); } catch (e2) { data = null; }
-      }
+      try { data = JSON.parse(x.responseText); } catch (e2) { data = null; }
+      if (data === null || typeof data !== 'object') { data = null; }
       cb(x.status, data);
     };
     x.open(method, url, true);
@@ -1257,6 +1284,22 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     setText('co-note', coHasWallet ? ''
       : 'Link a card to send your cash-out to your wallet.');
     setToggleFace();
+    setArmFace();
+  }
+  // The switch for the cabinet's own CASH OUT button (2026-11-17). The
+  // hub's words are shown as they come: when the machine cannot do it the
+  // refusal stays on screen until the next tap, not just until the next
+  // 2 s repaint.
+  function setArmFace() {
+    if (coArmBusy) { return; }
+    var on = coHasWallet && coCashToWat;
+    setText('co-arm', 'TO WALLET\u00a0\u00a0' + (on ? 'ON' : 'OFF'));
+    $('co-arm').className = 'nb'
+      + (!coHasWallet ? ' nb-off' : on ? ' nb-gold' : '');
+    setText('co-arm-hint', !coHasWallet ? '' : coArmMsg ? coArmMsg
+      : on ? 'The CASH OUT button on this machine sends your credits to '
+             + 'your wallet.'
+           : 'The CASH OUT button on this machine prints a ticket.');
   }
   function setToggleFace() {
     // HOST-CONTROL cash-out: a one-shot action button (not an arm toggle) —
@@ -1281,7 +1324,9 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     setMoney('co-mc-v', '—'); setMoney('co-wl-v', '—');
     setText('co-note', '');
     coCanFund = false; coHasWallet = false; coCashToWat = false;
+    coArmBusy = false; coArmMsg = '';
     setToggleFace();
+    setArmFace();
   }
   function openCashout() {
     resetCashout();
@@ -1676,8 +1721,9 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   $('hb-games').onclick    = openGames;
   $('hb-settings').onclick = openSettings;
 
-  // CASH OUT: the toggle sets the machine's cash-out destination (OFF prints a
-  // ticket, ON mirrors credits to the wallet). Funding moved to MY WALLET.
+  // CASH OUT: two controls. co-toggle sends the credits now; co-arm (below)
+  // switches where the cabinet's own button sends them. Funding is in MY
+  // WALLET.
   $('co-toggle').onclick = function () {
     // HOST-CONTROL cash-out: pull the machine's credits to the wallet NOW via
     // a money-confirm (cashOutNow). No arm/wait, no physical button.
@@ -1685,6 +1731,25 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     askConfirm('CASH OUT TO WALLET?',
       'Sends the ' + fmtMc(coMachineMc) + ' on this machine to your wallet.',
       { action: 'cashOutNow' }, 'cashout');
+  };
+  $('co-arm').onclick = function () {
+    // The switch moves no money. It tells the hub where this machine's own
+    // CASH OUT button should send the credits (cashOutToWallet). Never a
+    // fake ON: the face only changes on the hub's yes.
+    if (!coHasWallet || coArmBusy) { return; }
+    coArmBusy = true; coArmMsg = '';
+    setText('co-arm-hint', 'updating\u2026');
+    postAction({ action: 'cashOutToWallet', enable: !coCashToWat },
+      function (status, data) {
+        coArmBusy = false;
+        if (status === 200 && data && data.ok !== false) {
+          coCashToWat = !coCashToWat;
+        } else {
+          coArmMsg = (data && data.error) ? String(data.error)
+            : 'Could not update. Try again.';
+        }
+        setArmFace();
+      });
   };
   $('co-back').onclick = function () { show(home()); };
 

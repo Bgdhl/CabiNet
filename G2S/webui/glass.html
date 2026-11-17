@@ -1008,10 +1008,14 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
       if (x.readyState !== 4 || done) { return; }
       done = true;
       window.clearTimeout(dog);
+      // Parse the body whatever the status. The hub answers a refusal
+      // with a 4xx AND a JSON body whose "error" is the reason in plain
+      // words; until 2026-11-17 only a 200 was parsed, so that reason was
+      // thrown away and every refusal read as a generic "try again".
+      // Callers still take success from status 200 alone.
       var data = null;
-      if (x.status === 200) {
-        try { data = JSON.parse(x.responseText); } catch (e2) { data = null; }
-      }
+      try { data = JSON.parse(x.responseText); } catch (e2) { data = null; }
+      if (data === null || typeof data !== 'object') { data = null; }
       cb(x.status, data);
     };
     x.open(method, url, true);

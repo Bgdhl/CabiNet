@@ -328,11 +328,47 @@ class ByTheBookAFTMachine(ByTheBookMachine):
 
     The transfer stays PENDING until the test calls complete(), or until
     `complete_after` general polls have come in after a declined cancel —
-    which is exactly when our host has given up on it."""
+    which is exactly when our host has given up on it.
+
+    Host cashout, §8.7 (audit batch 5). The host cashout status byte of the
+    0x74 answer (and the flags byte of every 0x72 answer) says whether the
+    host may control the enable (`cashout_controllable`), whether cashout
+    to host is enabled now (`cashout_enabled`) and whether the mode is hard
+    (`cashout_hard`). While enabled:
+      * press_cashout() makes a cashout from the credit meter pending and
+        raises exception 6A; win(amount) makes a win pending and raises 6B.
+        Both are priority exceptions, raised again every 800 ms
+        (eight_hundred_ms_pass) for as long as the cashout is pending.
+      * the host answers with a 0x72 of the matching type (80 for 6A, 90
+        for 6B). Amounts of all 9s take the whole cashout; amounts of zero
+        tell the machine to cash out by other means, which it does at once
+        (a ticket, or the win paid to the credit meter).
+      * any other kind of transfer meanwhile is answered 87 and the
+        pending cashout is not aborted.
+      * with no answer in eight seconds (eight_seconds_pass) the machine
+        runs its failure recovery: soft mode cashes out the other way,
+        hard mode tilts and waits for an attendant.
+    While NOT enabled, press_cashout() prints a ticket straight away and no
+    6A is ever raised.
+    A successful transfer whose flags have bit 0 set changes the enable to
+    bit 1 and the mode to bit 2, if the machine lets the host control it.
+    A transfer with a total of zero is accepted for that purpose alone."""
 
     def __init__(self, credits=0, honours_cancel=False, complete_after=None,
-                 hears_initiate=True, restricted=0, complete_in=None, **kw):
+                 hears_initiate=True, restricted=0, complete_in=None,
+                 cashout_controllable=False, cashout_enabled=False,
+                 cashout_hard=False, **kw):
         super().__init__(**kw)
+        self.cashout_controllable = cashout_controllable
+        self.cashout_enabled = cashout_enabled
+        self.cashout_hard = cashout_hard
+        self.cashout_pending = None  # {"kind": "credits"|"win", "amount"}
+        self.ticketed = []           # amounts cashed out to a ticket
+        self.wins_to_meter = []      # wins paid to the credit meter instead
+        self.tilted = False          # hard mode: cashout-to-host failure
+        self.declined = 0            # zero-amount answers to 6A/6B
+        self.refused_87 = 0          # other transfers tried meanwhile
+        self._6x_due = False
         self.asset = bytes([0x92, 0x10, 0x00, 0x00])
         self.key = bytes(range(20))
         self.pos = b"\x01\x00\x00\x00"
@@ -361,16 +397,79 @@ class ByTheBookAFTMachine(ByTheBookMachine):
         c = self.cycle
         if c is None or c["status"] != 0x40:
             return
-        sign = -1 if c["type"] == 0x80 else 1       # 80: machine -> host
-        self.credits += sign * c["cents"]
-        self.restricted += sign * c.get("restricted", 0)
+        if c["type"] == 0x90:
+            pass                                    # a win: never on the meter
+        else:
+            sign = -1 if c["type"] == 0x80 else 1   # 80: machine -> host
+            self.credits += sign * c["cents"]
+            self.restricted += sign * c.get("restricted", 0)
+        if c.get("answers") is not None:            # it answered a 6A/6B
+            self.cashout_pending = None
+            self._6x_due = False
+            self.tilted = False
+        self._apply_enable(c.get("flags", 0))
         c["status"] = 0x00
         self._69_due = True
+
+    def _apply_enable(self, flags):
+        """§8.7: the requested enable takes effect "only when a transfer has
+        successfully completed", and the machine may override it."""
+        if flags & 0x01 and self.cashout_controllable:
+            self.cashout_enabled = bool(flags & 0x02)
+            self.cashout_hard = bool(flags & 0x04)
 
     def fifteen_seconds_pass(self):
         super().fifteen_seconds_pass()
         if self.cycle is not None and self.cycle["status"] != 0x40:
             self._69_due = True
+
+    # -- host cashout (§8.7) --------------------------------------------------
+
+    def host_cashout_status(self):
+        return ((0x01 if self.cashout_controllable else 0)
+                | (0x02 if self.cashout_enabled else 0)
+                | (0x04 if self.cashout_enabled and self.cashout_hard else 0))
+
+    def press_cashout(self):
+        """The player presses CASH OUT with credits on the meter."""
+        if self.credits + self.restricted <= 0:
+            return
+        if self.cashout_enabled:
+            self.cashout_pending = {"kind": "credits"}
+            self._6x_due = True
+        else:
+            self._other_means({"kind": "credits"})
+
+    def win(self, amount):
+        """A win that has to be cashed out rather than paid to the meter."""
+        if self.cashout_enabled:
+            self.cashout_pending = {"kind": "win", "amount": amount}
+            self._6x_due = True
+        else:
+            self._other_means({"kind": "win", "amount": amount})
+
+    def eight_hundred_ms_pass(self):
+        if self.cashout_pending is not None and self.cycle is None:
+            self._6x_due = True
+
+    def eight_seconds_pass(self):
+        """No transfer and no decline from the host: failure recovery."""
+        if self.cashout_pending is None or self.cycle is not None:
+            return
+        if self.cashout_hard:
+            self.tilted = True               # waits for an attendant
+        else:
+            self._other_means(self.cashout_pending)
+
+    def _other_means(self, pending):
+        if pending["kind"] == "credits":
+            self.ticketed.append(self.credits + self.restricted)
+            self.credits = self.restricted = 0
+        else:
+            self.wins_to_meter.append(pending["amount"])
+            self.credits += pending["amount"]
+        self.cashout_pending = None
+        self._6x_due = False
 
     def _close_cycle(self):
         self.last, self.cycle = self.cycle, None
@@ -390,6 +489,12 @@ class ByTheBookAFTMachine(ByTheBookMachine):
                 self._69_due = False
             self._on_ack = delivered
             return b"\x69"
+        if self._6x_due and self.cashout_pending is not None:
+            def asked():
+                self._6x_due = False         # until the 800 ms timer
+            self._on_ack = asked
+            return (b"\x6a" if self.cashout_pending["kind"] == "credits"
+                    else b"\x6b")
         return super()._general()
 
     def _framed(self, command, body):
@@ -418,8 +523,11 @@ class ByTheBookAFTMachine(ByTheBookMachine):
         elif code == 0x80:                          # cancel
             self.locked = False
         status = 0x00 if self.locked else 0xFF
+        avail = 0x03 | (0x08 if self.cashout_pending is not None
+                        and self.cashout_pending["kind"] == "win" else 0)
         return self._framed(0x74, self.asset
-                            + bytes([status, 0x03, 0x00, 0xFF, 0x0A])
+                            + bytes([status, avail,
+                                     self.host_cashout_status(), 0xFF, 0x0A])
                             + int_to_bcd(self.credits, 5)
                             + int_to_bcd(self.restricted, 5) + bytes(5)
                             + int_to_bcd(1000000, 5))
@@ -431,7 +539,7 @@ class ByTheBookAFTMachine(ByTheBookMachine):
                             + int_to_bcd(t["cents"] if live else 0, 5)
                             + int_to_bcd(t.get("restricted", 0)
                                          if live else 0, 5)
-                            + bytes(5) + bytes([0x00])
+                            + bytes(5) + bytes([self.host_cashout_status()])
                             + self.asset + bytes([len(txn)]) + txn)
 
     def _report(self, t):
@@ -465,10 +573,56 @@ class ByTheBookAFTMachine(ByTheBookMachine):
             self.refused_while_open += 1
             return self._framed(0x72, bytes([0x00, 0xC0]))
         txn_len = d[43]
+        ALL = 9999999999
+        cash, restr, nonr = (int(d[3:8].hex()), int(d[8:13].hex()),
+                             int(d[13:18].hex()))
         self.cycle = {"txn": d[44:44 + txn_len].decode("ascii"),
-                      "type": d[2], "cents": int(d[3:8].hex()),
-                      "restricted": int(d[8:13].hex()), "status": 0x40}
+                      "type": d[2], "cents": cash, "restricted": restr,
+                      "status": 0x40, "flags": d[18]}
         self.started.append(self.cycle["txn"])
+        pending = self.cashout_pending
+        if pending is not None:
+            wanted = 0x80 if pending["kind"] == "credits" else 0x90
+            if d[2] != wanted:
+                # §8.7: "the gaming machine will respond with status code
+                # 87 ... This must not cause the cashout in progress to be
+                # aborted."
+                self.refused_87 += 1
+                return self._final(0x87)
+            if cash + restr + nonr == 0:
+                self.declined += 1           # cash out by other means
+                self._other_means(pending)
+                self.tilted = False
+                return self._final(0x00)
+            if pending["kind"] == "credits":
+                take_c = self.credits if cash == ALL else cash
+                take_r = self.restricted if restr == ALL else restr
+                if take_c > self.credits or take_r > self.restricted:
+                    return self._final(0x84)
+            else:
+                take_c = pending["amount"] if cash == ALL else cash
+                take_r = 0
+                if take_c > pending["amount"]:
+                    return self._final(0x84)
+            self.cycle.update(cents=take_c, restricted=take_r,
+                              answers=pending["kind"])
+        elif d[2] == 0x90:
+            return self._final(0x8B)         # no won credits available
+        elif cash + restr + nonr == 0:
+            # §8.7: a transfer "for the sole purpose of setting the Host
+            # Cashout Enable state"
+            self._apply_enable(d[18])
+            return self._final(0x00)
+        elif ALL in (cash, restr, nonr):
+            return self._final(0x83)         # not a valid amount
         if self.complete_in is not None:
             self._countdown = self.complete_in
         return self._status(self.cycle)
+
+    def _final(self, status):
+        """The transfer just asked for ends at once with this status."""
+        c = self.cycle
+        c["status"] = status
+        if status != 0x00:
+            c["cents"] = c["restricted"] = 0
+        return self._report(c)
