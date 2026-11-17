@@ -5204,16 +5204,16 @@ function renderSettings(){
           address line left blank prints <em>empty</em> rather than leaving the
           machine's factory placeholder showing.</p>`:""}
         <div class="tkf"><label for="st-ticket-name">Casino name</label>
-          <input type="text" id="st-ticket-name" maxlength="64"
+          <input type="text" id="st-ticket-name" maxlength="40"
             value="${esc(tv("propName"))}" placeholder="YOUR ESTABLISHMENT"></div>
         <div class="tkf"><label for="st-ticket-line1">Address line 1</label>
-          <input type="text" id="st-ticket-line1" maxlength="64"
+          <input type="text" id="st-ticket-line1" maxlength="40"
             value="${esc(tv("line1"))}" placeholder="address / tagline line 1"></div>
         <div class="tkf"><label for="st-ticket-line2">Address line 2</label>
-          <input type="text" id="st-ticket-line2" maxlength="64"
+          <input type="text" id="st-ticket-line2" maxlength="40"
             value="${esc(tv("line2"))}" placeholder="address / tagline line 2"></div>
         <div class="tkf"><label for="st-ticket-title">Cash ticket title (where supported)</label>
-          <input type="text" id="st-ticket-title" maxlength="64"
+          <input type="text" id="st-ticket-title" maxlength="16"
             value="${esc(tv("titleCash"))}" placeholder="CASHOUT VOUCHER"></div>
         <div class="tkf"><label for="st-ticket-expire">Expiration (days &middot; 0 = never)</label>
           <input type="number" id="st-ticket-expire" min="0" max="255" step="1"

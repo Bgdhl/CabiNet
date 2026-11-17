@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.3.22
+Fifth batch from the G2S audit: the rest of the ticket items. Seven
+items.
+- **Ticket printing is not left switched off.** When a machine holds
+  ticket numbers the hub did not issue, the hub switches its ticket
+  printing off and on again so that it asks for new ones. If the "on"
+  was lost, printing stayed off, and on some machines the whole machine
+  with it, until someone sent the command by hand. The hub now keeps a
+  note on disk from the "off" until it has seen the machine say "on",
+  and until then asks the machine and sends the "on" again. A hub
+  restart between the two no longer loses it.
+- **Ticket header text has the room a ticket has.** The name and each
+  address line take 40 characters and the title 16, on both protocols.
+  The hub accepted 64 for each; a longer line made a strict G2S machine
+  refuse the whole header. Settings now holds each field to its limit,
+  and a header saved under the old limit is sent as far as it fits.
+- **"Never expires" is not sent to a G2S machine as 0 days.** The
+  setting is a number of days and 0 means, read as written, "expires
+  the day it is printed". For "never" the hub sets the most days the
+  machine says it allows; where the machine has not said, its own
+  setting is left as it is. A number of days is sent as before.
+- **A ticket's own expiry date is used only when the machine says it
+  applies.** A machine can print a date on a ticket record that means
+  nothing unless a second flag is set; the hub enforced it regardless.
+- **A ticket refused because the hub's ledger could not be read is
+  reported to the machine as "denied"**, not as "ticket not found".
+- **A failed print is not shown as printed**, and a good print reported
+  in the short form is not shown as failed.
+- A ticket log entry the machine has not finished with is no longer
+  copied into the hub's history beside the ticket's own record.
+
 ## v0.3.21
 Fourth batch from the G2S audit: meters and game play. Eight items.
 - **The credit on a machine is all three kinds of credit.** A machine

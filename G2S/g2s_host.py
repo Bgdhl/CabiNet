@@ -73,7 +73,7 @@ WINDOWS_UPDATES_UNSUPPORTED = (
     "checkout with git and restart the hub (deploy/WINDOWS_HUB.md).")
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hub_store import HubStore, MAX_TICKET_FIELD_LEN   # noqa: E402  (sibling module, stdlib sqlite3)
+from hub_store import HubStore, TICKET_FIELD_MAX   # noqa: E402  (sibling module, stdlib sqlite3)
 # The piTail canonicalizer lives with the table that owns the column (hub.db
 # v14 `devices.device_tail`), the same way _norm_fob_uid does below: the tail
 # on the wire and the tail in the table have to be ONE string, or a board
@@ -125,7 +125,7 @@ if "tournament_names" not in _hub_store_mod.HOST_SETTING_KEYS:
 # the MINOR bump per the repo's version rule). Surfaced in engine_meta() ->
 # /api/status ["_engine"]["version"]; bump this and add a CHANGELOG.md
 # section on every commit with a user-visible change.
-CABINET_VERSION = "0.3.21"
+CABINET_VERSION = "0.3.22"
 
 WSDL_NS = "http://www.gamingstandards.com/wsdl/g2s/v1.0"
 SCHEMA_NS = "http://www.gamingstandards.com/g2s/schemas/v1.0.3"
@@ -1388,6 +1388,27 @@ def games_required_for_play(config_options):
     return out
 
 
+def ticket_expiry(rec):
+    """The date-time after which a printed ticket is refused, or None.
+    An issueVoucher (and a voucher log entry) carries expireDateTime, but
+    it is "only valid if expireCredits is set to true" (Table 21.17):
+    the ticket was then printed from credit that came with its own
+    expiry. With expireCredits false, the default, the ticket runs on the
+    machine's number-of-days setting and the date-time means nothing. It
+    was kept and enforced regardless, so a machine that filled it in
+    anyway (with the print time, say) had its tickets refused as
+    expired."""
+    if g2s_true(rec.get("expireCredits")) and rec.get("expireDateTime"):
+        return rec.get("expireDateTime")
+    return None
+
+
+#: voucherState values of a log entry whose transaction the machine has
+#: not closed (Table 21.38): it is still waiting for the host.
+VOUCHER_STATES_OPEN = ("G2S_issueSent", "G2S_redeemSent", "G2S_redeemAuth",
+                       "G2S_commitSent")
+
+
 def derive_handpay_options(config_options):
     """Rebuild the handpay paramId -> value map (assoc.handpay_options) from a
     STRUCTURED config-options inventory — the same values the live optionList
@@ -1518,6 +1539,15 @@ CEREMONY_MODE_TTL_MS = 300000
 # A configuration mode (§8.7 commConfig, §9.7 optionConfig) keeps the machine
 # out of play for as long as it is on: "the EGM MUST NOT allow game play".
 # The hub therefore never leaves one on that nothing is driving.
+# The stale-list reconcile switches a machine's ticket printing off and on
+# again (§21.9). While it is off the machine prints no tickets, and where
+# its voucher device is requiredForPlay the whole machine is out of play.
+# The hub therefore remembers, on disk, that it has done so until it has
+# SEEN the device enabled again, and until then asks and re-enables.
+VOUCHER_ENABLE_RESEND_SEC = 20    # the enable is sent again this long after
+#                                   the last, while the device still says off
+VOUCHER_RECHECK_TRIES = 15        # status reads before the hub says, loudly,
+#                                   that it cannot tell
 MODE_EXIT_RESEND_SEC = 20         # an exit that has not taken is sent again
 #                                   this often, while the machine still says
 #                                   the mode is on
@@ -1954,6 +1984,11 @@ class EgmAssociation:
         # answers with a voucherStatus, which lands back in the reconcile that
         # sent it. Cleared when the replacement list actually goes out.
         self.voucher_reconciling = False
+        # when the enable that ends a reconcile was last queued, when the
+        # device's status was last asked for on its account, and how often
+        self.voucher_enable_at = 0.0
+        self.voucher_recheck_at = 0.0
+        self.voucher_rechecks = 0
         # Every REQUEST this host has sent, by its sessionId: which command
         # it was and that command's own attributes (note_request). An error
         # answer carries no command element (§1.18.3.3), only the class and
@@ -1995,6 +2030,10 @@ class EgmAssociation:
         # here has not been asked about: nothing is known, and it is treated
         # as it always was.
         self.config_can_mod = {}
+        # The limits the machine states for a parameter in the same
+        # definitions, "deviceClass/deviceId/paramId" -> {maxLen, minIncl,
+        # maxIncl} as text, those it gave (Tables 9.15 and 9.19).
+        self.config_param_limits = {}
         # The devices ("deviceClass/deviceId") whose read WITH the
         # definitions has been answered, or refused, since the join last
         # asked for it. Each of the two re-asserts a join makes waits for
@@ -2848,6 +2887,29 @@ class VoucherStore:
         with self.lock:
             return self.state["egms"].get(egm_id, {}).get("lastListId", 0)
 
+    def reconcile_open_since(self, egm_id):
+        """When this host switched the machine's ticket printing off to
+        refresh its ticket numbers and has not since seen it on again
+        (epoch seconds), or 0. Kept on disk: a hub restarted between the
+        two commands must still know the device is off by its own hand."""
+        with self.lock:
+            try:
+                return float(self.state["egms"].get(egm_id, {}).get(
+                    "reconcileOpenAt") or 0)
+            except (TypeError, ValueError):
+                return 0.0
+
+    def set_reconcile_open(self, egm_id, is_open):
+        with self.lock:
+            rec = self.state["egms"].setdefault(egm_id, {})
+            if is_open:
+                rec["reconcileOpenAt"] = time.time()
+            elif "reconcileOpenAt" in rec:
+                del rec["reconcileOpenAt"]
+            else:
+                return
+            self._save_locked()
+
     def new_validation_list(self, egm_id, count):
         """Allocate the next validationListId plus `count` fresh
         (validationId, validationSeed) pairs. Ids are 18 random digits
@@ -2953,8 +3015,11 @@ class VoucherStore:
                 info["issuedAt"] = rec.get("transferDateTime") \
                     or rec.get("seenAt") or now_iso()
                 info["issueTxn"] = rec.get("transactionId")
-                if rec.get("expireDateTime"):
-                    info["expireDateTime"] = rec.get("expireDateTime")
+                expiry = ticket_expiry(rec)
+                if expiry:
+                    info["expireDateTime"] = expiry
+                else:
+                    info.pop("expireDateTime", None)
             self._save_locked()
         return False
 
@@ -3215,11 +3280,25 @@ class VoucherStore:
                 kind = "issue" if e.get("voucherAction") == "G2S_issue" \
                     else "commit"
                 txn = e.get("transactionId")
-                if e.get("egmAction") == "G2S_pending":
+                if e.get("egmAction") == "G2S_pending" \
+                        or e.get("voucherState") in VOUCHER_STATES_OPEN:
                     # in-flight transaction (Table 21.34) — nothing terminal
                     # to reconcile, and resetting a live redeemPending hold
                     # here would break §21.20. Skip; the terminal entry for
                     # this txn merges on a later fetch.
+                    # The same for an entry whose voucherState says the
+                    # machine is still waiting for an acknowledgement
+                    # (G2S_issueSent, G2S_commitSent, Table 21.38): it "MUST"
+                    # keep sending that issueVoucher or commitVoucher, and
+                    # the command itself is what records the ticket. Merged
+                    # from the log (which carries only the last four digits
+                    # of the number), the entry went into the ring beside
+                    # the command's own record when that came: the same
+                    # ticket twice in the history. (Until v0.3.18 it did
+                    # worse: the command was taken for a repeat of the log
+                    # entry and the ticket was never recorded. Since then a
+                    # transaction is told apart by its whole number too:
+                    # same_transaction.)
                     summary["open"] += 1
                     continue
                 if any(self.same_transaction(
@@ -3242,6 +3321,7 @@ class VoucherStore:
                     "egmException": e.get("egmException") or "0",
                     "voucherState": e.get("voucherState"),
                     "logSequence": e.get("logSequence"),
+                    "expireCredits": g2s_bool(e.get("expireCredits")),
                     "expireDateTime": e.get("expireDateTime"),
                     "source": "egmLog", "seenAt": now_iso(),
                 })
@@ -3268,8 +3348,11 @@ class VoucherStore:
                         info["creditType"] = e.get("creditType")
                         info["issuedAt"] = when
                         info["issueTxn"] = txn
-                        if e.get("expireDateTime"):
-                            info["expireDateTime"] = e.get("expireDateTime")
+                        expiry = ticket_expiry(e)
+                        if expiry:
+                            info["expireDateTime"] = expiry
+                        else:
+                            info.pop("expireDateTime", None)
                 else:
                     # stash the value even on a redeem-only sighting (a
                     # legacy tier-1 issue record has nothing else to pay
@@ -3420,15 +3503,22 @@ class TitoAuthority:
                     if dec.get("restrictedPromo") else "G2S_cashable",
                     "retry": bool(dec.get("retry")),
                     "reason": dec.get("reason", "authorized")}
+        # The machine is told why (§21.20: hostException "MUST indicate
+        # the reason for rejection"; Table 21.35). 4, "Voucher not
+        # found", is for a number the ledger does not hold as a printed
+        # ticket. Everything that was neither redeemed nor in process
+        # used to be reported as 4, so a ledger that could not be read,
+        # or a ticket whose amount it could not pay from, went into the
+        # machine's log as a ticket that does not exist: those are 99,
+        # "Redemption denied – no reason given".
         reason = dec.get("reason", "rejected")
-        if "already redeemed" in reason:
-            exc = 2
-        elif "already in process" in reason:
-            exc = 1
-        elif "voided" in reason:
-            exc = 99
-        else:
-            exc = 4
+        why = dec.get("why")
+        if why is None:         # a refusal built in this file
+            why = ("redeemed" if "already redeemed" in reason
+                   else "inProcess" if "already in process" in reason
+                   else "notFound" if "never issued here" in reason
+                   else "denied")
+        exc = {"redeemed": 2, "inProcess": 1, "notFound": 4}.get(why, 99)
         return {"exc": exc, "amt": "0", "creditType": "G2S_cashable",
                 "retry": False, "reason": reason}
 
@@ -15799,6 +15889,12 @@ class G2SHost:
                 if assoc.voucher_reconciling:
                     return          # our own disable/enable is in flight
                 assoc.voucher_reconciling = True
+                # the enable is queued right behind the disable, below
+                assoc.voucher_enable_at = time.time()
+                assoc.voucher_rechecks = 0
+            # on disk BEFORE the disable goes out: from here until the
+            # device is seen enabled again, it is off by this hub's hand
+            self.voucher_store.set_reconcile_open(assoc.egm_id, True)
             log.warning("=" * 64)
             log.warning("🎟️ [%s] STALE TICKET IDS — this cabinet is holding "
                         "validation list %s; the last list we issued it was "
@@ -15816,6 +15912,73 @@ class G2SHost:
         except Exception as e:      # noqa: BLE001 — a reconcile fault must
             log.error("[%s] validation-list reconcile failed: %s",   # never
                       assoc.egm_id, e)                      # break the join
+
+    def _voucher_reconcile_seen(self, assoc, host_enabled):
+        """A voucherStatus arrived. If this hub switched the device off for
+        a reconcile and has not seen it on since: on now closes that; still
+        off, and the last enable more than VOUCHER_ENABLE_RESEND_SEC ago,
+        sends the enable again.
+
+        The disable and the enable were two commands queued one behind the
+        other, and nothing looked at what came back. With the disable
+        delivered and the enable lost (the machine signing on again between
+        the two drops what is queued), ticket printing stayed off, and the
+        whole machine with it where its voucher device is requiredForPlay,
+        until someone sent the command by hand."""
+        if not self.voucher_store.reconcile_open_since(assoc.egm_id):
+            return
+        if host_enabled == "true":
+            self.voucher_store.set_reconcile_open(assoc.egm_id, False)
+            with assoc.lock:
+                assoc.voucher_rechecks = 0
+            log.info("🎟️ [%s] ticket printing is back on after the refresh "
+                     "of its ticket numbers", assoc.egm_id)
+            return
+        now = time.time()
+        with assoc.lock:
+            if now - assoc.voucher_enable_at < VOUCHER_ENABLE_RESEND_SEC:
+                return              # an enable is on its way
+            assoc.voucher_enable_at = now
+            # still inside the reconcile: the list the machine shows stays
+            # the stale one until it has asked for a new one
+            assoc.voucher_reconciling = True
+        log.warning("🎟️ [%s] ticket printing is still off from this hub's "
+                    "refresh of its ticket numbers — switching it back on",
+                    assoc.egm_id)
+        self.enqueue_set_voucher_state(assoc, enable=True)
+
+    def sweep_voucher_reconciles(self, now=None):
+        """Called from the watchdog loop. A machine whose ticket printing
+        this hub switched off for a reconcile, and has not shown as on
+        since, is asked for its voucher status; the answer does the rest
+        (_voucher_reconcile_seen). After VOUCHER_RECHECK_TRIES the hub
+        says it cannot tell, once, and goes on asking at each join."""
+        now = time.time() if now is None else now
+        with self.assoc_lock:
+            assocs = list(self.associations.values())
+        for assoc in assocs:
+            since = self.voucher_store.reconcile_open_since(assoc.egm_id)
+            if not since or now - since < VOUCHER_ENABLE_RESEND_SEC:
+                continue
+            with assoc.lock:
+                if assoc.comms_state != "onLine" or \
+                        now - assoc.voucher_recheck_at \
+                        < VOUCHER_ENABLE_RESEND_SEC or \
+                        assoc.voucher_rechecks > VOUCHER_RECHECK_TRIES:
+                    continue
+                assoc.voucher_recheck_at = now
+                assoc.voucher_rechecks += 1
+                tries = assoc.voucher_rechecks
+            if tries > VOUCHER_RECHECK_TRIES:
+                log.error("🎟️ [%s] ticket printing was switched off by this "
+                          "hub %d s ago to refresh its ticket numbers and "
+                          "has not been seen on again after %d status "
+                          "reads. If the machine prints no tickets, send "
+                          "setVoucherState enable from the console.",
+                          assoc.egm_id, int(now - since),
+                          VOUCHER_RECHECK_TRIES)
+                continue
+            self.enqueue_get_voucher_status(assoc)
 
     def enqueue_set_voucher_state(self, assoc, enable=True, disable_text="",
                                   device_id=None):
@@ -18509,6 +18672,24 @@ class G2SHost:
     #: their own gets theirs.
     TICKET_PARAM_DEFAULTS = {"titleCash": "CASHOUT VOUCHER"}
 
+    #: The room each text field has by its data type (voucherTitle40 and
+    #: voucherTitle16, §21.27 Table 21.31), used unless the machine's own
+    #: definition of the parameter states a maxLen.
+    TICKET_PARAM_MAXLEN = {"G2S_propName": 40, "G2S_propLine1": 40,
+                           "G2S_propLine2": 40, "G2S_titleCash": 16}
+
+    @staticmethod
+    def _param_limit(assoc, key, which):
+        """A limit the machine stated for a parameter (maxLen, minIncl or
+        maxIncl), as an int, or None when it stated none."""
+        with assoc.lock:
+            raw = (getattr(assoc, "config_param_limits", {}).get(key)
+                   or {}).get(which)
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+
     def push_ticket_header_g2s(self, only=None):
         """Fan the hub ticket header to every ONLINE G2S EGM's printed
         tickets via the PROVEN option-change cycle (G2S-27 multi-param form,
@@ -18580,6 +18761,26 @@ class G2SHost:
                 targets = {pid: (hdr.get(f)
                                  or self.TICKET_PARAM_DEFAULTS.get(f, ""))
                            for f, pid in self.TICKET_PARAM_MAP if pid in vals}
+                # A text longer than its parameter holds is sent as far as
+                # it fits. Sent whole, a strict machine refuses the set
+                # (G2S_OCX013), and with it every other header field, at
+                # every join and every save. A value that long can only be
+                # one saved before v0.3.22, when the hub took 64 characters
+                # for each.
+                shortened = {}
+                for pid, text in list(targets.items()):
+                    room = self._param_limit(a, f"{dc}/{di}/{pid}", "maxLen")
+                    if room is None or room < 0:
+                        room = self.TICKET_PARAM_MAXLEN.get(pid)
+                    if room is not None and len(text) > room:
+                        shortened[pid] = [len(text), room]
+                        targets[pid] = text[:room].rstrip()
+                if shortened:
+                    v["shortened"] = shortened
+                    log.warning("🎫 [ticket:%s] header text longer than the "
+                                "machine takes, sent as far as it fits "
+                                "(characters held, characters sent): %s",
+                                a.egm_id, shortened)
                 if "G2S_propName" not in targets:
                     v["error"] = ("option advertises no G2S_propName param "
                                   "— refusing a header push that cannot set "
@@ -18739,7 +18940,15 @@ class G2SHost:
         the operator re-saving (the push_ticket_header_g2s discipline).
         NOTE the machine may enforce its own floor/ceiling on these
         options (OCX013 invalid value surfaces in the verdict) — bench
-        truth wins over the hub's 0..255 bound."""
+        truth wins over the hub's 0..255 bound.
+
+        "Never" is not written as 0. The two parameters are a number of
+        days, minimum 0 (Table 21.12), and the document gives 0 no other
+        meaning: a machine that takes it as written prints tickets that
+        expire the day they are printed. For "never" each parameter is set
+        to the most days the machine says it allows (maxIncl in its own
+        definition of the parameter); where it has stated none, the
+        machine's value is left as it is and the verdict says so."""
         days = int(self.ticket_header().get("expireDays") or 0)
         dc, di = "G2S_voucher", "1"
         gid, oid = "G2S_voucherOptions", "G2S_voucherOptions"
@@ -18761,10 +18970,26 @@ class G2SHost:
                               "G2S_voucher/1, then re-save")
             else:
                 vals = option_param_values(opt.get("currentValues"))
-                targets = {pid: want for pid in
-                           ("G2S_expireCashPromo", "G2S_expireNonCash")
-                           if pid in vals}
-                if not targets:
+                targets, left = {}, []
+                for pid in ("G2S_expireCashPromo", "G2S_expireNonCash"):
+                    if pid not in vals:
+                        continue
+                    if days > 0:
+                        targets[pid] = want
+                        continue
+                    most = self._param_limit(a, f"{dc}/{di}/{pid}", "maxIncl")
+                    if most is not None and most > 0:
+                        targets[pid] = str(most)
+                    else:
+                        left.append(pid)
+                if left:
+                    v["leftAlone"] = left
+                    v["note"] = ("never expires: this machine has not said "
+                                 "how many days it allows, so its own "
+                                 "setting is left as it is")
+                if not targets and left:
+                    v["ok"] = True
+                elif not targets:
                     v["error"] = ("option advertises no expiration params "
                                   "(G2S_expireCashPromo/NonCash absent)")
                 else:
@@ -20081,12 +20306,22 @@ class G2SHost:
                 p[cmd] = rec
                 if cmd == "printComplete":
                     last = dict(p.get("lastPrint") or {})
-                    tstate = rec.get("transferState", "")
+                    # Both attributes are optional: an absent transferState
+                    # is 1 (the transfer succeeded) and an absent
+                    # printComplete is true (Table 16.13). It printed only
+                    # when both say so: a print that fails after the data
+                    # reached the printer is transferState 1 with
+                    # printComplete false (G2S_PTE103, Table 16.38), which
+                    # read as "printed", and a good print reported with both
+                    # left at their defaults read as not printed.
+                    tstate = rec.get("transferState") or "1"
+                    moved = tstate in ("1", "true", "G2S_complete")
+                    whole = g2s_bool(rec.get("printComplete"), "true") \
+                        == "true"
                     last.update({
-                        "result": "printed" if tstate in ("1", "true",
-                                                          "G2S_complete")
-                        or str(rec.get("printComplete", "")).lower()
-                        == "true" else f"transferState={tstate}",
+                        "result": "printed" if moved and whole
+                        else "print failed" if moved
+                        else f"transferState={tstate}",
                         "transactionId": rec.get("transactionId", ""),
                         "completedAt": rec["at"]})
                     p["lastPrint"] = last
@@ -21493,7 +21728,7 @@ class G2SHost:
                 did = attr(dev, "deviceId")
                 groups, items, value_rows = [], [], 0
                 if detailed:
-                    can_mod = {}
+                    can_mod, limits = {}, {}
                     for sub in dev.iter():
                         if localname(sub.tag) != "optionParameters":
                             continue
@@ -21502,8 +21737,14 @@ class G2SHost:
                             if pid and localname(p.tag).endswith("Parameter"):
                                 can_mod[f"{dcls}/{did}/{pid}"] = g2s_true(
                                     attr(p, "canModRemote"))
+                                stated = {k: attr(p, k) for k in (
+                                    "maxLen", "minIncl", "maxIncl")
+                                    if attr(p, k) not in (None, "")}
+                                if stated:
+                                    limits[f"{dcls}/{did}/{pid}"] = stated
                     with assoc.lock:
                         assoc.config_can_mod.update(can_mod)
+                        assoc.config_param_limits.update(limits)
                 # G2S-27: harvest each option's COMPLETE current-value set,
                 # keyed by the addressing 4-tuple, so setOption can validate
                 # the option exists and copy+edit the whole set (§9.15).
@@ -22068,6 +22309,10 @@ class G2SHost:
                 "transferDateTime": attr(el, "transferDateTime"),
                 "egmAction": attr(el, "egmAction"),
                 "voucherSequence": attr(el, "voucherSequence"),
+                # expireDateTime is "only valid if expireCredits is set to
+                # true" (Table 21.17); the default is false, and then the
+                # ticket runs on the machine's number-of-days setting.
+                "expireCredits": g2s_bool(attr(el, "expireCredits")),
                 "expireDateTime": attr(el, "expireDateTime"),
                 "egmException": attr(el, "egmException") or "0",
                 "seenAt": now_iso(),
@@ -23100,9 +23345,9 @@ class G2SHost:
             data = {
                 "deviceId": req["deviceId"],
                 "configurationId": attr(el, "configurationId") or "0",
-                "egmEnabled": attr(el, "egmEnabled") or "true",
-                "hostEnabled": attr(el, "hostEnabled") or "true",
-                "hostLocked": attr(el, "hostLocked") or "false",
+                "egmEnabled": g2s_bool(attr(el, "egmEnabled"), "true"),
+                "hostEnabled": g2s_bool(attr(el, "hostEnabled"), "true"),
+                "hostLocked": g2s_bool(attr(el, "hostLocked")),
                 "validationListId": attr(el, "validationListId") or "0",
                 "statusAt": now_iso(),
             }
@@ -23113,6 +23358,8 @@ class G2SHost:
                      "egmEnabled=%s validationListId=%s", assoc.egm_id,
                      req["deviceId"], data["hostEnabled"],
                      data["egmEnabled"], data["validationListId"])
+            # a reconcile of ours that left the device off comes first
+            self._voucher_reconcile_seen(assoc, data["hostEnabled"])
             self._reconcile_validation_list(assoc, data["validationListId"])
 
         elif cmd == "voucherProfile" and stype == "G2S_response":
@@ -27325,18 +27572,25 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                 # field before writing ANY — a 400 on the third field must
                 # not leave a half-saved header (and no rev bump means no
                 # push of a partial save). Strict strings only; stripped;
-                # 64-char bound (the printed-line width); "" clears the
+                # 40 characters for the name and each address line, 16 for
+                # the title (what a ticket has room for and both protocols
+                # carry: hub_store.TICKET_FIELD_MAX); "" clears the
                 # tenant (hub.db deletes the row — absent = unset, C1).
                 clean = []
+                said = {"ticketPropName": "Casino name",
+                        "ticketLine1": "Address line 1",
+                        "ticketLine2": "Address line 2",
+                        "ticketTitleCash": "Cash ticket title"}
                 for jk, tk in tf_present:
                     tv = req.get(jk)
                     if not isinstance(tv, str):
                         raise ValueError(f"{jk} must be a string")
                     tv = tv.strip()
-                    if len(tv) > MAX_TICKET_FIELD_LEN:
-                        raise ValueError(f"{jk} must be <= "
-                                         f"{MAX_TICKET_FIELD_LEN} "
-                                         "characters")
+                    if len(tv) > TICKET_FIELD_MAX[tk]:
+                        raise ValueError(
+                            f"{said[jk]} has room for "
+                            f"{TICKET_FIELD_MAX[tk]} characters on a "
+                            f"ticket; this is {len(tv)}")
                     clean.append((jk, tk, tv))
                 exp_days = None
                 if exp_present:
@@ -27832,6 +28086,11 @@ def watchdog(engine):
             engine.sweep_config_modes()
         except Exception as e:  # noqa: BLE001 — never take the watchdog down
             log.error("config-mode sweep failed: %s", e)
+        # ticket printing this hub switched off and has not seen on again
+        try:
+            engine.sweep_voucher_reconciles()
+        except Exception as e:  # noqa: BLE001 — never take the watchdog down
+            log.error("voucher-reconcile sweep failed: %s", e)
         for assoc in list(engine.associations.values()):
             if assoc.comms_state == "onLine":
                 # The host keepAlive pinger POSTs every HOST_KEEPALIVE_SEC and
