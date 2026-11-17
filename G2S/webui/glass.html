@@ -857,6 +857,14 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
                                      // only when a DIFFERENT player sits down
   var coMachineMc = 0;               // cashout view: machine credits (millicents)
   var coWalletMc = null;             // wallet balance (millicents); null = no wallet
+  // Restricted promotional credit (2026-11-16): the player's second wallet
+  // balance. On THIS page it is called FREE SLOT PLAY (AJ: "on the players
+  // glass side it should be listed as Free Slot Play"); the operator pages
+  // use the machine's own wording, restricted promotional. When the player
+  // has some, tapping the wallet balance switches which one ADD CREDITS
+  // loads from. No carryover between players.
+  var coRestrMc = 0;                 // restricted balance (millicents)
+  var coUseRestr = false;            // ADD CREDITS loads restricted credit
   var coCanFund = false;             // funding allowed (linked + path available)
   var coHasWallet = false;           // a wallet exists at all (gates the toggle)
   var coCashToWat = false;           // current WAT-cash-out arm state
@@ -1037,6 +1045,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
       if (!overlay && sinceIso && sinceIso !== lastPlayerSince) {
         lastPlayerSince = sinceIso;
         selIdx = 1; selCents = CHIPS[selIdx];   // no carryover between players
+        coUseRestr = false;
       }
       if (fresh || view === 'attract') {
         show('home');          // card-in (or back from offline) -> home menu
@@ -1162,7 +1171,9 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     setStyle($('ph-credits'), 'display', credits ? 'block' : 'none');
     setStyle($('ph-credits'), 'fontSize',
       (credits && credits.length > 14) ? '13px' : '17px');
-    setMoney('wl-bal', credits || '\u2014');
+    // while the player has switched to their restricted promotional
+    // balance, that is the figure this line shows
+    setMoney('wl-bal', coUseRestr ? fmtMc(coRestrMc) : (credits || '\u2014'));
     // the 232px column clips silently past ~$1M at 40px bold, so step
     // the font DOWN on long balances: every digit stays on the glass
     var wlLen = (credits || '\u2014').length;
@@ -1361,15 +1372,28 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
       ? 0 : d.machineCreditsMc;
     coWalletMc = (d.walletMc === undefined || d.walletMc === null)
       ? null : d.walletMc;
+    coRestrMc = (typeof d.walletRestrictedMc === 'number' && d.walletRestrictedMc > 0)
+      ? d.walletRestrictedMc : 0;
+    if (!coRestrMc) { coUseRestr = false; }
     coCanFund = (d.canFund === true);
     coCashToWat = (d.cashOutToWat === true);
     coHasWallet = (coWalletMc !== null) || coCanFund;
+    paintWalletKind();
     setMoney('wl-mc-v', fmtMc(coMachineMc));
     setText('wl-note', coHasWallet ? ''
       : 'Link a card to move money to and from your wallet.');
     paintWalletChips();
     setBtnOff('wl-add', !coCanFund);
     setWalletToggleFace();
+  }
+  // Which wallet balance ADD CREDITS loads from. Only offered when the
+  // player HAS restricted promotional credit; the label says how to switch.
+  function paintWalletKind() {
+    if (!coRestrMc) { setText('wl-label', 'WALLET BALANCE'); return; }
+    setText('wl-label', coUseRestr
+      ? 'FREE SLOT PLAY \u00b7 TAP FOR CASH'
+      : 'CASH \u00b7 TAP FOR FREE SLOT PLAY');
+    if (coUseRestr) { setMoney('wl-bal', fmtMc(coRestrMc)); }
   }
   function paintWalletChips() {
     for (var i = 0; i < 3; i++) {
@@ -1736,12 +1760,31 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   $('kp-cancel').onclick = closeKeypad;
   $('wl-add').onclick = function () {
     if (!coCanFund) { return; }
+    if (coUseRestr) {
+      if (selCents * 1000 > coRestrMc) {
+        setText('wl-fund-msg', 'Not enough Free Slot Play'); return;
+      }
+      askConfirm('ADD ' + fmtCents(selCents) + ' FREE SLOT PLAY?',
+        'Moves ' + fmtCents(selCents) + ' of Free Slot Play '
+        + 'from your wallet to this machine. It has to be played.',
+        { action: 'walletFund', cents: selCents, restricted: true }, 'wallet');
+      return;
+    }
     if (coWalletMc !== null && selCents * 1000 > coWalletMc) {
       setText('wl-fund-msg', 'Not enough in your wallet'); return;
     }
     askConfirm('ADD ' + fmtCents(selCents) + '?',
       'Moves ' + fmtCents(selCents) + ' from your wallet to this machine.',
       { action: 'walletFund', cents: selCents }, 'wallet');
+  };
+  $('wl-bal').onclick = function () {
+    if (!coRestrMc) { return; }
+    coUseRestr = !coUseRestr;
+    paintWalletKind();
+    if (!coUseRestr) {
+      setMoney('wl-bal', coWalletMc === null ? '\u2014' : fmtMc(coWalletMc));
+    }
+    setText('wl-fund-msg', '');
   };
   $('wl-toggle').onclick = function () {
     if (!coHasWallet || coToggleBusy) { return; }

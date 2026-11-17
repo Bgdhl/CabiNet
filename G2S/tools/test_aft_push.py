@@ -347,6 +347,88 @@ def main():
     check("a junk restricted figure books the cash and no restricted",
           bal() == (3_200_000, 2_200_000))
 
+    print("— the player's glass fund can load restricted credit")
+    class GlassStub:
+        SAS_AFT_MAX_CENTS = 1_000_000
+        GLASS_FUND_RESERVE_TTL = 30
+        glass_wallet_fund = G.G2SHost.glass_wallet_fund
+        _glass_fund_reserved_mc = G.G2SHost._glass_fund_reserved_mc
+
+        def __init__(self):
+            import itertools, threading
+            self.account_store = store
+            self.sas_links = {"EGM1": "bb2/1"}
+            self.sas_lock = threading.Lock()
+            self.sas_machines = {"bb2/1": {"smibId": "smib-bb2"}}
+            self._glass_fund_lock = threading.Lock()
+            self._glass_fund_reserves = []
+            self._fob_seq = itertools.count(1)
+            self.sent = []
+
+        def sas_enqueue_command(self, smib, cmd):
+            self.sent.append((smib, cmd))
+            return {"ok": True, "id": cmd["id"]}
+
+    gs = GlassStub()
+    g, _ = store.create("Glass Gus")
+    gid = g["id"]
+    store.adjust(gid, d_cash=500_000, d_non=200_000)     # $5 cash, $2 restricted
+    code, body = gs.glass_wallet_fund("EGM1", gid, 100, restricted=True)
+    check("restricted fund queues an aft_transfer marked restricted",
+          code == 200 and gs.sent[-1][1]["creditType"] == "restricted"
+          and gs.sent[-1][1]["cents"] == 100
+          and gs.sent[-1][1]["accountId"] == gid)
+    code, body = gs.glass_wallet_fund("EGM1", gid, 300, restricted=True)
+    check("more restricted than the player has is refused, whatever their "
+          "cash", code == 400 and len(gs.sent) == 1)
+    code, body = gs.glass_wallet_fund("EGM1", gid, 300)
+    check("a cash fund is unchanged and carries no creditType",
+          code == 200 and "creditType" not in gs.sent[-1][1])
+
+    print("— the bank can give a player restricted promotional credit")
+    class PlayerStub:
+        player_action = G.G2SHost.player_action
+        _FUND_REF_SEQ = G.G2SHost._FUND_REF_SEQ
+
+        def __init__(self):
+            self.account_store = store
+            self.hub_store = None       # the fund action never touches it
+
+        def house_allow_negative(self):
+            return False            # floor mode ON: cash gifts are gated
+
+    ps = PlayerStub()
+    f, _ = store.create("Fund Fay")
+    fid = f["id"]
+    house_non = store.get("house")["nonCashMillicents"]
+    house_cash = _house_cash(store)
+    r = ps.player_action({"action": "fund", "accountId": fid, "cents": 700,
+                          "restricted": True})
+    check("a restricted fund lands in the player's restricted balance",
+          r.get("ok") is True and r.get("restricted") is True
+          and store.get(fid)["nonCashMillicents"] == 700_000
+          and store.get(fid)["cashableMillicents"] == 0)
+    check("...comes off the bank's restricted balance, not its cash, and "
+          "is not stopped by floor mode",
+          store.get("house")["nonCashMillicents"] == house_non - 700_000
+          and _house_cash(store) == house_cash)
+    r = ps.player_action({"action": "fund", "accountId": fid, "cents": -200,
+                          "restricted": True})
+    check("a restricted pull-back returns it to the bank",
+          r.get("ok") is True
+          and store.get(fid)["nonCashMillicents"] == 500_000
+          and store.get("house")["nonCashMillicents"] == house_non - 500_000)
+    r = ps.player_action({"action": "fund", "accountId": fid, "cents": -900,
+                          "restricted": True})
+    check("pulling back more restricted than the player has is refused",
+          r.get("ok") is False
+          and store.get(fid)["nonCashMillicents"] == 500_000)
+    rows = [e for e in store.state["ledger"]
+            if e.get("accountId") == fid and e.get("kind") == "nonCash"]
+    check("the ledger rows say restricted promotional",
+          len(rows) == 2 and all("restricted promotional" in e["note"]
+                                 for e in rows))
+
     print("=" * 50)
     print(f"RESULT: {_passed} passed, {_failed} failed")
     return 1 if _failed else 0

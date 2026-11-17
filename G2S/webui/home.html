@@ -3841,6 +3841,10 @@ function renderPlayerFundModal(id){
       <input type="text" id="m-fund" inputmode="decimal" placeholder="$ 0.00"
         aria-label="Amount in dollars">
     </div>
+    <label class="none" style="display:flex;gap:8px;align-items:center;font-style:normal;margin:0 0 10px;cursor:pointer">
+      <input type="checkbox" id="m-fund-restr">
+      <span>as restricted promotional credit (has to be played, never cash)</span>
+    </label>
     <div class="btnrow">
       <button class="btn slim gold" onclick="playerFundSend('${esc(p.id)}',1)">
         <span class="bl">Fund</span>
@@ -3858,18 +3862,23 @@ async function playerFundSend(id, sign){
      of bouncing it off the hub for a raw error. Client-side nicety only:
      the hub still enforces (our snapshot can lag a beat), this just makes
      the common case read like a host, not a terminal. */
+  /* cash, or the player's restricted promotional balance (the checkbox) */
+  const restr=!!(($("m-fund-restr")||{}).checked);
   if(sign<0){
     const p=playerById(id);
-    const bal=Number((p||{}).cashableMillicents||0);
+    const bal=Number((p||{})[restr?"nonCashMillicents":"cashableMillicents"]||0);
     if(mc>bal){
       toast(((p&&p.name)||"That player")+" has "+fmtAmt(bal)
+        +(restr?" restricted":"")
         +" — can't pull back "+fmtAmt(mc)+". Try a smaller amount.",false);
       return;
     }
   }
   const cents=Math.round(mc/1000);   // the fund action speaks CENTS
-  const j=await playerPost({action:"fund", accountId:id, cents:sign*cents},
-    (sign>0?"Fund ":"Pull back ")+fmtAmt(mc));
+  const body={action:"fund", accountId:id, cents:sign*cents};
+  if(restr) body.restricted=true;
+  const j=await playerPost(body,
+    (sign>0?"Fund ":"Pull back ")+fmtAmt(mc)+(restr?" restricted promotional":""));
   if(j&&$("m-fund")) $("m-fund").value="";
 }
 function playerRenameOpen(id){

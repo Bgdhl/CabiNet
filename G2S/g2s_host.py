@@ -8743,6 +8743,10 @@ class G2SHost:
                         "cents must be non-zero (negative pulls back "
                         "to the house)"}
             mc = cents * 1000
+            # Cash, or RESTRICTED PROMOTIONAL credit (2026-11-16): the same
+            # two-leg move in the restricted balance. The bank gives
+            # promotional credit freely, so floor mode does not gate it.
+            restricted = req.get("restricted") is True
             # Floor mode (Options ▸ "let the bank go negative" = OFF): giving
             # a friend money that would take the bank below $0 is refused up
             # front, BEFORE any ledger write, with a friendly nudge — the
@@ -8752,7 +8756,7 @@ class G2SHost:
             # two funds racing a near-empty bank could each pass and dip it
             # slightly negative — harmless, money is still conserved, and a
             # home floor never has concurrent funders.)
-            if mc > 0 and not self.house_allow_negative():
+            if mc > 0 and not restricted and not self.house_allow_negative():
                 house = store.get("house") or {}
                 if int(house.get("cashableMillicents", 0) or 0) < mc:
                     return {"ok": False, "error":
@@ -8766,15 +8770,19 @@ class G2SHost:
             # player leg FIRST: a pull-back that would take the player
             # negative refuses HERE, atomically inside adjust, before the
             # house leg ever writes.
+            kind = " (restricted promotional)" if restricted else ""
+            leg = (lambda v: {"d_non": v}) if restricted \
+                else (lambda v: {"d_cash": v})
             account, err = store.adjust(
-                aid, d_cash=mc,
-                note=("house fund" if mc > 0 else "pull back to house"),
-                ref=ref)
+                aid,
+                note=("house fund" if mc > 0 else "pull back to house") + kind,
+                ref=ref, **leg(mc))
             if err:
                 return {"ok": False, "error": err}
             _, err = store.adjust(
-                "house", d_cash=-mc,
-                note=f"{'fund' if mc > 0 else 'pull back'} {aid}", ref=ref)
+                "house",
+                note=f"{'fund' if mc > 0 else 'pull back'} {aid}{kind}",
+                ref=ref, **leg(-mc))
             if err:
                 log.error("🧑 player fund %s: house leg FAILED (%s) — see "
                           "ledger ref %s", aid, err, ref)
@@ -8785,7 +8793,7 @@ class G2SHost:
                      "cashable now %s mc", aid, account.get("name"), cents,
                      ref, account.get("cashableMillicents"))
             return {"ok": True, "player": account, "ref": ref,
-                    "movedMillicents": mc}
+                    "movedMillicents": mc, "restricted": restricted}
         if action == "rename":
             account, err = store.rename(req.get("accountId"),
                                         req.get("name"))
@@ -9324,6 +9332,10 @@ class G2SHost:
                 out["walletMc"] = mc
                 out["walletCredits"] = f"{money_symbol()}{mc / 100000:,.2f}"
                 out["canFund"] = True
+                # the player's restricted promotional balance, so the glass
+                # can offer to load it (0 = nothing to offer)
+                out["walletRestrictedMc"] = int(
+                    acct.get("nonCashMillicents") or 0)
         except Exception:  # noqa: BLE001 — no wallet, not a fault
             pass
         # cashOutToWat: this session's own pin (armed here) OR the wat device
@@ -9525,7 +9537,7 @@ class G2SHost:
         return (isinstance(xf, int) and not isinstance(xf, bool)
                 and bool(xf & AVAIL_XFER_FROM_EGM))
 
-    def glass_wallet_fund(self, egm_id, account_id, cents):
+    def glass_wallet_fund(self, egm_id, account_id, cents, restricted=False):
         """walletFund — push the carded player's OWN wallet onto THIS machine,
         reusing the EXACT money paths sendCredits drives: a SAS-linked cabinet
         takes the satellite aft_transfer (sas_enqueue_command, CENTS); a plain
@@ -9545,9 +9557,12 @@ class G2SHost:
         if acct is None or acct.get("kind") != "player":
             return 403, {"ok": False,
                          "error": "no linked player wallet on this session"}
+        # restricted=True funds from the player's RESTRICTED PROMOTIONAL
+        # balance, as restricted credit on the machine (2026-11-16).
+        bucket = "nonCashMillicents" if restricted else "cashableMillicents"
         # Courtesy overdraft gate (players can never go negative). The reused
         # money path re-checks at escrow/settle — this is the up-front refuse.
-        have = int(acct.get("cashableMillicents") or 0)
+        have = int(acct.get(bucket) or 0)
         if have < cents * 1000:
             return 400, {"ok": False,
                          "error": f"{acct.get('name') or account_id} has "
@@ -9570,7 +9585,7 @@ class G2SHost:
                     "exp": time.time() + self.GLASS_FUND_RESERVE_TTL}
             with self._glass_fund_lock:
                 cur = self.account_store.get(account_id) or {}
-                live = int(cur.get("cashableMillicents") or 0)
+                live = int(cur.get(bucket) or 0)
                 avail = live - self._glass_fund_reserved_mc(account_id)
                 if avail < need_mc:
                     return 400, {"ok": False,
@@ -9583,6 +9598,8 @@ class G2SHost:
             cmd = {"id": f"glass{next(self._fob_seq)}-{int(time.time())}",
                    "type": "aft_transfer", "cents": cents,
                    "accountId": account_id}
+            if restricted:
+                cmd["creditType"] = "restricted"
             reply = self.sas_enqueue_command(smib, cmd)
             ok = bool(reply.get("ok"))
             if not ok:
@@ -9606,7 +9623,9 @@ class G2SHost:
             return 404, {"ok": False, "error": "machine not connected"}
         res = self.start_wat_credit_push(
             assoc, device_id=self.default_wat_device(assoc),
-            account_id=account_id, cashable=cents * 1000)
+            account_id=account_id,
+            **({"non_cash": cents * 1000} if restricted
+               else {"cashable": cents * 1000}))
         ok = not (isinstance(res, dict) and res.get("ok") is False)
         log.info("🪙 [glass:%s] walletFund $%.2f from %s -> WAT addCredits "
                  "(%s)", egm_id, cents / 100, account_id,
@@ -24082,7 +24101,8 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                                            "wallet"})
             if action == "walletFund":
                 status, payload = engine.glass_wallet_fund(
-                    egm_id, acct_id, req.get("cents"))
+                    egm_id, acct_id, req.get("cents"),
+                    restricted=req.get("restricted") is True)
                 return done(status, payload)
             if action == "cashOutNow":
                 # HOST-CONTROL immediate cash-out (SAS/BB2): the panel button

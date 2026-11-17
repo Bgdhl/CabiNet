@@ -1,24 +1,33 @@
 # Changelog
 
 ## v0.3.12
-Restricted promotional credit and tickets.
-- **Credits can be sent to a machine as restricted promotional credit.**
-  The Wallet page has a new step, "As": cash credit or restricted
-  promotional. Restricted credit has to be played; the machine never pays
-  it out as cash, and cashing it out prints a restricted promotional
-  ticket. It comes off the sending account's restricted balance, and the
-  bank can give it freely. It works on SAS machines (the AFT restricted
-  amount) and on G2S machines, where the hub could already move it but
-  the page never offered it.
-- **Restricted promotional tickets are flagged.** A SAS machine says what
-  each ticket it prints is. The hub now keeps that, tags the ticket
-  "restricted promotional" in the Cage list and names the kind in the
-  ticket's detail. Such a ticket still redeems like any other for now.
+Restricted promotional credit, end to end. Every player wallet has two
+balances: cash and restricted. Restricted credit has to be played and is
+never paid out as cash. Operator pages call it "restricted promotional",
+the machine's own wording; the player's glass page calls it "Free Slot
+Play".
+- **Sending it to a machine.** The Wallet page has a new step, "As": cash
+  credit or restricted promotional. It comes off the sending account's
+  restricted balance, and the bank can give it freely. It works on SAS
+  machines (the AFT restricted amount) and on G2S machines, where the hub
+  could already move it but the page never offered it.
+- **Giving it to a player.** The Players page fund box has a "restricted
+  promotional" tick box, for giving and for pulling back.
+- **Loading it from the glass.** When a carded player has Free Slot Play,
+  tapping their wallet balance on the glass switches between cash and
+  Free Slot Play, and ADD CREDITS loads the one shown.
+- **Cashing it out to the wallet.** A SAS cash-out to the wallet now
+  takes the machine's restricted credit along with its cash and puts
+  each in its own balance. Before, restricted credit was left on the
+  machine.
+- **Tickets.** A SAS machine says what each ticket it prints is. A
+  restricted promotional ticket (titled PLAYABLE ONLY) is tagged in the
+  Cage list and named in its detail, and when it goes back into a
+  machine it is credited as restricted credit, on SAS and on G2S.
 - The default expiry for restricted tickets is set on the machine along
   with the ordinary one.
-- Not done yet: redeeming a restricted promotional ticket as restricted
-  credit, cashing restricted credit out to a player's wallet over SAS,
-  and the choice on the player's glass page.
+- Seen on a Bluebird 2: a $150 restricted push, and at cash-out a normal
+  ticket for the cash followed by a PLAYABLE ONLY ticket for the $150.
 
 ## v0.3.11
 Third batch from the SAS audit, second part.
