@@ -71,6 +71,7 @@ from core.sas_tito_host import (SASTITOHost, TicketCaptureOutcome,
 from core.sas_bonus import (MAX_BONUS_CREDITS, build_legacy_bonus_poll,
                             classify_bonus_reply)
 from modules.aft.open_transfer import OpenTransferJournal
+from core.sas_machine_info import read_extended_validation_status
 from modules.aft.aft_handler import (
     AFTHost, AFTTransferRequest, TRANSFER_TYPE_HOST_TO_EGM,
     TRANSFER_TYPE_EGM_TO_HOST, TRANSFER_CODE_FULL_ONLY, TRANSFER_FLAGS_NONE,
@@ -497,6 +498,11 @@ class TicketHeaderState:
         self._session = 0        # bumped on every machine-online edge
         self._attempted = None   # (session, rev) of the last wire attempt
         self._again_at = None    # clock time one more attempt is due | None
+        # The ticket expiry (days) the machine reported in its 0x7B answer
+        # right after the header last went on. SAS has no poll that reads
+        # the header TEXT back, but the expiry travels with it: a machine
+        # that drops its ticket settings goes back to its own expiry too.
+        self.expiry_baseline = None
 
     def on_reply(self, value) -> None:
         """Reporter thread: ingest the raw reply value (junk = no-op)."""
@@ -548,6 +554,22 @@ class TicketHeaderState:
         self._again_at = (settled if self._again_at is None
                           else min(self._again_at, settled))
 
+    def on_expiry_report(self, days) -> bool:
+        """Poll thread: the expiry the machine reports NOW (a periodic 0x7B
+        read). If it is no longer what the machine reported when the header
+        went on, its ticket settings have changed under us: send the header
+        again. True when that was triggered.
+
+        Compared with the machine's OWN earlier report, not with the hub's
+        setting — a machine that clamps or ignores the value we set would
+        otherwise be re-sent the header on every read for ever."""
+        if days is None or self.expiry_baseline is None \
+                or self.applied_rev is None or days == self.expiry_baseline:
+            return False
+        self.expiry_baseline = None
+        self.on_machine_event(lost=True)
+        return True
+
     def due(self):
         """Poll thread: the target dict if an apply attempt is due now,
         else None. Never due for the already-applied rev (same rev never
@@ -583,6 +605,7 @@ class TicketHeaderState:
             self.tries = 0
             self._again_at = None
         else:
+            self.expiry_baseline = None
             self.failures += 1
             wait = TICKET_HEADER_RETRY_SEC[
                 min(self.failures, len(TICKET_HEADER_RETRY_SEC)) - 1]
@@ -613,7 +636,7 @@ def _ticket_set_flag(resp, address, command, proto):
 
 def apply_ticket_header(transport, address, target, protocol=None,
                         pace=SAS_POLL_FLOOR, sleep=time.sleep,
-                        host_id=DEFAULT_SYSTEM_ID):
+                        host_id=DEFAULT_SYSTEM_ID, report=None):
     """Push one hub ticket header to the machine. Returns (ok, detail).
 
     Wire plan (adjudicated 2026-07-09 from the on-disk SAS 6.02 text —
@@ -699,6 +722,22 @@ def apply_ticket_header(transport, address, target, protocol=None,
                           "refused (expiration unchanged)",
                    None: f" · expiration {days}d 0x7D silent — machine "
                          "may not honor host expiration"}[eflag]
+        # ...and with long poll 7B, the poll SAS 6.02 §15.2 gives for it:
+        # "Values set using long poll 7B take precedence over the
+        # expiration field in long poll 7D" (audit item 39; the comment
+        # above predates that text). Both are sent: 7D is what machines here
+        # are known to take, 7B is what the document says wins. The answer
+        # carries the expiry the machine will actually print, which is kept
+        # as the baseline for TicketHeaderState.on_expiry_report.
+        sleep(pace)
+        ev = read_extended_validation_status(
+            transport, address, proto,
+            cashable_days=9999 if days == 0 else days)
+        if ev is not None and ev.cashable_expiration_days is not None:
+            edetail += (f" and 0x7B (machine reports "
+                        f"{ev.cashable_expiration_days}d)")
+            if report is not None:
+                report["expiry"] = ev.cashable_expiration_days
         return True, f"applied {fields} via 0x7C (ACK){edetail}{note}"
     if flag is False:
         return False, ("0x7C NACK — the machine flagged the ticket data "
@@ -2920,6 +2959,20 @@ def main():
                 # registration survives (the live 07-09 refusal), and the
                 # Wallet should know BEFORE a push, not from a refusal.
                 ls = aft_host.read_lock_status()
+                # The ticket expiry the machine reports now, against what
+                # it reported when the header went on (TicketHeaderState.
+                # on_expiry_report). Only while a header is on.
+                if ticket_header.expiry_baseline is not None:
+                    was = ticket_header.expiry_baseline
+                    ev = read_extended_validation_status(
+                        poller.transport, args.address, poller.protocol)
+                    if ev is not None and ticket_header.on_expiry_report(
+                            ev.cashable_expiration_days):
+                        logger.warning(
+                            "🎟️ the machine now reports ticket expiry {}d; "
+                            "it reported {}d when the header went on — its "
+                            "ticket settings changed, sending the header "
+                            "again", ev.cashable_expiration_days, was)
                 stats["aft"] = {
                     "registered": bool(reg and reg.registered),
                     "statusCode": reg.status if reg else None,
@@ -3119,10 +3172,11 @@ def main():
             due = ticket_header.due()
             if due is not None:
                 ticket_header.mark_attempted(due["rev"])
+                seen = {}
                 try:
                     ok, detail = apply_ticket_header(
                         poller.transport, args.address, due,
-                        protocol=poller.protocol)
+                        protocol=poller.protocol, report=seen)
                 except Exception as e:                        # noqa: BLE001
                     ok, detail = False, (f"apply error: "
                                          f"{type(e).__name__}: {e}")
@@ -3131,6 +3185,7 @@ def main():
                 changed = detail != ticket_header.detail
                 ticket_header.record_result(due["rev"], ok, detail)
                 if ok:
+                    ticket_header.expiry_baseline = seen.get("expiry")
                     logger.info("🎟️ ticket header rev {} APPLIED{}: {}",
                                 due["rev"],
                                 f" on try {tries}" if tries > 1 else "",

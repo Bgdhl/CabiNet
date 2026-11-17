@@ -218,3 +218,28 @@ class TestReadMachineInfo:
         info = read_machine_info(port, 1, sleep=no_sleep)
         assert info.serial_number is None
         assert info.registry_key == "sas:WS:PT0091"
+
+
+class TestExtendedValidationStatusPoll:
+    """Long poll 7B, SAS 6.02 Table 15.2a (audit item 39)."""
+
+    def test_the_default_is_still_read_only(self):
+        from core.sas_machine_info import build_extended_validation_status_poll
+        frame = build_extended_validation_status_poll(1)
+        assert frame[:3] == bytes([0x01, 0x7B, 0x08])
+        assert frame[3:11] == bytes(8)
+
+    def test_setting_the_cashable_expiry_leaves_the_control_mask_alone(self):
+        from core.sas_machine_info import build_extended_validation_status_poll
+        frame = build_extended_validation_status_poll(1, cashable_days=180)
+        assert frame[3:7] == bytes(4)                # mask and states: 0000
+        assert frame[7:9] == bytes([0x01, 0x80])     # 0180 BCD days
+        assert frame[9:11] == bytes(2)               # restricted: no change
+        never = build_extended_validation_status_poll(1, cashable_days=9999)
+        assert never[7:9] == bytes([0x99, 0x99])
+
+    def test_out_of_range_days_are_refused(self):
+        import pytest
+        from core.sas_machine_info import build_extended_validation_status_poll
+        with pytest.raises(ValueError):
+            build_extended_validation_status_poll(1, cashable_days=10000)
