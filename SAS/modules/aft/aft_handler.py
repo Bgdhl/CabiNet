@@ -393,12 +393,18 @@ class AFTRegistration:
 
 def build_aft_register_poll(address: int, code: int, asset_number: bytes,
                             registration_key: bytes, pos_id: bytes) -> bytes:
-    """0x73 register/initialize/unregister — VERIFY_ON_BENCH layout:
-    [addr][73][len][code][asset 4][key 20][POS ID 4][crc]."""
-    if code not in (REG_CODE_INITIALIZE, REG_CODE_REGISTER,
-                    REG_CODE_UNREGISTER):
-        raise ValueError(f"unknown registration code 0x{code:02X} "
-                         "(interrogate has its own builder)")
+    """0x73 initialize (00) or register (01), SAS 6.02 Table 8.1a:
+    [addr][73][len][code][asset 4][key 20][POS ID 4][crc].
+
+    Interrogate (FF) and unregister (80) carry the code alone, "omitting
+    the remaining fields", and have their own builders. Until v0.3.16
+    this one took code 80 and sent it with the full body, which a machine
+    may treat as a poll out of sequence (nothing ever called it that
+    way)."""
+    if code not in (REG_CODE_INITIALIZE, REG_CODE_REGISTER):
+        raise ValueError(f"registration code 0x{code:02X} does not take "
+                         "the full body (interrogate and unregister have "
+                         "their own builders)")
     if len(asset_number) != ASSET_NUMBER_LEN:
         raise ValueError("asset number is 4 wire bytes")
     if len(registration_key) != REGISTRATION_KEY_LEN:
@@ -410,6 +416,14 @@ def build_aft_register_poll(address: int, code: int, asset_number: bytes,
     return _crc_frame(body)
 
 
+def build_aft_unregister_poll(address: int) -> bytes:
+    """0x73 unregister, or cancel a registration cycle: [addr][73][len=01]
+    [80][crc] (SAS 6.02 §8.1: "a registration code of 80 and omitting the
+    remaining fields")."""
+    return _crc_frame(bytes([address, AFT_CMD_REGISTER, 1,
+                             REG_CODE_UNREGISTER]))
+
+
 def build_aft_register_interrogate_poll(address: int) -> bytes:
     """0x73 read current registration — VERIFY_ON_BENCH:
     [addr][73][len=01][FF][crc]."""
@@ -419,7 +433,13 @@ def build_aft_register_interrogate_poll(address: int) -> bytes:
 
 def parse_aft_register_response(data: bytes) -> AFTRegistration:
     """Parse SASPacket.data for 0x73: [len][status][asset 4][key 20]
-    [POS ID 4]. Raises ValueError on structural mismatch."""
+    [POS ID 4]. Raises ValueError on structural mismatch.
+
+    Bytes after the POS ID are ignored (SAS 6.02 §2.2.3: a host that
+    receives a valid variable length response with more data than it
+    expects "will process the portion of the message it understands and
+    ignore the extra bytes"). A body shorter than the three fields, other
+    than the status-only short form, is still refused."""
     if len(data) < 2:
         raise ValueError("register response too short")
     if data[0] != len(data) - 1:
@@ -427,8 +447,8 @@ def parse_aft_register_response(data: bytes) -> AFTRegistration:
     status = data[1]
     rest = data[2:]
     need = ASSET_NUMBER_LEN + REGISTRATION_KEY_LEN + POS_ID_LEN
-    if len(rest) not in (0, need):
-        raise ValueError(f"register body must be 0 or {need} bytes")
+    if rest and len(rest) < need:
+        raise ValueError(f"register body must be 0 or at least {need} bytes")
     if not rest:
         return AFTRegistration(status, b"", b"", b"")
     return AFTRegistration(
@@ -1104,9 +1124,14 @@ def aft_transfer(transport, address: int, request: AFTTransferRequest,
             lock = _read_lock(transport, address, proto)
             attempts += 1
         if lock is None or not lock.locked:
-            if lock is not None:
-                sleep(pace)
-                _read_lock(transport, address, proto, LOCK_CODE_CANCEL)
+            # Cancel on EVERY failed exit, the lost answer included. §8.2:
+            # a machine "may stay in the lock pending state indefinitely",
+            # so a request whose answer we never saw can still be waiting,
+            # and would lock the game for five seconds the next time it
+            # goes idle, with no transfer coming. Until v0.3.16 the cancel
+            # was only sent when an answer had been read.
+            sleep(pace)
+            _read_lock(transport, address, proto, LOCK_CODE_CANCEL)
             state = advance(state, AFTTxnEvent.STATUS_ERROR)
             return AFTTransferResult(
                 AFTOutcome.LOCK_FAILED, state, request, reg, lock, None, False,

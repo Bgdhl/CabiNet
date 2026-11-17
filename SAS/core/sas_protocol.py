@@ -403,12 +403,23 @@ class SASProtocol:
         return self.build_packet(address, MULTIDENOM_PREAMBLE,
                                  bytes([len(body)]) + body)
 
-    def parse_multidenom_response(self, address: int, reply: bytes) -> dict:
+    def parse_multidenom_response(self, address: int, reply: bytes,
+                                  expect_denom: Optional[int] = None) -> dict:
         """SAS 6.02 §16.1 Table 16.1b — decode a B0 preamble response.
 
             [addr][B0][length][denom][base cmd][data...][CRC16]
 
         Returns {ok, denom, baseCommand, data, error, errorText, outcome}.
+
+        The frame is checked before anything in it is believed (audit item
+        12): it must be exactly length + 5 bytes and its CRC must be right
+        (§2.2.3: a message is valid only "followed by a correct CRC"), else
+        `malformed`. With `expect_denom`, the denomination it echoes must
+        be the one asked for, else `wrong_denom`; asking for 00 (the
+        default denomination) accepts whatever the machine resolved it to.
+        Until v0.3.16 none of this was checked: a damaged or cut-short
+        answer was acted on, and an answer the machine re-sent for the
+        previous denomination was credited to the next one asked.
 
         ⭐ The reason this matters: base command byte 00 means ERROR and the
         data is a 1-byte code from Table 16.1c. And for base polls that answer
@@ -419,7 +430,10 @@ class SASProtocol:
         `outcome` values:
           silent | busy      — nothing / the §4.1 [addr][00] frame, i.e. the
                                PREAMBLE itself was not serviced
-          malformed          — not a B0 response from this address
+          malformed          — not a B0 response from this address, the
+                               wrong length, or a bad CRC
+          wrong_denom        — a good frame for another denomination than
+                               the one asked for (`expect_denom`)
           error              — base byte 00; `error`/`errorText` = Table 16.1c
           ack | nack         — ONLY for MULTIDENOM_ACKNACK_BASES (LP 09)
           busy_base          — the machine serviced the preamble but answered
@@ -456,11 +470,21 @@ class SASProtocol:
             out["outcome"] = "malformed"
             return out
         length = reply[2]
+        if len(reply) != length + 5 or \
+                sas_crc(reply[:-2]) != int.from_bytes(reply[-2:], "little"):
+            out["outcome"] = "malformed"
+            return out
         body = reply[3:3 + length]
         if len(body) < 2:
             out["outcome"] = "malformed"
             return out
         out["denom"] = body[0]
+        if expect_denom and body[0] != expect_denom:
+            out["outcome"] = "wrong_denom"
+            out["errorText"] = (f"the answer is for denomination code "
+                                f"0x{body[0]:02X}, not the 0x{expect_denom:02X} "
+                                "asked for")
+            return out
         base = body[1]
         payload = body[2:]
         out["data"] = payload

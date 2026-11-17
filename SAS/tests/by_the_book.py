@@ -116,6 +116,11 @@ class ByTheBookMachine:
         self.reset_unable = False    # answer 94 with code 01
         self.key_off_after_a8 = False  # an attendant resets it in between
         self._reset_done = False     # reset, its exception 52 still owed
+        # the clock (§7.17, §7.18): seconds this machine's clock is off by,
+        # or None for a machine that answers neither 7E nor 7F
+        self.clock_skew = None
+        self.clock_sets = 0
+        self.wall_clock = None       # a datetime.now stand-in for tests
         self.resends_on_nack = resends_on_nack      # True per §3.2
         # timekeeping (only with a clock)
         self.clock = clock
@@ -313,6 +318,17 @@ class ByTheBookMachine:
             return self._send_handpay_info()
         if command == 0x1A and len(raw) == 2:
             return frame(self.address, 0x1A, int_to_bcd(self.credits, 4))
+        if command in (0x7E, 0x7F) and self.clock_skew is None:
+            return b""                               # keeps no clock
+        if command == 0x7E and len(raw) == 2:
+            return frame(self.address, 0x7E, self._clock_bytes())
+        if command == 0x7F:
+            if sas_crc(raw[:-2]).to_bytes(2, "little") != raw[-2:]:
+                return b""
+            if self.nack.get(command):
+                self.nack[command] -= 1
+                return bytes([self.address | 0x80])
+            return self._set_clock(raw[2:9])
         if command in (0x01, 0x02, 0x94, 0xA8):
             if sas_crc(raw[:-2]).to_bytes(2, "little") != raw[-2:]:
                 return b""
@@ -338,6 +354,26 @@ class ByTheBookMachine:
         if command == 0x4D:
             return self._send_validation(raw[2])
         return b""                                   # not supported: ignored
+
+    def _now(self):
+        import datetime
+        return (self.wall_clock or datetime.datetime.now)()
+
+    def _clock_bytes(self):
+        import datetime
+        t = self._now() + datetime.timedelta(seconds=self.clock_skew)
+        return (int_to_bcd(t.month, 1) + int_to_bcd(t.day, 1)
+                + int_to_bcd(t.year, 2) + int_to_bcd(t.hour, 1)
+                + int_to_bcd(t.minute, 1) + int_to_bcd(t.second, 1))
+
+    def _set_clock(self, d):
+        import datetime
+        h = d.hex()
+        given = datetime.datetime(int(h[4:8]), int(h[0:2]), int(h[2:4]),
+                                  int(h[8:10]), int(h[10:12]), int(h[12:14]))
+        self.clock_skew = round((given - self._now()).total_seconds())
+        self.clock_sets += 1
+        return bytes([self.address])                 # Table 7.4b: ACK
 
     def _shutdown(self, off):
         self.shut_down = off
@@ -614,8 +650,8 @@ class ByTheBookAFTMachine(ByTheBookMachine):
 
     def _long(self, raw):
         command = raw[1]
-        if command not in (0x72, 0x73, 0x74):
-            return super()._long(raw)
+        if command not in (0x72, 0x73, 0x74) or command in self.deaf:
+            return super()._long(raw)       # (which keeps `deaf` deaf)
         if len(raw) < 4 or sas_crc(raw[:-2]).to_bytes(2, "little") != raw[-2:]:
             return b""
         if command == 0x73:

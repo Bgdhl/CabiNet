@@ -2333,11 +2333,11 @@ def main():
 
     st, _ = raw_post("/api/sas/report", json.dumps({
         "smibId": "smib-test", "address": "3", "online": True,
-        "machineInfo": {"denomCode": 9}}))
+        "machineInfo": {"denomCode": 0x1B}}))
     e = _sas_entry()
-    check("code with no bench-verified C-4 row -> state=unverified, "
-          "cents=None (never guessed)",
-          st == 200 and _ds(e, 9, None, "unverified"),
+    check("code with no whole-cent Table C-4 row (1B, half a cent) -> "
+          "state=unverified, cents=None (never guessed)",
+          st == 200 and _ds(e, 0x1B, None, "unverified"),
           f"got {e.get('denomSuggest')}")
 
     # Attacker-typed machineInfo: junk clamps to nulls; a null denomCode

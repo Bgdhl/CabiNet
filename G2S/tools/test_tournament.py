@@ -1096,9 +1096,35 @@ def main():
     check("verified code, operator disagrees -> mismatch",
           sug({"denomCents": 25, "machineInfo": {"denomCode": 1}}) ==
           {"code": 1, "cents": 1, "state": "mismatch"})
-    check("unlisted code -> unverified with cents=None (never guessed)",
-          sug({"denomCents": 25, "machineInfo": {"denomCode": 9}}) ==
-          {"code": 9, "cents": None, "state": "unverified"})
+    check("a code Table C-4 gives in fractions of a cent -> unverified "
+          "with cents=None (never guessed)",
+          sug({"denomCents": 25, "machineInfo": {"denomCode": 0x1B}}) ==
+          {"code": 0x1B, "cents": None, "state": "unverified"})
+    check("a reserved code -> unverified",
+          sug({"machineInfo": {"denomCode": 0x20}}) ==
+          {"code": 0x20, "cents": None, "state": "unverified"})
+    check("a quarter machine is offered 25 to confirm (Table C-4 code 04; "
+          "it was a bare code until v0.3.16)",
+          sug({"machineInfo": {"denomCode": 4}}) ==
+          {"code": 4, "cents": 25, "state": "confirm"})
+    check("...and flagged when the operator's setting disagrees",
+          sug({"denomCents": 1, "machineInfo": {"denomCode": 4}}) ==
+          {"code": 4, "cents": 25, "state": "mismatch"})
+    import importlib.util as _ilu, os as _os
+    _sp = _ilu.spec_from_file_location(
+        "sas_protocol_for_c4", _os.path.join(
+            _os.path.dirname(_os.path.dirname(_os.path.dirname(
+                _os.path.abspath(__file__)))), "SAS", "core",
+            "sas_protocol.py"))
+    try:
+        _m = _ilu.module_from_spec(_sp); _sp.loader.exec_module(_m)
+        _sat = {c: v for c, v in _m.DENOM_CODE_CENTS.items()
+                if isinstance(v, int)}
+    except Exception:                        # noqa: BLE001 — no crcmod here
+        _sat = None
+    check("the hub's table is the satellite's, whole-cent rows only",
+          _sat is None or gh.G2SHost.SAS_C4_DENOM_CENTS == _sat,
+          _sat)
     check("bool/invalid operator denom counts as unset -> confirm not match",
           sug({"denomCents": True, "machineInfo": {"denomCode": 1}}) ==
           {"code": 1, "cents": 1, "state": "confirm"})
@@ -3009,7 +3035,7 @@ def main():
           {"machineInfo": e2.get("machineInfo"),
            "denomSuggest": e2.get("denomSuggest")})
     d8.sas_report({"smibId": "smib-mi", "address": "1", "online": True,
-                   "machineInfo": {"denomCode": 9, "totalGames": 3,
+                   "machineInfo": {"denomCode": 0x1B, "totalGames": 3,
                                    "enabledGames": [7]}}, "10.0.0.9")
     e3 = d8.sas_machines["smib-mi/1"]
     check("a FRESH census always wins over the carried copy",

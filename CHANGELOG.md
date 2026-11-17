@@ -1,5 +1,53 @@
 # Changelog
 
+## v0.3.16
+Seventh and last batch from the SAS audit: meters, denominations and the
+remainder. Twelve smaller items.
+- **A ticket's issue time is the satellite's own clock.** It was the date
+  inside the machine's ticket record, which is the machine's clock and is
+  wrong after a RAM clear or with a dead clock battery. The hub works
+  ticket expiry from the issue time, so a ticket stamped years back could
+  be removed as expired the same day it printed. The machine's date is
+  kept with the ticket for the record.
+- **The machine's clock is kept in step.** The satellite reads the
+  machine's date and time when it comes online and once a day, and sets
+  it when it is more than five seconds off. That is what the machine
+  prints on tickets and writes in its own logs, and it is wrong after a
+  RAM clear. The satellite only sets it when its own clock comes from a
+  time source (NTP); a Pi that started without one leaves the machine
+  alone and says so in its log. A machine kept right some other way,
+  such as over G2S, just reads as in step.
+- **The hub offers the right denomination for every machine.** A SAS
+  machine reports its accounting denomination as a code. The hub only
+  knew one code (1 cent), so any other machine showed a bare code for the
+  operator to work out. It now knows the document's whole table and
+  offers the value ("25 cents") to confirm. It is still only offered: the
+  operator's setting is what money is worked from.
+- **Each machine gets its own validation ID.** Every machine was seeded
+  with the same one, so two machines' ticket numbers were kept apart only
+  by when they were seeded. The ID is now worked out from the satellite
+  and the machine's address, and the starting sequence is sent in the
+  byte order the document gives. This takes effect the next time a
+  machine is seeded (after a RAM clear, or from Settings).
+- **A call to the hub for a ticket decision has one time limit.** The
+  2.5 seconds applied to each step of the call, so a slow hub could hold
+  the machine unpolled for five seconds or more, at which point it hands
+  the ticket back. It now applies to the whole call.
+- **The multi-denomination answer is checked before it is used**: its
+  length, its checksum, and that it is for the denomination asked for.
+- **A lock request that got no answer is cancelled.** It was only
+  cancelled when an answer had been read, so a machine that had put the
+  request on hold could lock itself later with no transfer coming.
+- Answers that carry more bytes than expected are read, not refused (AFT
+  registration, validation status, enabled games), as the document asks.
+- Turning a game off reports which games are left, and says so when none
+  is. The per-denomination form labels a game number of 0000 as the
+  experiment it is.
+- The extended meter read keeps "not supported" apart from zero and
+  takes twelve codes; the jackpot meter has a parser; the enabled
+  features poll can no longer be built without its game number; an
+  unregister poll carries the code alone.
+
 ## v0.3.15
 Sixth batch from the SAS audit: lock, unlock and handpay reset report
 what the machine answered.
