@@ -212,6 +212,12 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
             text-align: center; font-size: 44px; line-height: 52px;
             font-weight: bold; color: #e8c266;
             overflow: hidden; white-space: nowrap; }
+/* Free Slot Play (the player's restricted promotional balance): the line
+   under the wallet balance shows the balance NOT in the big figure and
+   switches the two when tapped. Hidden when the player has none. */
+#wl-fsp   { position: absolute; left: 32px; top: 184px; width: 320px;
+            text-align: center; font-size: 15px; line-height: 20px;
+            letter-spacing: 1px; color: #7fd0a8; display: none; }
 #wl-mc-l  { position: absolute; left: 32px; top: 240px; width: 320px;
             text-align: center; font-size: 13px; letter-spacing: 2px;
             color: #55708a; }
@@ -422,6 +428,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   /* --- MY WALLET ------------------------------------------------------- */
   #wl-label { top: 72px; } #wl-bal { top: 92px; font-size: 34px;
                                      line-height: 40px; }
+  #wl-fsp   { top: 134px; font-size: 13px; line-height: 16px; }
   #wl-mc-l  { top: 170px; } #wl-mc-v { top: 190px; font-size: 24px;
                                        line-height: 30px; }
   #wl-note  { top: 252px; }
@@ -529,6 +536,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   <div class="vt">MY WALLET</div>
   <div id="wl-label">WALLET BALANCE</div>
   <div id="wl-bal">&#8212;</div>
+  <div id="wl-fsp"></div>
   <div id="wl-mc-l">ON THIS MACHINE</div>
   <div id="wl-mc-v">&#8212;</div>
   <div id="wl-note"></div>
@@ -738,6 +746,14 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
                                      // only when a DIFFERENT player sits down
   var coMachineMc = 0;               // cashout: machine credits (millicents)
   var coWalletMc = null;             // wallet balance (millicents); null = none
+  // FREE SLOT PLAY (2026-11-17): the player's second wallet balance — the
+  // hub's restricted promotional credit, which has to be played and is
+  // never cash. The player sees it as Free Slot Play (AJ: "on the players
+  // glass side it should be listed as Free Slot Play"). The big figure
+  // shows one balance and the line under it the other; tapping either
+  // switches them, and ADD CREDITS loads the one in the big figure.
+  var coRestrMc = 0;                 // Free Slot Play balance (millicents)
+  var coUseRestr = false;            // the big figure is Free Slot Play
   var coCanFund = false;             // funding allowed (linked + path available)
   var coHasWallet = false;           // a wallet exists at all (gates the toggle)
   var coCashToWat = false;           // current cash-out-to-wallet arm state
@@ -923,6 +939,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
       if (!overlay && sinceIso && sinceIso !== lastPlayerSince) {
         lastPlayerSince = sinceIso;
         selIdx = 1; selCents = CHIPS[selIdx];   // no carryover between players
+        coUseRestr = false;
       }
       if (fresh || view === 'attract') {
         show('home');          // card-in (or back from offline) -> home menu
@@ -1048,7 +1065,8 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     // 40px bold, so step the font DOWN: every digit stays on the panel
     setStyle($('ph-credits'), 'fontSize',
       (credits && credits.length > 13) ? '28px' : '40px');
-    setMoney('wl-bal', credits || '—');
+    // (while the player has switched to Free Slot Play, that is the figure)
+    setMoney('wl-bal', coUseRestr ? fmtMc(coRestrMc) : (credits || '—'));
     // the 320px balance column clips silently on long balances at 44px bold,
     // so step the font DOWN: every digit stays on the panel
     var wlLen = (credits || '—').length;
@@ -1211,15 +1229,47 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
       ? 0 : d.machineCreditsMc;
     coWalletMc = (d.walletMc === undefined || d.walletMc === null)
       ? null : d.walletMc;
+    coRestrMc = (typeof d.walletRestrictedMc === 'number' && d.walletRestrictedMc > 0)
+      ? d.walletRestrictedMc : 0;
+    if (!coRestrMc) { coUseRestr = false; }
     coCanFund = (d.canFund === true);
     coCashToWat = (d.cashOutToWat === true);
     coHasWallet = (coWalletMc !== null) || coCanFund;
+    paintWalletKind();
     setMoney('wl-mc-v', fmtMc(coMachineMc));
     setText('wl-note', coHasWallet ? ''
       : 'Link a card to move money to and from your wallet.');
     paintWalletChips();
     setBtnOff('wl-add', !coCanFund);
     setWalletToggleFace();
+  }
+  // Which balance is in the big figure, and what the line under it says.
+  function paintWalletKind() {
+    var line = $('wl-fsp');
+    if (!coRestrMc) {
+      setText('wl-label', 'WALLET BALANCE');
+      setStyle(line, 'display', 'none');
+      return;
+    }
+    setStyle(line, 'display', 'block');
+    if (coUseRestr) {
+      setText('wl-label', 'FREE SLOT PLAY');
+      setMoney('wl-bal', fmtMc(coRestrMc));
+      setText('wl-fsp', 'CASH ' + (coWalletMc === null ? '\u2014' : fmtMc(coWalletMc))
+        + ' \u00b7 TAP TO USE');
+    } else {
+      setText('wl-label', 'WALLET BALANCE');
+      setText('wl-fsp', 'FREE SLOT PLAY ' + fmtMc(coRestrMc) + ' \u00b7 TAP TO USE');
+    }
+  }
+  function switchWalletKind() {
+    if (!coRestrMc) { return; }
+    coUseRestr = !coUseRestr;
+    if (!coUseRestr) {
+      setMoney('wl-bal', coWalletMc === null ? '\u2014' : fmtMc(coWalletMc));
+    }
+    paintWalletKind();
+    setText('wl-fund-msg', '');
   }
   function paintWalletChips() {
     for (var i = 0; i < 3; i++) {
@@ -1568,6 +1618,16 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   $('kp-cancel').onclick = closeKeypad;
   $('wl-add').onclick = function () {
     if (!coCanFund) { return; }
+    if (coUseRestr) {
+      if (selCents * 1000 > coRestrMc) {
+        setText('wl-fund-msg', 'Not enough Free Slot Play'); return;
+      }
+      askConfirm('ADD ' + fmtCents(selCents) + ' FREE SLOT PLAY?',
+        'Moves ' + fmtCents(selCents) + ' of Free Slot Play from your wallet '
+        + 'to this machine. It has to be played.',
+        { action: 'walletFund', cents: selCents, restricted: true }, 'wallet');
+      return;
+    }
     if (coWalletMc !== null && selCents * 1000 > coWalletMc) {
       setText('wl-fund-msg', 'Not enough in your wallet'); return;
     }
@@ -1575,6 +1635,8 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
       'Moves ' + fmtCents(selCents) + ' from your wallet to this machine.',
       { action: 'walletFund', cents: selCents }, 'wallet');
   };
+  $('wl-bal').onclick = switchWalletKind;
+  $('wl-fsp').onclick = switchWalletKind;
   $('wl-toggle').onclick = function () {
     // HOST-CONTROL cash-out: pull the machine's credits to the wallet NOW via
     // a money-confirm (cashOutNow). The hub owns any refusal wording (a machine

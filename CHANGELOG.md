@@ -13,9 +13,10 @@ Play".
   could already move it but the page never offered it.
 - **Giving it to a player.** The Players page fund box has a "restricted
   promotional" tick box, for giving and for pulling back.
-- **Loading it from the glass.** When a carded player has Free Slot Play,
-  tapping their wallet balance on the glass switches between cash and
-  Free Slot Play, and ADD CREDITS loads the one shown.
+- **Loading it from the player's screen.** On the SMIB player screen and
+  the digital glass, a carded player with Free Slot Play sees it on a
+  line under their wallet balance. Tapping it (or the balance) swaps
+  which one is the big figure, and ADD CREDITS loads the one shown.
 - **Cashing it out to the wallet.** A SAS cash-out to the wallet now
   takes the machine's restricted credit along with its cash and puts
   each in its own balance. Before, restricted credit was left on the
