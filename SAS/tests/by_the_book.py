@@ -285,14 +285,17 @@ class ByTheBookAFTMachine(ByTheBookMachine):
     still sends bare general polls in a row (audit item 4)."""
 
     def __init__(self, credits=0, honours_cancel=False, complete_after=None,
-                 hears_initiate=True, **kw):
+                 hears_initiate=True, restricted=0, complete_in=None, **kw):
         kw.setdefault("counts_idle_general_polls", False)
         super().__init__(**kw)
         self.asset = bytes([0x92, 0x10, 0x00, 0x00])
         self.key = bytes(range(20))
         self.pos = b"\x01\x00\x00\x00"
         self.credits = credits               # cashable
-        self.restricted = 0                  # restricted promotional
+        self.restricted = restricted         # restricted promotional
+        # complete the transfer this many general polls after it starts,
+        # i.e. inside the host's normal wait (None: only when told to)
+        self.complete_in = complete_in
         self.honours_cancel = honours_cancel
         self.complete_after = complete_after
         self.hears_initiate = hears_initiate    # False: the 0x72 is lost
@@ -372,7 +375,8 @@ class ByTheBookAFTMachine(ByTheBookMachine):
         status = 0x00 if self.locked else 0xFF
         return self._framed(0x74, self.asset
                             + bytes([status, 0x03, 0x00, 0xFF, 0x0A])
-                            + int_to_bcd(self.credits, 5) + bytes(10)
+                            + int_to_bcd(self.credits, 5)
+                            + int_to_bcd(self.restricted, 5) + bytes(5)
                             + int_to_bcd(1000000, 5))
 
     def _status(self, t):
@@ -420,4 +424,6 @@ class ByTheBookAFTMachine(ByTheBookMachine):
                       "type": d[2], "cents": int(d[3:8].hex()),
                       "restricted": int(d[8:13].hex()), "status": 0x40}
         self.started.append(self.cycle["txn"])
+        if self.complete_in is not None:
+            self._countdown = self.complete_in
         return self._status(self.cycle)

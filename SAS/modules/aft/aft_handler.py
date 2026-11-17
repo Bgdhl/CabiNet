@@ -1213,6 +1213,9 @@ def judge_open_transfer(rec: Dict,
         full = event == AFTTxnEvent.STATUS_FULL
         return {"ok": True, "outcome": "completed" if full else "partial",
                 "amountCents": int(amount),
+                # a cash-out can carry restricted credit as well as cash
+                "restrictedCents": int(status.restricted_cents or 0)
+                if rec.get("kind") != "aft_transfer" else 0,
                 "detail": ("full transfer successful" if full else
                            f"partial transfer: {amount} cashable cents")
                 + note}

@@ -283,6 +283,70 @@ def main():
           store.get(qid)["cashableMillicents"] == 900_000
           and non(qid) == 100_000)
 
+    print("— a cash-out with restricted credit lands in both balances")
+    # 2026-11-16: the satellite pulls restricted credit off the machine
+    # with the cash and reports it as restrictedCents.
+    class CashStub:
+        SAS_AFT_MAX_CENTS = 1_000_000
+        _settle_aft_cashouts = G.G2SHost._settle_aft_cashouts
+
+        def __init__(self, pin):
+            self.account_store = store
+            self._aft_cashouts_settled = set()
+            self._aft_cashout_unconfirmed = set()
+            self.pin, self.flags, self.disarmed = pin, [], []
+
+        def _sas_cashout_pin(self, key):
+            return self.pin
+
+        def _flag_unhomed_cashout(self, *a, **k):
+            self.flags.append((a, k))
+
+        def _disarm_sas_leg(self, key):
+            self.disarmed.append(key)
+
+        def _tournament_pin_consumed(self, key):
+            pass
+
+    w, _ = store.create("Wally")
+    wid = w["id"]
+    co = CashStub(wid)
+
+    def out(txn, cents, restricted=None):
+        rec = {"type": "aft_cashout", "ok": True, "outcome": "completed",
+               "txnId": txn, "amountCents": cents}
+        if restricted is not None:
+            rec["restrictedCents"] = restricted
+        co._settle_aft_cashouts([rec], "bb2/1")
+
+    def bal():
+        a = store.get(wid)
+        return a["cashableMillicents"], a["nonCashMillicents"]
+
+    out("CO1", 2500, 1500)
+    check("cash to cash, restricted to restricted", bal() == (2_500_000,
+                                                              1_500_000))
+    rows = [e for e in store.state["ledger"] if e.get("ref") == "aftcashout:CO1"]
+    check("two ledger rows under the one ref, one per balance",
+          sorted(e.get("kind") for e in rows) == ["cashable", "nonCash"])
+    out("CO1", 2500, 1500)
+    check("the same record again books nothing more",
+          bal() == (2_500_000, 1_500_000))
+    out("CO2", 0, 700)
+    check("restricted credit alone is a real cash-out, not an "
+          "'amount unconfirmed' hold",
+          bal() == (2_500_000, 2_200_000) and co.flags == [])
+    out("CO3", 300)
+    check("no restrictedCents at all is a cash-only cash-out as before",
+          bal() == (2_800_000, 2_200_000))
+    out("CO4", 0, 0)
+    check("nothing readable in either is still held loudly, not booked",
+          bal() == (2_800_000, 2_200_000) and len(co.flags) == 1)
+    for junk in (True, -5, "9", 1.5):
+        out(f"COJ{junk}", 100, junk)
+    check("a junk restricted figure books the cash and no restricted",
+          bal() == (3_200_000, 2_200_000))
+
     print("=" * 50)
     print(f"RESULT: {_passed} passed, {_failed} failed")
     return 1 if _failed else 0

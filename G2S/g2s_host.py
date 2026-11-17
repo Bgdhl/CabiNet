@@ -6814,8 +6814,14 @@ class G2SHost:
                 if len(self._aft_cashouts_settled) > 2048:
                     self._aft_cashouts_settled = {ref}
                 continue
+            # Restricted promotional credit that came off the machine with
+            # (or without) cash: credited to the SAME wallet's restricted
+            # balance, never to its cash (2026-11-16).
+            rc = r.get("restrictedCents")
+            rc = rc if isinstance(rc, int) and not isinstance(rc, bool) \
+                and rc > 0 else 0
             if (isinstance(cents, bool) or not isinstance(cents, int)
-                    or cents <= 0):
+                    or cents < 0 or (cents == 0 and rc == 0)):
                 # CONFIRMED completion (passed the ok+completed/partial gate)
                 # but the cashable amount is unreadable — the satellite reports
                 # cents=0 with an UNCONFIRMED marker when the completion BCD
@@ -6833,10 +6839,10 @@ class G2SHost:
                         "amount UNCONFIRMED (completion BCD unreadable) — "
                         "verify meters", path="SAS AFT (amount unconfirmed)")
                 continue
-            if cents > self.SAS_AFT_MAX_CENTS:
+            if cents + rc > self.SAS_AFT_MAX_CENTS:
                 log.warning("💵 [sas:%s] AFT cash-out %r reports %d cents — "
                             "over the %d ceiling; NOT credited", key, txn,
-                            cents, self.SAS_AFT_MAX_CENTS)
+                            cents + rc, self.SAS_AFT_MAX_CENTS)
                 continue
             # Destination wallet: THE HUB'S OWN ARM (_glass_cash_out_pin for
             # this machine), NEVER the wire's echoed accountId. The
@@ -6853,9 +6859,11 @@ class G2SHost:
             note = f"AFT cash-out from {key} to wallet ({r.get('outcome')})"
             acct = err = None
             if acct_id:
+                # one adjust, both buckets: cash and restricted land
+                # together under the same ref, or neither does
                 acct, err = self.account_store.adjust(
-                    acct_id, d_cash=cents * 1000, note=note, ref=ref,
-                    once=True)
+                    acct_id, d_cash=cents * 1000, d_non=rc * 1000,
+                    note=note, ref=ref, once=True)
             self._aft_cashouts_settled.add(ref)
             if len(self._aft_cashouts_settled) > 2048:
                 self._aft_cashouts_settled = {ref}
@@ -6866,14 +6874,16 @@ class G2SHost:
                 # goes unanswered → the machine tickets (it is answering
                 # cash-outs the hub can't home — stop the bleeding).
                 self._flag_unhomed_cashout(
-                    key, txn, cents * 1000, acct_id or wire_acct, err,
+                    key, txn, (cents + rc) * 1000, acct_id or wire_acct, err,
                     path="SAS AFT")
                 self._disarm_sas_leg(key)
             else:
                 bal = int((acct or {}).get("cashableMillicents", 0))
                 log.info("💵 [sas:%s] AFT CASH-OUT CONFIRMED — credited %s "
-                         "$%.2f (txn %s); cashable now $%.2f",
-                         key, acct_id, cents / 100, txn, bal / 100000)
+                         "$%.2f%s (txn %s); cashable now $%.2f",
+                         key, acct_id, cents / 100,
+                         f" and ${rc / 100:.2f} restricted" if rc else "",
+                         txn, bal / 100000)
                 if acct_id == "house":
                     # only a tournament sweep ever pins the House — this
                     # settle IS that sweep landing, so consume its pins:
