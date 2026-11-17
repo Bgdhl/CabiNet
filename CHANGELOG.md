@@ -16,6 +16,15 @@ Third batch from the G2S audit: configuration changes. Eight items.
   WMS Bluebird 2 keeps two of the handpay settings to itself, so the
   hub's change was refused whole at every join, the settings it does
   allow included. They are now left as the machine has them.
+- **The two things the hub re-applies at every join each wait for the
+  machine's own answer.** The ticket header and the remote handpay
+  reset are checked against the machine at join and sent again if a
+  memory clear has put them back. Each could be judged on the answer
+  to the other's question, using what the hub remembered from an
+  earlier join: a handpay setting that a memory clear had switched off
+  could be taken as still on, and the Bluebird was still sent the two
+  settings it keeps to itself. If a machine refuses the fuller read the
+  hub now makes, it is read the way earlier versions read it.
 - **An option change the hub gives up on is cancelled on the machine**
   instead of being left there waiting. One the machine has accepted and
   is waiting to apply is no longer shown as timed out or replaced.

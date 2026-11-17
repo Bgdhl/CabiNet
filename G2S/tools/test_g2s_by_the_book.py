@@ -1298,11 +1298,14 @@ def online(egm):
     return egm
 
 
-def answer_to(egm, cls, command, body, device="1"):
+def answer_to(egm, cls, command, body, device="1", where=None):
     """The EGM's RESPONSE to the newest request of that name from the host
-    (same sessionId, as §1.18.3.2 requires)."""
+    (same sessionId, as §1.18.3.2 requires). `where` narrows it to the
+    request that carried those attributes."""
     sid = [s for s, r in egm.assoc.sent_requests.items()
-           if r["command"] == command][-1]
+           if r["command"] == command
+           and all(r["attrs"].get(k) == v
+                   for k, v in (where or {}).items())][-1]
     egm.cid += 1
     ts = gh.now_iso()
     return egm._deliver(
@@ -1610,6 +1613,218 @@ def item_22_what_the_machine_lets_a_host_change():
           egm2.assoc.config_can_mod)
 
 
+HEADER = {"propName": "The Den", "line1": None, "line2": None,
+          "titleCash": None, "rev": 1}
+TEXT_SET = (("G2S_propName", "true", "The Den"),)
+TEXT_FACTORY = (("G2S_propName", "true", "YOUR ESTABLISHMENT"),)
+ALL_ON = tuple((p, "true", "true") for p, _m, _v in HANDPAY_PARAMS)
+
+
+def voucher_text(params=TEXT_SET, definitions=True):
+    """An optionList for G2S_voucher/1's text fields: (paramId,
+    canModRemote, value)."""
+    defs = ""
+    if definitions:
+        defs = ("<g2s:optionParameters><g2s:complexParameter "
+                'g2s:paramId="G2S_voucherTextFields">' + "".join(
+                    f'<g2s:stringParameter g2s:paramId="{p}" '
+                    f'g2s:canModRemote="{mod}"/>' for p, mod, _v in params)
+                + "</g2s:complexParameter></g2s:optionParameters>")
+    vals = ('<g2s:optionCurrentValues><g2s:complexValue '
+            'g2s:paramId="G2S_voucherTextFields">' + "".join(
+                f'<g2s:stringValue g2s:paramId="{p}">{v}</g2s:stringValue>'
+                for p, _m, v in params)
+            + "</g2s:complexValue></g2s:optionCurrentValues>")
+    return ('<g2s:optionList><g2s:deviceOptions g2s:deviceClass="G2S_voucher"'
+            ' g2s:deviceId="1"><g2s:optionGroup '
+            'g2s:optionGroupId="G2S_voucherOptions"><g2s:optionItem '
+            f'g2s:optionId="G2S_voucherTextFields">{defs}{vals}'
+            "</g2s:optionItem></g2s:optionGroup></g2s:deviceOptions>"
+            "</g2s:optionList>")
+
+
+def changed_devices(cmds):
+    """The device class of every setOptionChange in there."""
+    return [o.get(f"{{{gh.SCHEMA_NS}}}deviceClass")
+            for _c, name, _a, el in cmds if name == "setOptionChange"
+            for o in el.iter() if gh.localname(o.tag) == "option"]
+
+
+def reads(cmds):
+    return [(a.get("deviceClass"), a.get("optionDetail"))
+            for _c, name, a, _e in cmds if name == "getOptionList"]
+
+
+def a_join(host, egm):
+    """What the join does once the device list is in: both re-asserts are
+    armed, the ticket one first, as the hub does it."""
+    host._maybe_push_ticket_header_on_join(egm.assoc)
+    host._maybe_arm_remote_handpay_on_join(egm.assoc)
+    drain(host, egm.assoc)
+
+
+VOUCHER = {"deviceClass": "G2S_voucher"}
+HANDPAY = {"deviceClass": "G2S_handpay"}
+
+
+def item_22_the_order_the_answers_arrive_in():
+    print("— audit item 22, as it went on the floor: the join makes two "
+          "reads, and the ticket one is answered first")
+    host = make_host()
+    host.ticket_header = lambda: dict(HEADER)
+    egm = online(joined(host, "BTB_order"))
+    a = egm.assoc
+    # the handpay options are already known: the machine sent its list
+    # unasked, with definitions that say nothing (a WMS Bluebird 2)
+    egm.send("optionConfig", handpay_options(bare=True))
+    mark = len(host.sent)
+    a_join(host, egm)
+    check("the ticket options are read first, then the handpay ones, both "
+          "with the definitions",
+          reads(sent_since(host, mark)) == [("G2S_voucher", "true"),
+                                            ("G2S_handpay", "true")],
+          reads(sent_since(host, mark)))
+    mark = len(host.sent)
+    answer_to(egm, "optionConfig", "getOptionList", voucher_text(),
+              where=VOUCHER)
+    check("the ticket answer lands: nothing is asked of the handpay device "
+          "on the strength of it (v0.3.20 sent the change here, before it "
+          "had read what the machine lets a host change, and the Bluebird "
+          "refused it: G2S_OCX015)",
+          changed_devices(sent_since(host, mark)) == []
+          and a.handpay_arm_pending is True,
+          (changed_devices(sent_since(host, mark)), a.handpay_arm_pending))
+    mark = len(host.sent)
+    answer_to(egm, "optionConfig", "getOptionList", handpay_options(),
+              where=HANDPAY)
+    sent = values_sent(sent_since(host, mark))
+    check("the handpay answer lands: the change goes now, and leaves what "
+          "the machine keeps to itself as the machine has it",
+          sent is not None and sent.get("G2S_enabledRemoteCredit") == "true"
+          and sent.get("G2S_disabledRemoteCredit") == "false"
+          and sent.get("G2S_disabledRemoteHandpay") == "false", sent)
+
+    print("— the other way round: the ticket text waits for its own answer")
+    host = make_host()
+    host.ticket_header = lambda: dict(HEADER)
+    egm = online(joined(host, "BTB_order_ticket"))
+    a = egm.assoc
+    egm.send("optionConfig", voucher_text(TEXT_FACTORY, definitions=False))
+    a_join(host, egm)
+    mark = len(host.sent)
+    answer_to(egm, "optionConfig", "getOptionList", handpay_options(ALL_ON),
+              where=HANDPAY)
+    check("the handpay answer lands first: no ticket text is sent on it",
+          changed_devices(sent_since(host, mark)) == []
+          and a.ticket_push_pending is True,
+          changed_devices(sent_since(host, mark)))
+    mark = len(host.sent)
+    answer_to(egm, "optionConfig", "getOptionList",
+              voucher_text(TEXT_FACTORY), where=VOUCHER)
+    check("the ticket answer lands: the header is sent",
+          changed_devices(sent_since(host, mark)) == ["G2S_voucher"]
+          and values_sent(sent_since(host, mark)).get("G2S_propName")
+          == "The Den", sent_since(host, mark))
+
+    print("— a memory clear between two joins (what the re-assert is for)")
+    host = make_host()
+    host.ticket_header = lambda: dict(HEADER)
+    egm = online(joined(host, "BTB_order_cleared"))
+    a = egm.assoc
+    a_join(host, egm)
+    answer_to(egm, "optionConfig", "getOptionList", voucher_text(),
+              where=VOUCHER)
+    mark = len(host.sent)
+    answer_to(egm, "optionConfig", "getOptionList", handpay_options(ALL_ON),
+              where=HANDPAY)
+    check("first join, the machine is set: nothing is sent",
+          changed_devices(sent_since(host, mark)) == []
+          and a.handpay_arm_pending is False)
+    egm.comms_online(reset=True)            # cleared, and back
+    online(egm)
+    a_join(host, egm)
+    mark = len(host.sent)
+    answer_to(egm, "optionConfig", "getOptionList", voucher_text(),
+              where=VOUCHER)
+    check("second join, the ticket answer lands: the re-assert does not "
+          "judge the handpay options by what the hub kept from the first "
+          "join (it did, found them on, and stood down)",
+          a.handpay_arm_pending is True
+          and changed_devices(sent_since(host, mark)) == [],
+          a.handpay_arm_pending)
+    mark = len(host.sent)
+    answer_to(egm, "optionConfig", "getOptionList", handpay_options(
+        tuple((p, "true", "false") for p, _m, _v in HANDPAY_PARAMS)),
+        where=HANDPAY)
+    sent = values_sent(sent_since(host, mark))
+    check("the handpay answer shows them off again: they are switched "
+          "back on", sent is not None
+          and sent.get("G2S_enabledRemoteCredit") == "true", sent)
+    host = make_host()
+    host.ticket_header = lambda: dict(HEADER)
+    egm = online(joined(host, "BTB_order_cleared_text"))
+    a = egm.assoc
+    a_join(host, egm)
+    answer_to(egm, "optionConfig", "getOptionList", voucher_text(),
+              where=VOUCHER)
+    answer_to(egm, "optionConfig", "getOptionList", handpay_options(ALL_ON),
+              where=HANDPAY)
+    egm.comms_online(reset=True)
+    online(egm)
+    a_join(host, egm)
+    mark = len(host.sent)
+    answer_to(egm, "optionConfig", "getOptionList", handpay_options(ALL_ON),
+              where=HANDPAY)
+    check("the ticket text likewise: with the handpay answer first, it is "
+          "not judged by the text kept from the first join",
+          a.ticket_push_pending is True
+          and changed_devices(sent_since(host, mark)) == [],
+          a.ticket_push_pending)
+    mark = len(host.sent)
+    answer_to(egm, "optionConfig", "getOptionList",
+              voucher_text(TEXT_FACTORY), where=VOUCHER)
+    check("its own answer shows the factory text: the header is sent again",
+          changed_devices(sent_since(host, mark)) == ["G2S_voucher"],
+          changed_devices(sent_since(host, mark)))
+
+    print("— a machine that refuses the read with the definitions")
+    host = make_host()
+    egm = online(joined(host, "BTB_order_refused"))
+    a = egm.assoc
+    egm.send("optionConfig", handpay_options(bare=True))
+    host._maybe_arm_remote_handpay_on_join(a)
+    drain(host, a)
+    sid = [s for s, r in a.sent_requests.items()
+           if r["command"] == "getOptionList"
+           and r["attrs"].get("optionDetail") == "true"][-1]
+    mark = len(host.sent)
+    egm.refuse("optionConfig", sid, "G2S_OCX001")
+    check("the values are read alone, as every version before read them, "
+          "and nothing is changed yet",
+          reads(sent_since(host, mark)) == [("G2S_handpay", "false")]
+          and changed_devices(sent_since(host, mark)) == [],
+          names(sent_since(host, mark)))
+    mark = len(host.sent)
+    answer_to(egm, "optionConfig", "getOptionList",
+              handpay_options(definitions=False),
+              where={"deviceClass": "G2S_handpay", "optionDetail": "false"})
+    sent = values_sent(sent_since(host, mark))
+    check("that answer lands: the re-assert runs as it always did",
+          sent is not None and sent.get("G2S_enabledRemoteCredit") == "true"
+          and a.handpay_arm_pending is False, sent)
+    host = make_host()
+    egm = online(joined(host, "BTB_order_refused_twice"))
+    a = egm.assoc
+    host._maybe_arm_remote_handpay_on_join(a)
+    drain(host, a)
+    sid = list(a.sent_requests)[-1]
+    egm.refuse("optionConfig", sid, "G2S_OCX001")
+    mark = len(host.sent)
+    egm.refuse("optionConfig", list(a.sent_requests)[-1], "G2S_OCX001")
+    check("the second read refused as well: it is not asked a third time",
+          reads(sent_since(host, mark)) == [], reads(sent_since(host, mark)))
+
+
 def change_status(cfg, txn, status, exc="0"):
     return (f'<g2s:optionChangeStatus g2s:configurationId="{cfg}" '
             f'g2s:transactionId="{txn}" g2s:changeStatus="{status}" '
@@ -1834,6 +2049,7 @@ def main():
     item_42_a_request_past_its_time_to_live()
     items_5_and_8_a_machine_left_in_a_config_mode()
     item_22_what_the_machine_lets_a_host_change()
+    item_22_the_order_the_answers_arrive_in()
     item_26_a_set_the_hub_gives_up_on()
     items_21_24_25_37_the_ownership_claim()
     print("=" * 50)

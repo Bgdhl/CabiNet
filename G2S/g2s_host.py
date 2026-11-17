@@ -1835,6 +1835,15 @@ class EgmAssociation:
         # here has not been asked about: nothing is known, and it is treated
         # as it always was.
         self.config_can_mod = {}
+        # The devices ("deviceClass/deviceId") whose read WITH the
+        # definitions has been answered, or refused, since the join last
+        # asked for it. Each of the two re-asserts a join makes waits for
+        # its own device to be in here before it sends anything: the
+        # handpay one used to run when the ticket read's answer landed,
+        # before the handpay definitions had been read, and asked a WMS
+        # Bluebird 2 for parameters it keeps to itself (G2S_OCX015 at
+        # every join, v0.3.20 on the floor, 2026-11-17).
+        self.option_detail_settled = set()
         self.vouchers = []
         self.voucher_count = 0
         # voucher redemption tier-2 (G2S-26): redemptions is a bounded ring
@@ -17628,8 +17637,9 @@ class G2SHost:
         (the getDescriptor pattern) but may be scoped to one device;
         optionGroupId/optionId take G2S_all; optionDetail=false asks for
         current VALUES only — the same shape the unsolicited config-sync
-        push carries and all the optionList parser stores (optionDetail=true
-        would add optionParameters/defaults, which it skips). The EGM
+        push carries; optionDetail=true adds the parameter definitions,
+        from which the optionList parser keeps canModRemote (what the
+        machine lets a host change) and nothing else. The EGM
         answers with the same optionList command in RESPONSE form (§9.13
         'sent in response to a getOptionList'), which the widened optionList
         handler parses + persists; a response draws NO optionListAck. Wired
@@ -18197,6 +18207,7 @@ class G2SHost:
                 return
             assoc.ticket_push_epoch = assoc.epoch
             assoc.ticket_push_pending = True
+            assoc.option_detail_settled.discard("G2S_voucher/1")
         log.info("🎫 [%s] join: re-asserting the hub ticket header — reading "
                  "G2S_voucher/1 options first (a RAM clear silently restores "
                  "the EGM's factory ticket text)", assoc.egm_id)
@@ -18206,11 +18217,15 @@ class G2SHost:
                                      device_id="1", option_detail=True)
 
     def _ticket_push_after_option_list(self, assoc):
-        """The voucher optionList landed — run the armed join push, if any.
-        Called from the optionList handler AFTER the inventory is folded in,
-        so push_ticket_header_g2s sees current values."""
+        """An optionList landed — run the armed join push, if any, once the
+        join's own read of G2S_voucher/1 is the one that has been answered
+        (option_detail_settled). Called from the optionList handler AFTER
+        the inventory is folded in, so push_ticket_header_g2s sees current
+        values and what the machine lets a host change."""
         with assoc.lock:
             if not assoc.ticket_push_pending:
+                return
+            if "G2S_voucher/1" not in assoc.option_detail_settled:
                 return
             assoc.ticket_push_pending = False
         for v in self.push_ticket_header_g2s(only=assoc):
@@ -18241,6 +18256,7 @@ class G2SHost:
                 return
             assoc.handpay_arm_epoch = assoc.epoch
             assoc.handpay_arm_pending = True
+            assoc.option_detail_settled.discard("G2S_handpay/1")
         log.info("💰 [%s] join: re-asserting remote handpay key-off — "
                  "reading G2S_handpay/1 options first (a RAM clear silently "
                  "resets G2S_enabledRemoteCredit)", assoc.egm_id)
@@ -18249,15 +18265,20 @@ class G2SHost:
 
     def _remote_handpay_arm_after_option_list(self, assoc):
         """A (any) optionList landed — run the armed remote key-off
-        re-assert once the handpay inventory is actually present. Stays
-        armed across landings that did not carry it (the voucher read from
-        the ticket twin lands on this same hook), so ordering between the
-        two join reads can never lose the arm; a machine that never
+        re-assert once the join's own read of G2S_handpay/1 has been
+        answered and the handpay inventory is actually present. Stays
+        armed across landings that were not that answer (the voucher read
+        from the ticket twin lands on this same hook), so ordering between
+        the two join reads can never lose the arm, and can never run it on
+        an inventory kept from an earlier join before this join's
+        definitions say what may be changed; a machine that never
         advertises the option costs one dict probe per landing and nothing
         on the wire."""
         key = "G2S_handpay/1/G2S_handpayOptions/G2S_handpayOptions"
         with assoc.lock:
             if not assoc.handpay_arm_pending:
+                return
+            if "G2S_handpay/1" not in assoc.option_detail_settled:
                 return
             has_opt = key in assoc.config_options
             if has_opt:
@@ -18986,6 +19007,23 @@ class G2SHost:
                     log.warning("[%s] ⚙️ OPTION CHANGE REJECTED (option=%s) — "
                                 "%s%s", assoc.egm_id, oid, rerr,
                                 f" ({hint})" if hint else "")
+                # A read that asked for the definitions, refused. What the
+                # machine lets a host change stays unknown for that device,
+                # and it is read once more the way every version before
+                # v0.3.20 read it (values only); the join's re-assert for
+                # it runs when that answer lands, and does not run at all
+                # if that is refused too, as before.
+                if ans_cmd == "getOptionList" and \
+                        ans_attrs.get("optionDetail") == "true":
+                    dc = ans_attrs.get("deviceClass")
+                    di = ans_attrs.get("deviceId")
+                    with assoc.lock:
+                        assoc.option_detail_settled.add(f"{dc}/{di}")
+                    log.warning("[%s] ⚙️  the read of %s/%s with its "
+                                "definitions was refused (%s) — reading the "
+                                "values alone", assoc.egm_id, dc, di, rerr)
+                    self.enqueue_get_option_list(
+                        assoc=assoc, device_class=dc, device_id=di)
             # G2S-39: a wat-class error is the verdict on a transfer only
             # when the request it refuses is that transfer's own: our
             # initiateRequest (found by its requestId) or our cancelRequest
@@ -21261,6 +21299,16 @@ class G2SHost:
                 # The inventory is folded in by now, so an armed join-time
                 # ticket-header push can finally read current values and
                 # decide whether the machine drifted (RAM clear) or matches.
+                # Each of the two waits for the answer to its own read:
+                # the device that read named, and any device the answer
+                # carried, are marked here, after their definitions are in.
+                if detailed:
+                    asked_attrs = asked.get("attrs") or {}
+                    with assoc.lock:
+                        assoc.option_detail_settled.update(synced)
+                        assoc.option_detail_settled.add(
+                            f"{asked_attrs.get('deviceClass')}/"
+                            f"{asked_attrs.get('deviceId')}")
                 self._ticket_push_after_option_list(assoc)
                 self._remote_handpay_arm_after_option_list(assoc)
 
