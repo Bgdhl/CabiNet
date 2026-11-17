@@ -440,6 +440,11 @@ def note_ticket_capture(addr, result, recent_events) -> None:
             "code": "0x4D", "label": f"validation record, not a ticket: {what}",
             "when": time.strftime("%Y-%m-%dT%H:%M:%S")})
         return
+    if not result.ok:
+        # nothing was captured: do not call that a ticket being issued
+        logger.info("🎫 addr {} ticket read found nothing ({}): {}", addr,
+                    result.outcome.value, result.detail)
+        return
     logger.info("🎫 addr {} ticket issued: {}", addr, result)
 
 
@@ -2878,6 +2883,13 @@ def main():
                     note_transfer_end(ended, reporter)
             except Exception as e:                        # noqa: BLE001
                 logger.warning("🏦 AFT follow-up failed (ignored): {}", e)
+            # Same for a ticket redemption the machine accepted and has
+            # not reported the end of (§15.12, exception 68).
+            try:
+                tito_host.service_open_redemption()
+            except Exception as e:                        # noqa: BLE001
+                logger.warning("🎫 redemption follow-up failed (ignored): "
+                               "{}", e)
         elif cashout_state["pending"]:
             # STALE-0x6A guard: a host-cashout request raised while the link
             # was up but not yet answered when the machine dropped OFFLINE is

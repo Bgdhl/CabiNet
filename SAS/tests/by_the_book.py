@@ -62,10 +62,14 @@ def frame(address, command, data=b""):
 class ByTheBookMachine:
     def __init__(self, address=1, mark_read_on="ack", peek_marks_read=False,
                  knows_look_ahead=True, speaks_4d=True,
-                 counts_idle_general_polls=True, resends_on_nack=True):
+                 counts_idle_general_polls=True, resends_on_nack=True,
+                 answers_4d_with_zeros=False):
         self.address = address
         self.counts_idle_general_polls = counts_idle_general_polls
         self.resends_on_nack = resends_on_nack      # True per §3.2
+        # standard validation, the other way §15.10 allows: answer 0x4D,
+        # with "all zeros in the Validation Number field"
+        self.answers_4d_with_zeros = answers_4d_with_zeros
         self.mark_read_on = mark_read_on            # "ack" (§15.10) | "send"
         self.peek_marks_read = peek_marks_read      # False per §15.10
         self.knows_look_ahead = knows_look_ahead    # False: silent to FF
@@ -192,7 +196,8 @@ class ByTheBookMachine:
         if command == 0x3D and len(raw) == 2:
             # standard validation read; a machine in enhanced validation
             # answers with a zero validation field
-            if self.speaks_4d or not self.records:
+            standard = not self.speaks_4d or self.answers_4d_with_zeros
+            if not standard or not self.records:
                 return frame(self.address, 0x3D, bytes(9))
             r = self.records[-1]
             return frame(self.address, 0x3D, int_to_bcd(int(r["vn"]), 4)
@@ -214,6 +219,8 @@ class ByTheBookMachine:
     def _send_validation(self, function):
         if not self.speaks_4d:
             return b""
+        if self.answers_4d_with_zeros:
+            return frame(self.address, 0x4D, bytes(31))
         if function == 0xFF and not self.knows_look_ahead:
             return b""
         if function in (0x00, 0xFF):

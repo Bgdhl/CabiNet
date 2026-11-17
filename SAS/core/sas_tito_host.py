@@ -84,7 +84,8 @@ __all__ = [
     "CMD_SEND_TICKET_VALIDATION_DATA", "CMD_REDEEM_TICKET",
     "REDEEM_AUTHORIZE_CASHABLE", "REDEEM_REJECT", "REDEEM_INTERROGATE",
     "REDEEM_STATUS_REDEEMED", "REDEEM_STATUS_PENDING",
-    "REDEEM_STATUS_REJECTED", "PARSING_CODE_BCD",
+    "REDEEM_STATUS_REJECTED", "PARSING_CODE_BCD", "redeem_status_kind",
+    "REDEMPTION_RETRY_SEC", "read_redemption_status",
     "TicketInData", "parse_ticket_in_data",
     "build_ticket_data_poll", "build_redeem_ticket_poll",
     "build_redeem_interrogate_poll",
@@ -160,7 +161,46 @@ REDEEM_INTERROGATE = 0xFF             # status interrogate (no other data)
 # 0x71/0x70 machine-status byte (EGM -> host)    VERIFY_ON_BENCH, all three
 REDEEM_STATUS_REDEEMED = 0x00         # ticket credited
 REDEEM_STATUS_PENDING = 0x40          # redemption in progress
-REDEEM_STATUS_REJECTED = 0x80         # >= 0x80: rejected/error family
+REDEEM_STATUS_REJECTED = 0x80         # 100xxxxx: the failed family
+REDEEM_STATUS_WAITING = 0x20          # still waiting for long poll 71
+
+REDEMPTION_RETRY_SEC = (2.0, 5.0, 15.0)   # wait before asking a machine
+#                                       again about a redemption with no
+#                                       final status; the last repeats.
+#                                       Exception 68 asks at once.
+
+
+def redeem_status_kind(status: Optional[int]) -> str:
+    """What a long poll 71 machine status MEANS, by its top three bits —
+    SAS 6.02 Table 15.12d: "3 MSbits can be used to determine category of
+    status code".
+
+      redeemed  000xxxxx  00 cashable, 01 restricted, 02 nonrestricted
+      waiting   001xxxxx  20: the machine has not had its long poll 71
+      pending   010xxxxx  40: accepted, the ticket is not stacked yet
+      failed    100xxxxx  80-8B: the ticket was NOT redeemed
+      unknown   anything else — C0 ("not compatible with current
+                redemption cycle (ignored)"), FF (no validation
+                information), no answer at all.
+
+    Only `failed` puts a ticket back to issued, and only `redeemed` spends
+    it. This used to be "anything from 0x80 up is a rejection", which sent
+    C0 and FF — answers that say NOTHING about the ticket — down the
+    rejection path and released the hub's hold on a ticket the machine may
+    have been stacking (audit item 37)."""
+    if status is None:
+        return "unknown"
+    top = status & 0xE0
+    if top == 0x00:
+        return "redeemed"
+    if top == 0x20:
+        return "waiting"
+    if top == 0x40:
+        return "pending"
+    if top == 0x80:
+        return "failed"
+    return "unknown"
+
 
 PARSING_CODE_BCD = 0x00               # VERIFY_ON_BENCH: validation data is
                                       # packed BCD digits
@@ -691,12 +731,13 @@ def capture_printed_ticket(transport, address: int, store: TicketStore,
         return _persist_4d(store, peek, address,
                            f" · the 0x4D read {why}; taken from the "
                            "look-ahead (FF) copy")
-    if rec is not None:
-        # a parsed-but-zeroed record: an empty validation buffer
-        return TicketCaptureResult(
-            TicketCaptureOutcome.NO_DATA, None, None, "4D", None,
-            "4D answered with a zeroed record — validation buffer empty")
-    if heard or peek_heard:
+    # A parsed-but-zeroed record. On a machine in enhanced or system
+    # validation that is an empty buffer. But a STANDARD-validation machine
+    # may answer 0x4D too: it "must either not respond to long poll 4D or
+    # return all zeros in the Validation Number field" (§15.10). Both go on
+    # to the 0x3D read, which tells them apart (audit item 20).
+    zeroed = rec is not None
+    if not zeroed and (heard or peek_heard):
         # The machine speaks 0x4D and its answer did not arrive. No 0x3D
         # read: that is for standard validation, and a different long poll
         # here would have been the ACK. The machine keeps the record unread
@@ -707,11 +748,15 @@ def capture_printed_ticket(transport, address: int, store: TicketStore,
             "acknowledged, so the machine still holds the record and "
             "raises its exception again")
 
-    # -- 2: standard-validation fallback: 0x4D never answered at all ----------
+    # -- 2: standard validation: 0x4D never answered, or answered zeros -------
     sleep(pace)
     resp = transport.transact(build_meter_poll(address, 0x3D))
     packet = _classify_frame(resp, address, 0x3D, proto)
     if packet is None:
+        if zeroed:
+            return TicketCaptureResult(
+                TicketCaptureOutcome.NO_DATA, None, None, "4D", None,
+                "4D answered with a zeroed record — validation buffer empty")
         return TicketCaptureResult(
             TicketCaptureOutcome.TIMEOUT, None, None, None, None,
             "silence on both 4D and 3D reads — ticket data unrecoverable "
@@ -725,6 +770,8 @@ def capture_printed_ticket(transport, address: int, store: TicketStore,
     if not info.validation_number.strip("0"):
         return TicketCaptureResult(
             TicketCaptureOutcome.NO_DATA, None, info.amount_cents, "3D", None,
+            ("4D answered with a zeroed record and the 3D validation field "
+             "is all zeros — nothing to capture") if zeroed else
             "3D validation field all zeros (machine is enhanced/system-"
             "configured, guide §4.6.3 note) and 4D did not answer")
     if not info.amount_cents:
@@ -1032,7 +1079,11 @@ def redeem_inserted_ticket(transport, address: int, store: TicketStore,
     proto = protocol or _PROTO
 
     # -- 1: read the escrowed ticket -----------------------------------------
-    resp = transport.transact(build_ticket_data_poll(address))
+    # Every poll of this cycle is asked for again when its answer arrives
+    # damaged or not at all (§3.2, transact_reread; audit item 19). For the
+    # authorising 71 the document says so itself: "the host may also request
+    # the current ticket status by resending the exact same command".
+    resp, _h, _n = transact_reread(transport, build_ticket_data_poll(address))
     packet = _classify_frame(resp, address, CMD_SEND_TICKET_VALIDATION_DATA,
                              proto)
     if packet is None:
@@ -1074,7 +1125,7 @@ def redeem_inserted_ticket(transport, address: int, store: TicketStore,
     # -- 3: authorize or deny --------------------------------------------------
     sleep(pace)
     if not decision["authorized"]:
-        resp = transport.transact(build_redeem_ticket_poll(
+        resp, _h, _n = transact_reread(transport, build_redeem_ticket_poll(
             address, REDEEM_REJECT, 0, ticket.validation_raw))
         status = _redeem_status(resp, address, proto)
         return TicketRedemptionResult(
@@ -1084,58 +1135,90 @@ def redeem_inserted_ticket(transport, address: int, store: TicketStore,
     amount = decision["amount_cents"]
     auth_frame = build_redeem_ticket_poll(
         address, REDEEM_AUTHORIZE_CASHABLE, amount, ticket.validation_raw)
-    resp = transport.transact(auth_frame)
+    resp, _h, _n = transact_reread(transport, auth_frame)
     status = _redeem_status(resp, address, proto)
-    # BENCH CAPTURE 2026-07-08: log the exact wire so the 0x71 echo can be
-    # matched to what the EGM expects (0x81 reject = frame-shape mismatch).
+    # the exact wire, so a 0x71 the machine refuses can be matched to what
+    # it expects (0x81 = validation number does not match)
     _raw = (f" [0x70resp={packet.data.hex()} 0x71sent={auth_frame.hex()} "
             f"0x71resp={resp.hex() if resp else 'none'}]")
 
-    if status == REDEEM_STATUS_REDEEMED:
-        store.close_redemption(address, vn, redeemed=True,
+    def closed(redeemed: bool, confirmed: bool, detail: str):
+        store.close_redemption(address, vn, redeemed=redeemed,
                                validation_raw=ticket.validation_raw)
         return TicketRedemptionResult(
-            RedemptionOutcome.REDEEMED, vn, amount, status,
-            decision["reason"], False,
-            "machine credited the ticket immediately" + _raw)
-    if status is not None and status >= REDEEM_STATUS_REJECTED:
-        store.close_redemption(address, vn, redeemed=False,
-                               validation_raw=ticket.validation_raw)
-        return TicketRedemptionResult(
-            RedemptionOutcome.MACHINE_REJECTED, vn, amount, status,
-            decision["reason"], False,
-            f"machine rejected the authorized redemption "
-            f"(status 0x{status:02X}); ticket reset to issued" + _raw)
+            RedemptionOutcome.REDEEMED if redeemed
+            else RedemptionOutcome.MACHINE_REJECTED, vn, amount, status,
+            decision["reason"], confirmed, detail)
 
-    # pending (0x40) or ack-without-status: await the completion exception
-    confirmed = _await_transfer_complete(transport, address, proto, pace,
-                                         sleep, confirm_polls, on_exception,
-                                         on_frame)
-    sleep(pace)
-    resp = transport.transact(build_redeem_interrogate_poll(address))
-    status = _redeem_status(resp, address, proto)
-    if status == REDEEM_STATUS_REDEEMED:
-        store.close_redemption(address, vn, redeemed=True,
-                               validation_raw=ticket.validation_raw)
-        return TicketRedemptionResult(
-            RedemptionOutcome.REDEEMED, vn, amount, status,
-            decision["reason"], confirmed,
-            "redemption confirmed by interrogate")
-    if status is not None and status >= REDEEM_STATUS_REJECTED:
-        store.close_redemption(address, vn, redeemed=False,
-                               validation_raw=ticket.validation_raw)
-        return TicketRedemptionResult(
-            RedemptionOutcome.MACHINE_REJECTED, vn, amount, status,
-            decision["reason"], confirmed,
-            f"interrogate reports rejection (0x{status:02X}); "
-            "ticket reset to issued" + _raw
-            + f" [interrogateResp={resp.hex() if resp else 'none'}]")
+    kind = redeem_status_kind(status)
+    if kind == "redeemed":
+        return closed(True, False,
+                      "machine credited the ticket immediately" + _raw)
+    if kind == "failed":
+        return closed(False, False,
+                      f"machine rejected the authorized redemption "
+                      f"(status 0x{status:02X}); ticket reset to issued"
+                      + _raw)
+
+    confirmed = False
+    for attempt in (1, 2):
+        confirmed = _await_transfer_complete(
+            transport, address, proto, pace, sleep, confirm_polls,
+            on_exception, on_frame) or confirmed
+        sleep(pace)
+        resp, _h, _n = transact_reread(
+            transport, build_redeem_interrogate_poll(address))
+        status = _redeem_status(resp, address, proto)
+        kind = redeem_status_kind(status)
+        if kind == "redeemed":
+            return closed(True, confirmed,
+                          "redemption confirmed by interrogate")
+        if kind == "failed":
+            return closed(False, confirmed,
+                          f"interrogate reports rejection (0x{status:02X}); "
+                          "ticket reset to issued" + _raw
+                          + f" [interrogateResp="
+                            f"{resp.hex() if resp else 'none'}]")
+        if kind != "waiting" or attempt == 2:
+            break
+        # 20: the machine never got its long poll 71 (our authorisation or
+        # its answer was lost). Send it again, once, and wait once more.
+        sleep(pace)
+        resp, _h, _n = transact_reread(transport, auth_frame)
+        status = _redeem_status(resp, address, proto)
+        kind = redeem_status_kind(status)
+        if kind == "redeemed":
+            return closed(True, confirmed,
+                          "machine credited the ticket on the second "
+                          "authorisation")
+        if kind == "failed":
+            return closed(False, confirmed,
+                          f"machine rejected the authorized redemption "
+                          f"(status 0x{status:02X}); ticket reset to issued")
     return TicketRedemptionResult(
         RedemptionOutcome.UNCONFIRMED, vn, amount, status,
         decision["reason"], confirmed,
-        "authorized but completion never confirmed — ticket stays "
-        "redeemPending; a retry from this machine re-draws the same "
-        "authorization, or void/close it manually after checking meters")
+        "authorized but completion not confirmed yet — the ticket stays "
+        "redeemPending and the machine is asked again until it gives a "
+        "final status")
+
+
+def read_redemption_status(transport, address: int,
+                           protocol: Optional[SASProtocol] = None):
+    """One 71/FF interrogation, asked for again if its answer is damaged.
+    Returns the parsed TicketInData (status, amount, validation number) or
+    None. The answer names the ticket, so a redemption can be closed from
+    it even by a satellite that was restarted in the middle of one."""
+    proto = protocol or _PROTO
+    resp, _h, _n = transact_reread(
+        transport, build_redeem_interrogate_poll(address))
+    packet = _classify_frame(resp, address, CMD_REDEEM_TICKET, proto)
+    if packet is None:
+        return None
+    try:
+        return parse_ticket_in_data(packet.data)
+    except ValueError:
+        return None
 
 
 def _redeem_status(resp: bytes, address: int,
@@ -1235,6 +1318,17 @@ class SASTITOHost:
         self.pace = pace
         self.sleep = sleep
         self._busy = False
+        # A redemption the machine accepted (status 40) whose final status
+        # has not been read. SAS 6.02 §15.12: the machine raises exception
+        # 68 when the ticket is stacked or returned and "must reissue
+        # exception 68 every fifteen seconds until the host polls for and
+        # ACKs the completion status. ... It is the responsibility of the
+        # host to properly complete a ticket transaction."
+        self.open_redemption = None    # {"vn", "amount"}
+        self.transfer_complete_seen = False    # exception 68 came in
+        self._ask_at = 0.0
+        self._asked = 0
+        self.clock = time.monotonic
         self._prev_typed = poller.on_typed_event
         poller.on_typed_event = self._typed_event
 
@@ -1251,12 +1345,84 @@ class SASTITOHost:
     def redeem(self) -> TicketRedemptionResult:
         """Run one ticket-in redemption cycle now."""
         p = self.poller
+        # "If the host sends long poll 70 without polling for the
+        # completion status of the previous ticket, that status will be
+        # lost" (§15.12) — so ask about an open one before reading the next.
+        if self.open_redemption is not None or self.transfer_complete_seen:
+            self.resolve_open_redemption()
         result = redeem_inserted_ticket(
             p.transport, p.address, self.store, p.protocol,
             pace=self.pace, sleep=self.sleep,
             on_exception=p._dispatch_event,
             on_frame=p._handle_long_poll_result)
+        if result.outcome is RedemptionOutcome.UNCONFIRMED:
+            self.open_redemption = {"vn": result.validation_number,
+                                    "amount": result.amount_cents}
+            self._asked = 0
+            self._ask_at = self.clock() + REDEMPTION_RETRY_SEC[0]
         p._safe(self.on_redemption, p.address, result)
+        return result
+
+    def resolve_open_redemption(self) -> Optional[TicketRedemptionResult]:
+        """Ask the machine (71/FF) how the last redemption ended and close
+        the hub's row from the answer. Returns the END, or None while there
+        is still none. Poll thread only.
+
+        The answer carries the ticket's own validation number, so this also
+        closes a redemption left open by a satellite that was restarted (it
+        no longer remembers which ticket it was)."""
+        p = self.poller
+        self.transfer_complete_seen = False
+        data = read_redemption_status(p.transport, p.address, p.protocol)
+        kind = redeem_status_kind(data.status if data is not None else None)
+        if kind not in ("redeemed", "failed"):
+            return None
+        known = self.open_redemption or {}
+        vn = None
+        if data.validation_number and data.validation_number.isdigit() \
+                and data.validation_number.strip("0"):
+            vn = _canonical_vn(data.validation_number)
+        vn = vn or known.get("vn")
+        self.open_redemption = None
+        if not vn:
+            return None             # a final status with no ticket named
+        redeemed = kind == "redeemed"
+        self.store.close_redemption(p.address, vn, redeemed=redeemed,
+                                    validation_raw=data.validation_raw)
+        amount = known.get("amount")
+        if amount is None:
+            amount = data.amount_cents or 0
+        result = TicketRedemptionResult(
+            RedemptionOutcome.REDEEMED if redeemed
+            else RedemptionOutcome.MACHINE_REJECTED, vn, amount, data.status,
+            "", True,
+            ("ended late: the machine reports the ticket redeemed"
+             if redeemed else
+             f"ended late: the machine reports the redemption failed "
+             f"(status 0x{data.status:02X}); ticket reset to issued"))
+        p._safe(self.on_redemption, p.address, result)
+        return result
+
+    def service_open_redemption(self) -> Optional[TicketRedemptionResult]:
+        """Poll thread, BETWEEN polls: follow up a redemption with no final
+        status. Asks when exception 68 has come in, and otherwise on a wait
+        that grows to fifteen seconds while one is open."""
+        if self._busy:
+            return None
+        if self.open_redemption is None and not self.transfer_complete_seen:
+            return None
+        now = self.clock()
+        if not self.transfer_complete_seen and now < self._ask_at:
+            return None
+        self._busy = True
+        try:
+            result = self.resolve_open_redemption()
+        finally:
+            self._busy = False
+        if result is None and self.open_redemption is not None:
+            self._asked += 1
+            self._ask_at = now + REDEMPTION_RETRY_SEC[
+                min(self._asked, len(REDEMPTION_RETRY_SEC) - 1)]
         return result
 
     def service_validation(self, approve: bool = True
@@ -1324,6 +1490,11 @@ class SASTITOHost:
         if address != self.poller.address or self._busy:
             return
         code = info.code
+        if code == TICKET_TRANSFER_COMPLETE_EXCEPTION:
+            # Not answered here: service_open_redemption() reads the status
+            # between polls (no long poll inside the exception drain).
+            self.transfer_complete_seen = True
+            return
         if code in (TICKET_PRINTED_EXCEPTION, HANDPAY_VALIDATED_EXCEPTION):
             self._busy = True
             try:
