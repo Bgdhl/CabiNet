@@ -32,7 +32,7 @@ import time
 from typing import Dict, Optional
 
 KEYS = ("txnId", "kind", "transferType", "cents", "accountId", "cmdId",
-        "startedAt", "reported")
+        "startedAt", "reported", "creditType")
 
 
 class OpenTransferJournal:
@@ -76,14 +76,15 @@ class OpenTransferJournal:
 
     def open(self, txn_id: str, kind: str, transfer_type: int, cents: int,
              account_id: Optional[str] = None,
-             cmd_id: Optional[str] = None) -> Dict:
+             cmd_id: Optional[str] = None,
+             credit_type: str = "cashable") -> Dict:
         """Write the transfer down. Raises OSError if it cannot be saved:
         the caller must then NOT send the transfer."""
         rec = {"txnId": str(txn_id), "kind": str(kind),
                "transferType": int(transfer_type), "cents": int(cents),
                "accountId": account_id, "cmdId": cmd_id,
                "startedAt": time.strftime("%Y-%m-%dT%H:%M:%S"),
-               "reported": None}
+               "reported": None, "creditType": str(credit_type)}
         self._save(rec)
         self._rec = rec
         return dict(rec)

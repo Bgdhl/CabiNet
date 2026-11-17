@@ -119,6 +119,27 @@ def test_record_issued_records_locally_and_pushes(hub, local, tmp_path):
     assert sent["ticketNumber"] == 2
 
 
+def test_record_issued_tells_the_hub_what_kind_of_ticket_it_is(
+        hub, local, tmp_path):
+    """The kind the machine gave the ticket (SAS 6.02 Table 15.13c) goes
+    up with it, so the hub can flag a restricted promotional ticket
+    (2026-11-16). A capture with no kind sends no such key."""
+    c = make_client(hub.url, local, tmp_path)
+    c.record_issued("0100000000000042", 25, 1, source="egm_4D",
+                    extra={"validationType": 1})
+    assert hub.last("issued")["validationType"] == 1
+    assert local.get("0100000000000042")["extra"] == {"validationType": 1}
+    c.record_issued("0100000000000043", 25, 1, source="egm_3D")
+    assert "validationType" not in hub.last("issued")
+
+
+def test_the_kind_survives_a_hub_outage_in_the_journal(local, tmp_path):
+    c = make_client(DEAD, local, tmp_path)
+    c.record_issued("0100000000000042", 25, 1, extra={"validationType": 3})
+    with c._jlock:
+        assert [p.get("validationType") for p in c._issued] == [3]
+
+
 def test_hub_reissue_verdict_mirrors_locally(hub, local, tmp_path):
     # COLLISION containment e2e (2026-07-12): the local mirror holds the vn
     # as a still-'issued' old ticket (it never learns the hub redeemed it at
@@ -171,10 +192,22 @@ def test_authorize_sends_canonical_from_raw(hub, local, tmp_path):
     dec = c.authorize_redemption(1, "3829105628374651", 0,
                                  validation_raw=raw)
     assert dec == {"authorized": True, "amount_cents": 25,
-                   "reason": "authorized", "retry": False}
+                   "reason": "authorized", "retry": False,
+                   "restricted": False}
     sent = hub.last("authorize")
     assert sent["canonical"] == "473829105628374651"
     assert sent["vn16"] == "3829105628374651"
+
+
+def test_authorize_passes_on_that_the_ticket_is_restricted(hub, local,
+                                                           tmp_path):
+    """The hub says when a ticket is a restricted promotional one; the
+    redemption then uses transfer code 01 (2026-11-16)."""
+    hub.replies["authorize"] = dict(hub.replies["authorize"],
+                                    restricted=True)
+    c = make_client(hub.url, local, tmp_path)
+    dec = c.authorize_redemption(1, "0100000000000042", 25)
+    assert dec["authorized"] is True and dec["restricted"] is True
 
 
 def test_authorize_without_raw_sends_vn_only(hub, local, tmp_path):

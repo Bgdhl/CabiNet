@@ -320,9 +320,11 @@ class TestFrames:
         assert frame[-2:] == sas_crc(frame[:-2]).to_bytes(2, "little")
 
     def test_transfer_poll_trailing_fields(self):
-        # Adjudicated 2026-07-07 vs saspy (sas.py:1290-1309): after txn id come
-        # expiration(4 BCD), pool id(2 BCD MSB-first — was binary LE), receipt
-        # data length(00), then the trailing lock timeout(2 BCD). VERIFY_ON_BENCH.
+        # After the txn id come expiration (4 BCD), pool id, receipt data
+        # length (00), then the trailing lock timeout (2 BCD). The pool id
+        # is "2 binary" in SAS 6.02 Table 8.3a, least significant byte
+        # first (§2); it was packed BCD on saspy's word until restricted
+        # amounts were first sent (2026-11-16).
         req = AFTTransferRequest(transaction_id="T", cashable_cents=100,
                                  expiration_mmddyyyy=12312025, pool_id=1234,
                                  lock_timeout_hundredths=500)
@@ -331,7 +333,7 @@ class TestFrames:
         # locate the txn id ("T", len byte 0x01 precedes it) then walk the tail
         i = body.index(b"\x01T") + 2                # past [txnlen=1]["T"]
         assert body[i:i + 4] == bytes.fromhex("12312025")   # expiration BCD
-        assert body[i + 4:i + 6] == bytes.fromhex("1234")   # pool id BCD (!LE)
+        assert body[i + 4:i + 6] == (1234).to_bytes(2, "little")   # pool id
         assert body[i + 6] == 0x00                          # receipt data len
         assert body[i + 7:i + 9] == bytes.fromhex("0500")   # lock timeout BCD
         assert i + 9 == len(body)                           # nothing trails it
@@ -955,3 +957,21 @@ class TestRealSpecTables:
         # and the pre-RAM-clear healthy values (Jul 8 capture)
         assert "to-machine" in describe_available_transfers(0x17)
         assert "in-house-ENABLED" in describe_aft_status(0xFF)
+
+
+class TestRestrictedPromotionalPush:
+    """The same in-house transfer with the amount in the restricted field
+    (SAS 6.02 Tables 8.3a and 8.3d), pool 0000 and expiration 00000000."""
+
+    def test_the_amount_rides_the_restricted_field(self):
+        req = AFTTransferRequest(transaction_id="T", restricted_cents=500)
+        frame = build_aft_transfer_poll(1, req, ASSET, KEY)
+        body = frame[3:-2]
+        assert body[2] == TRANSFER_TYPE_HOST_TO_EGM
+        assert body[3:8] == cents_to_bcd5(0)            # cashable
+        assert body[8:13] == cents_to_bcd5(500)         # restricted
+        assert body[13:18] == cents_to_bcd5(0)          # nonrestricted
+        i = body.index(b"\x01T") + 2
+        assert body[i:i + 4] == bytes(4)                # default expiration
+        assert body[i + 4:i + 6] == bytes(2)            # pool 0000
+        assert req.total_cents == 500

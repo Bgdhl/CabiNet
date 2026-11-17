@@ -359,6 +359,25 @@ class TestFollowedToItsEnd:
         assert (e["rec"]["kind"], e["ok"], e["outcome"],
                 e["amountCents"]) == ("aft_cashout", True, "completed", CENTS)
 
+    def test_a_restricted_promotional_push_that_lands_late(self):
+        """The END names the amount in the kind of credit that was sent."""
+        machine, port, poller, host, clock = _rig()
+        req = AFTTransferRequest(transaction_id=TXN,
+                                 transfer_type=TRANSFER_TYPE_HOST_TO_EGM,
+                                 restricted_cents=500)
+        _start_unconfirmed(host, req, kind="aft_transfer", account_id="house")
+        assert host.journal.current["creditType"] == "restricted"
+        assert host.journal.current["cents"] == 500
+        machine.complete()
+        assert (machine.credits, machine.restricted) == (0, 500)
+        poller.poll_once()
+        e = host.service_open()[0]
+        assert (e["ok"], e["outcome"], e["amountCents"]) == (
+            True, "completed", 500)
+        record = sas_host.late_transfer_record(e)
+        assert (record["creditType"], record["amountCents"],
+                record["cents"]) == ("restricted", 500, 500)
+
     def test_exception_69_with_nothing_of_ours_open_is_still_read(self):
         machine, port, poller, host, clock = _rig()
         machine.cycle = {"txn": "FROM-BEFORE", "type": 0x00, "cents": 700,
@@ -487,6 +506,49 @@ class TestWhatTheHubIsTold:
 
 
 # ---------------------------------------------------------------------------
+# Restricted promotional credit coming back at cash-out (2026-11-16)
+# ---------------------------------------------------------------------------
+
+class TestRestrictedCreditComesBackAsRestricted:
+    def test_one_transfer_takes_both_and_names_both(self):
+        machine, port, poller, host, clock = _rig(
+            credits=2500, restricted=1500, complete_in=2)
+        req = AFTTransferRequest(transaction_id=TXN,
+                                 transfer_type=TRANSFER_TYPE_EGM_TO_HOST,
+                                 cashable_cents=2500, restricted_cents=1500)
+        res = host.transfer(req, require_lock=False, kind="aft_cashout")
+        assert res.outcome is AFTOutcome.COMPLETED
+        assert (res.final.cashable_cents, res.final.restricted_cents) == (
+            2500, 1500)
+        assert sas_host._restricted_moved(res) == 1500
+        assert (machine.credits, machine.restricted) == (0, 0)
+
+    def test_a_transfer_that_did_not_complete_moved_no_restricted(self):
+        machine, port, poller, host, clock = _rig(credits=0, restricted=900)
+        req = AFTTransferRequest(transaction_id=TXN,
+                                 transfer_type=TRANSFER_TYPE_EGM_TO_HOST,
+                                 restricted_cents=900)
+        res = host.transfer(req, require_lock=False, kind="aft_cashout")
+        assert res.outcome is AFTOutcome.UNCONFIRMED
+        assert sas_host._restricted_moved(res) == 0
+
+    def test_a_late_cash_out_reports_its_restricted_part(self):
+        machine, port, poller, host, clock = _rig(credits=2500,
+                                                  restricted=1500)
+        req = AFTTransferRequest(transaction_id=TXN,
+                                 transfer_type=TRANSFER_TYPE_EGM_TO_HOST,
+                                 cashable_cents=2500, restricted_cents=1500)
+        _start_unconfirmed(host, req, kind="aft_cashout", account_id="p1")
+        machine.complete()
+        poller.poll_once()
+        e = host.service_open()[0]
+        assert (e["amountCents"], e["restrictedCents"]) == (2500, 1500)
+        record = sas_host.late_transfer_record(e)
+        assert (record["type"], record["amountCents"],
+                record["restrictedCents"]) == ("aft_cashout", 2500, 1500)
+
+
+# ---------------------------------------------------------------------------
 # The whole satellite program: sas_host.main() against a stub hub
 # ---------------------------------------------------------------------------
 
@@ -550,3 +612,45 @@ class TestTheWholeSatelliteProgram:
         assert machine.credits == 2500
         assert machine.cycle is None and len(machine.started) == 1
         assert machine.refused_while_open == 0
+
+
+
+_PULL_RUN = {}
+
+
+def _run_pull_with_restricted():
+    """The hub's cash-out pull against a machine holding $25 cash and $15
+    restricted promotional credit, which completes inside the wait."""
+    if _PULL_RUN:
+        return _PULL_RUN
+    from test_sas_host_commands import _run_scripted
+    served = {"done": False}
+
+    def script(i, reports):
+        if not served["done"] and any(r.get("online") for r in reports):
+            served["done"] = True
+            return {"commands": [{"id": "pull-1", "type": "aft_cashout_pull",
+                                  "accountId": "p1"}]}
+        return {}
+
+    run = _run_scripted(
+        "pullrestricted",
+        lambda: ByTheBookAFTMachine(credits=2500, restricted=1500,
+                                    complete_in=2),
+        script, max_polls=300)
+    _PULL_RUN.update(run)
+    return _PULL_RUN
+
+
+class TestTheWholeProgramPullsRestrictedCreditToo:
+    def test_the_result_carries_cash_and_restricted_apart(self):
+        run = _run_pull_with_restricted()
+        r = run["by_id"]["pull-1"]
+        assert (r["type"], r["ok"], r["outcome"], r["amountCents"],
+                r["restrictedCents"], r["accountId"]) == (
+            "aft_cashout", True, "completed", 2500, 1500, "p1")
+
+    def test_the_machine_is_left_with_nothing(self):
+        machine = _run_pull_with_restricted()["machine"]
+        assert (machine.credits, machine.restricted) == (0, 0)
+        assert machine.cycle is None or machine.cycle["status"] == 0x00

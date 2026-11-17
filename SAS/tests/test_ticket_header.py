@@ -806,9 +806,10 @@ class TestApplyTicketHeader:
         assert tp.frames[1] == build_set_ticket_data(
             1, host_id=DEFAULT_SYSTEM_ID, expiration_days=0,
             allow_no_text=True)
-        # 7B: mask 0000, states 0000, cashable 9999 (never), restricted 0000
+        # 7B: mask 0000, states 0000, cashable 9999 (never), and the same
+        # as the default for restricted tickets
         assert tp.frames[2] == _crc(bytes([0x01, 0x7B, 0x08, 0, 0, 0, 0,
-                                           0x99, 0x99, 0x00, 0x00]))
+                                           0x99, 0x99, 0x99, 0x99]))
         assert sleeps == [sas_host.SAS_POLL_FLOOR] * 2
 
     def test_the_expiry_also_goes_by_7b_and_the_answer_is_kept(self):
@@ -825,7 +826,7 @@ class TestApplyTicketHeader:
                "180d)" in detail
         assert seen == {"expiry": 180}
         assert tp.frames[2] == _crc(bytes([0x01, 0x7B, 0x08, 0, 0, 0, 0,
-                                           0x01, 0x80, 0x00, 0x00]))
+                                           0x01, 0x80, 0x01, 0x80]))
 
     def test_expiration_7d_nack_or_silence_never_fails_the_header(self):
         """The expiration write is advisory: a machine that refuses or

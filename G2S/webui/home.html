@@ -650,6 +650,8 @@
                 <button class="clr" onclick="padClear()">clear amount</button>
               </div>
             </div></div>
+          <div class="step"><label>4 · As</label>
+            <div class="pickrow" id="w-kindpick"></div></div>
           <div class="step" id="w-send"></div>
         </div>
       </div>
@@ -3839,6 +3841,10 @@ function renderPlayerFundModal(id){
       <input type="text" id="m-fund" inputmode="decimal" placeholder="$ 0.00"
         aria-label="Amount in dollars">
     </div>
+    <label class="none" style="display:flex;gap:8px;align-items:center;font-style:normal;margin:0 0 10px;cursor:pointer">
+      <input type="checkbox" id="m-fund-restr">
+      <span>as restricted promotional credit (has to be played, never cash)</span>
+    </label>
     <div class="btnrow">
       <button class="btn slim gold" onclick="playerFundSend('${esc(p.id)}',1)">
         <span class="bl">Fund</span>
@@ -3856,18 +3862,23 @@ async function playerFundSend(id, sign){
      of bouncing it off the hub for a raw error. Client-side nicety only:
      the hub still enforces (our snapshot can lag a beat), this just makes
      the common case read like a host, not a terminal. */
+  /* cash, or the player's restricted promotional balance (the checkbox) */
+  const restr=!!(($("m-fund-restr")||{}).checked);
   if(sign<0){
     const p=playerById(id);
-    const bal=Number((p||{}).cashableMillicents||0);
+    const bal=Number((p||{})[restr?"nonCashMillicents":"cashableMillicents"]||0);
     if(mc>bal){
       toast(((p&&p.name)||"That player")+" has "+fmtAmt(bal)
+        +(restr?" restricted":"")
         +" — can't pull back "+fmtAmt(mc)+". Try a smaller amount.",false);
       return;
     }
   }
   const cents=Math.round(mc/1000);   // the fund action speaks CENTS
-  const j=await playerPost({action:"fund", accountId:id, cents:sign*cents},
-    (sign>0?"Fund ":"Pull back ")+fmtAmt(mc));
+  const body={action:"fund", accountId:id, cents:sign*cents};
+  if(restr) body.restricted=true;
+  const j=await playerPost(body,
+    (sign>0?"Fund ":"Pull back ")+fmtAmt(mc)+(restr?" restricted promotional":""));
   if(j&&$("m-fund")) $("m-fund").value="";
 }
 function playerRenameOpen(id){
@@ -4028,18 +4039,33 @@ function renderWallet(){
     +(hidden?`<p class="none" style="margin:6px 0 0">${hidden} machine${hidden>1?"s":""} hidden —
       offline, SAS off, or transfers disabled on the game.</p>`:""));
 
+  /* cash, or restricted promotional credit: the machine plays it down
+     first, never pays it out as cash, and prints a restricted promotional
+     ticket for what is left at cash-out. It comes off the account's
+     restricted balance. Works on SAS (the AFT restricted amount) and G2S
+     (the WAT nonCash amount). */
+  const restr=S.wallet.kind==="restricted";
+  setHTML($("w-kindpick"),
+    `<button class="fchip ${restr?"":"on"}" aria-pressed="${!restr}"
+       onclick="walletKind('cash')">Cash credit</button>
+     <button class="fchip ${restr?"on":""}" aria-pressed="${restr}"
+       onclick="walletKind('restricted')">Restricted promotional</button>`
+    +(restr?`<p class="none" style="margin:6px 0 0">Has to be played. Cashing it
+      out prints a restricted promotional ticket.</p>`:""));
+
   /* send summary + button */
   const amt=S.wallet.amount;
   const accName=accs.length?acctName(S.wallet.account):"House";
   const mach=S.wallet.egm?machineName(snap(S.wallet.egm),S.wallet.egm):null;
   const acc=acctById(S.wallet.account);
-  const overdraft=acc && acc.kind!=="house" && amt>Number(acc.cashableMillicents||0);
+  const have=acc?Number((restr?acc.nonCashMillicents:acc.cashableMillicents)||0):0;
+  const overdraft=acc && acc.kind!=="house" && amt>have;
   const ready=amt>0 && S.wallet.egm && !overdraft;
   setHTML($("w-send"),
     (overdraft?`<p class="none" style="color:var(--ruby);font-style:normal;margin:0 0 8px">
-      ${esc(accName)} only has ${esc(fmtAmt(acc.cashableMillicents))} — give them a little less, or top up their card first.</p>`:"")+
+      ${esc(accName)} only has ${esc(fmtAmt(have))}${restr?" restricted":""} — give them a little less, or top up their card first.</p>`:"")+
     `<button class="btn gold ${ready?"":"off"}" onclick="sendCredits(this)">
-      <span class="bl">${amt>0?`Send ${esc(fmtAmt(amt))}`:"Send credits"}</span>
+      <span class="bl">${amt>0?`Send ${esc(fmtAmt(amt))}`:"Send credits"}${restr?" · restricted promotional":""}</span>
       <span class="ba">${esc(accName)} → ${mach?esc(mach):"pick a machine"}</span>
     </button>`);
 
@@ -4136,6 +4162,10 @@ function walletPick(kind,id){
   if(kind==="account") S.wallet.account=id; else S.wallet.egm=id;
   renderWallet();
 }
+function walletKind(kind){
+  S.wallet.kind=kind==="restricted"?"restricted":"cash";
+  renderWallet();
+}
 function padChip(mc){
   S.wallet.amount=(S.wallet.amount||0)+mc;
   $("w-custom").value=(S.wallet.amount/100000).toFixed(2);
@@ -4158,6 +4188,7 @@ function padClear(){
 async function sendCredits(btn){
   const amt=S.wallet.amount, egm=S.wallet.egm;
   if(!(amt>0)||!egm) return;
+  const restr=S.wallet.kind==="restricted";
   const sm=((S.status||{}).sas||{})[egm];
   if(sm){
     if(!sm.smibId){toast("Machine unknown — refresh and retry",false); return;}
@@ -4168,13 +4199,15 @@ async function sendCredits(btn){
     try{
       const r=await fetch("/api/sas/command",{method:"POST",
         headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({smibId:sm.smibId, type:"aft_transfer", cents,
-                             accountId:S.wallet.account||"house"})});
+        body:JSON.stringify(Object.assign(
+          {smibId:sm.smibId, type:"aft_transfer", cents,
+           accountId:S.wallet.account||"house"},
+          restr?{creditType:"restricted"}:{}))});
       if(r.status===404){toast("Add credits — awaiting host update",false);
         flash(btn,false); return;}
       const j=await r.json().catch(()=>({}));
       if(j.ok){
-        toast(`🪙 Credits queued — ${CUR()}${(cents/100).toFixed(2)} to ${name} (verdict ~2s)`, true);
+        toast(`🪙 ${restr?"Restricted promotional credits":"Credits"} queued — ${CUR()}${(cents/100).toFixed(2)} to ${name} (verdict ~2s)`, true);
         flash(btn,true); padClear(); S.accountsAt=0; auxFetch(true);
       }else{
         toast("Add credits refused · "
@@ -4186,8 +4219,10 @@ async function sendCredits(btn){
     return;
   }
   const body={action:"addCredits", egmId:egm,
-    accountId:S.wallet.account||"house", cashableMillicents:amt};
-  const r=await cmd(body, "Send "+fmtAmt(amt)+" to "+machineName(snap(egm),egm));
+    accountId:S.wallet.account||"house"};
+  body[restr?"nonCashMillicents":"cashableMillicents"]=amt;
+  const r=await cmd(body, "Send "+fmtAmt(amt)+(restr?" restricted promotional":"")
+                    +" to "+machineName(snap(egm),egm));
   flash(btn,r.ok);
   if(r.ok){padClear(); S.accountsAt=0; auxFetch(true);}
 }
@@ -4469,7 +4504,7 @@ function hubRow(t){
       <span class="ta">${esc(fmtAmt(t.amountMc))}</span>
       <span class="ti"><span class="id">${esc(fmtVid(t.canonical))}</span>
         <span class="mt">${esc(titoName(t.origin))} · ${esc(stateLabel(t.state))}${
-          pendAt?" · redeeming at "+esc(titoName(t.pending.machine)):""}${tkReuseTag(t)}</span>
+          pendAt?" · redeeming at "+esc(titoName(t.pending.machine)):""}${tkReuseTag(t)}${tkKindTag(t)}</span>
         ${cross?xmBadge(t.origin,t.redeemedBy):""}</span>
       <span class="tst">${esc(when?ago(when):"")}</span>
     </button>`;
@@ -4482,6 +4517,13 @@ function hubRow(t){
 function tkReuseTag(t){
   if(!t||!t.reusable) return "";
   return " · reusable"+(t.uses?" ×"+esc(String(t.uses)):"");
+}
+/* What the machine said the ticket is. A restricted promotional ticket
+   (the machine's own wording; it prints PLAYABLE ONLY on them) is flagged
+   here and in the ticket's detail. It still redeems like any other. Only
+   SAS tickets captured by a satellite that reads the kind carry it. */
+function tkKindTag(t){
+  return t&&t.restrictedPromo?" · restricted promotional":"";
 }
 function tkControls(t, kind, reissuable, attrs){
   // kind: "hub" (tito ledger) | "g2s" (voucher store); attrs = data-* string
@@ -4633,6 +4675,8 @@ function renderHubTicketModal(cid){
       +(t.pending.at?" · "+clock(t.pending.at):"")]);
   if(t.vn16) rows.push(["system id (vn16)",fmtVid(t.vn16)]);
   if(t.uses) rows.push(["times redeemed",String(t.uses)]);
+  if(t.restrictedPromo)
+    rows.splice(1,0,["kind","restricted promotional ticket (playable only, not cash)"]);
   const voidable=t.state==="issued"||t.state==="redeemPending";
   const hAttrs=`data-vn="${esc(t.vn16||t.canonical)}" data-cid="${esc(t.canonical)}"`;
   setHTML($("m-body"),`

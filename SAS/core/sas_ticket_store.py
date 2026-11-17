@@ -61,6 +61,13 @@ DEFAULT_TICKET_STORE_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "data", "sas_ticket_state.json")
 
+def _is_restricted(rec) -> bool:
+    """A restricted promotional ticket (SAS 6.02 Table 15.13c types 01 and
+    03), by the kind the machine gave it when it was captured."""
+    extra = rec.get("extra") if isinstance(rec, dict) else None
+    return isinstance(extra, dict) and extra.get("validationType") in (1, 3)
+
+
 # Ticket states
 ISSUED = "issued"
 REDEEM_PENDING = "redeemPending"
@@ -444,7 +451,8 @@ class TicketStore:
                             "amount_cents": int(pend.get("amountCents", 0)),
                             "reason": "retry — same machine re-drew the "
                                       "same authorization",
-                            "retry": True}
+                            "retry": True,
+                            "restricted": _is_restricted(rec)}
                 return self._reject(
                     "redemption already in process at address %s"
                     % pend.get("address"))
@@ -467,7 +475,8 @@ class TicketStore:
                               "amountCents": amount, "at": _now_iso()}
             self._save_locked()
             return {"authorized": True, "amount_cents": amount,
-                    "reason": note, "retry": False}
+                    "reason": note, "retry": False,
+                    "restricted": _is_restricted(rec)}
 
     def close_redemption(self, address: int, validation_number: str,
                          redeemed: bool,

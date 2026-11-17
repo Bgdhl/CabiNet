@@ -76,6 +76,8 @@
        stacked home (admin build): hello y=40(+30), nick y=80(+16),
          credits y=104(+22), ADMIN badge y=132(+26), hairline y=168,
          stack from y=180 -> ends y=950 < foot y=976          OK
+         with Free Slot Play: fsp y=128(+18), badge y=154, hairline y=190,
+         stack from y=202 (nine 76px admin buttons -> y=950)   OK
          (non-admin build hides the 5 admin buttons -> WALLET+CASHOUT+LOGOUT)
        cashout: title y=40, machine-credits y=120/138, wallet y=214/232,
          destination sec y=340, toggle y=372(+84)->456, hint y=470,
@@ -88,6 +90,9 @@
          machine y=158/176, ADD sec y=226, chips y=258(+64), sel y=334,
          ADD y=386(+84)->470, CASHOUT sec y=500, toggle y=528(+84)->612,
          hint y=620, note y=704, BACK y=880                  OK
+         with Free Slot Play: two 64px radio rows y=72..136 / 144..208 and
+         everything under them 60px lower (ADD ->558, toggle ->672,
+         note y=764 < BACK y=880)                             OK
        BACK buttons: y=880 + 84                              -> ends y=964  OK
        footers: y=976 + ~16                                  -> ends y=992  OK
        attract column: brand y=264(+40), nick y=330, tap y=520(+64),
@@ -175,6 +180,18 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
 #ph-credits { position: absolute; left: 12px; top: 104px; width: 232px;
               font-size: 17px; font-weight: bold; color: #e8c266;
               overflow: hidden; white-space: nowrap; display: none; }
+/* Free Slot Play (the player's restricted promotional balance) under the
+   credits line. Shown only when the player has some (html.fsp); the badge,
+   the hairline and the button stack then sit 22px lower:
+   fsp y=128(+18), badge y=154(+26), hairline y=190, stack from y=202
+   -> the nine 76px admin buttons end y=950 < foot y=976. */
+#ph-fsp   { position: absolute; left: 12px; top: 128px; width: 232px;
+            font-size: 15px; font-weight: bold; color: #7fd0a8;
+            overflow: hidden; white-space: nowrap; display: none; }
+.fsp #ph-fsp   { display: block; }
+.fsp #hm-badge { top: 154px; }
+.fsp #hm-rule  { top: 190px !important; }
+.fsp #hm-btns  { top: 202px !important; }
 /* ADMIN badge: shown ONLY when state.admin (the old ATTENDANT/MANAGER strip,
    now a single access badge); non-admin players never see it */
 #hm-badge { position: absolute; left: 12px; top: 132px; width: 232px;
@@ -207,12 +224,60 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
 #wl-title { position: absolute; left: 12px; top: 40px; width: 232px;
             font-size: 18px; font-weight: bold; letter-spacing: 3px;
             color: #e8c266; }
-#wl-label { position: absolute; left: 12px; top: 80px; width: 232px;
+/* .wk = one balance. With no Free Slot Play there is one, drawn as plain
+   centred text exactly where it always was (label y=80, figure y=100). */
+.wk       { position: absolute; left: 12px; width: 232px; height: 76px; }
+#wl-k0    { top: 72px; }
+#wl-k1    { top: 144px; display: none; }
+.wk-ring  { display: none; position: absolute; left: 10px; top: 19px;
+            width: 22px; height: 22px; border: 2px solid #55708a;
+            border-radius: 11px; }
+.wk-dot   { display: none; position: absolute; left: 4px; top: 4px;
+            width: 10px; height: 10px; border-radius: 5px;
+            background: #e8c266; }
+#wl-label, #wl-fsp-l {
+            position: absolute; left: 0; top: 8px; width: 232px;
             text-align: center; font-size: 12px; letter-spacing: 3px;
             color: #55708a; }
-#wl-bal   { position: absolute; left: 12px; top: 100px; width: 232px;
+#wl-bal, #wl-fsp {
+            position: absolute; left: 0; top: 28px; width: 232px;
             text-align: center; font-size: 40px; font-weight: bold;
             color: #e8c266; overflow: hidden; white-space: nowrap; }
+#wl-fsp   { color: #7fd0a8; }
+/* Free Slot Play (the player's restricted promotional balance) makes it
+   two (html.fsp): each balance becomes a 64px row with a radio ring, and
+   the one picked (.wk-on) is what ADD loads from. Everything under the
+   rows sits 60px lower:
+     rows y=72..136 / 144..208, machine y=218/236, ADD sec y=286, chips
+     y=318(+64), amount y=388(+44), sel y=434, msg y=452, ADD y=474(+84)
+     ->558, CASHOUT sec y=560, toggle y=588(+84)->672, hint y=680, note
+     y=764, BACK y=880. Inline tops need !important to lose. */
+.fsp .wk  { height: 64px; background: #141c26; border: 2px solid #2c3a4a;
+            cursor: pointer; }
+.fsp .wk:active { background: #26364a; }
+.fsp #wl-k1 { display: block; }
+.fsp .wk-on { background: #1b2735; border-color: #e8c266; }
+.fsp .wk-ring { display: block; }
+.fsp .wk-on .wk-ring { border-color: #e8c266; }
+.fsp .wk-on .wk-dot { display: block; }
+.fsp #wl-label, .fsp #wl-fsp-l {
+            left: 42px; top: 8px; width: 180px; text-align: left;
+            font-size: 11px; letter-spacing: 1px; color: #9fb2c8; }
+.fsp #wl-bal, .fsp #wl-fsp {
+            left: 42px; top: 23px; width: 180px; text-align: left;
+            font-size: 24px; line-height: 30px; }
+.fsp #wl-mc-l  { top: 218px; }
+.fsp #wl-mc-v  { top: 236px; }
+.fsp #wl-sec1  { top: 286px; }
+.fsp #wl-chips { top: 318px; }
+.fsp #wl-custom { top: 388px; }
+.fsp #wl-sel   { top: 434px; }
+.fsp #wl-fund-msg { top: 452px !important; }
+.fsp #wl-add-slot { top: 474px !important; }
+.fsp #wl-sec2  { top: 560px; }
+.fsp #wl-toggle-slot { top: 588px !important; }
+.fsp #wl-toggle-hint { top: 680px; }
+.fsp #wl-note  { top: 764px; }
 #wl-mc-l  { position: absolute; left: 12px; top: 158px; width: 232px;
             text-align: center; font-size: 11px; letter-spacing: 2px;
             color: #55708a; }
@@ -419,6 +484,9 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
 .wide .hd-sub   { left: 24px; top: 62px; width: 380px; }
 .wide #ph-credits { left: 24px; top: 88px; width: 380px; font-size: 20px; }
 .wide #hm-badge { left: 24px; top: 122px; width: 150px; }
+/* Free Slot Play: under the credits line, the badge 20px lower */
+.wide #ph-fsp   { left: 24px; top: 114px; width: 380px; font-size: 16px; }
+.wide.fsp #hm-badge { top: 142px; }
 .wide #hm-rule  { display: none; }
 .wide #hm-btns  { left: 420px !important; top: 16px !important; width: 412px; }
 .wide #hm-btns .nb { float: left; margin: 0 8px 8px 0; }
@@ -431,9 +499,22 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
 .wide .foot     { left: 24px; top: 262px; width: 380px; text-align: left; }
 /* wallet: balances left, fund pad middle, cash-out + back on the right */
 .wide #wl-title { left: 24px; top: 18px; width: 380px; }
-.wide #wl-label { left: 24px; top: 50px; width: 380px; text-align: left; }
-.wide #wl-bal   { left: 24px; top: 66px; width: 380px; text-align: left;
+.wide #wl-k0    { left: 24px; top: 44px; width: 380px; }
+.wide #wl-label { left: 0; top: 6px; width: 380px; text-align: left; }
+.wide #wl-bal   { left: 0; top: 22px; width: 380px; text-align: left;
                   font-size: 38px; }
+/* wide with Free Slot Play: the two radio rows sit side by side, 186x60
+   at x=24 and x=218, y=44..104; nothing under them moves */
+.wide.fsp #wl-k0 { width: 186px; height: 60px; }
+.wide.fsp #wl-k1 { left: 218px; top: 44px; width: 186px; height: 60px; }
+.wide.fsp .wk-ring { left: 8px; top: 18px; width: 20px; height: 20px;
+                     border-radius: 10px; }
+.wide.fsp .wk-dot  { left: 3px; top: 3px; }
+.wide.fsp #wl-label, .wide.fsp #wl-fsp-l {
+                  left: 36px; top: 7px; width: 142px; font-size: 10px; }
+.wide.fsp #wl-bal, .wide.fsp #wl-fsp {
+                  left: 36px; top: 20px; width: 142px; text-align: left;
+                  font-size: 20px; line-height: 30px; }
 .wide #wl-mc-l  { left: 24px; top: 116px; width: 380px; text-align: left; }
 .wide #wl-mc-v  { left: 24px; top: 132px; width: 380px; text-align: left; }
 .wide #wl-sec1  { left: 24px; top: 172px; width: 380px; }
@@ -543,6 +624,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
        string; the hub omits it when the fob has no linked account, and the
        line hides with it (display:none is the default) -->
   <div id="ph-credits">CREDITS &#8212;</div>
+  <div id="ph-fsp"></div>
   <div id="hm-badge">ADMIN</div>
   <div class="hairline" id="hm-rule" style="top:168px;"></div>
   <div class="btncol" id="hm-btns" style="top:180px;">
@@ -579,8 +661,16 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
      ?view=cashout every ~2s so the numbers + arm state stay live. -->
 <div class="view" id="v-wallet">
   <div id="wl-title">MY WALLET</div>
-  <div id="wl-label">WALLET BALANCE</div>
-  <div id="wl-bal">&#8212;</div>
+  <div class="wk" id="wl-k0">
+    <div class="wk-ring"><div class="wk-dot"></div></div>
+    <div id="wl-label">WALLET BALANCE</div>
+    <div id="wl-bal">&#8212;</div>
+  </div>
+  <div class="wk" id="wl-k1">
+    <div class="wk-ring"><div class="wk-dot"></div></div>
+    <div id="wl-fsp-l">FREE SLOT PLAY</div>
+    <div id="wl-fsp">&#8212;</div>
+  </div>
   <div id="wl-mc-l">ON THIS MACHINE</div>
   <div id="wl-mc-v">&#8212;</div>
   <div id="wl-sec1">ADD TO MACHINE</div>
@@ -857,6 +947,15 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
                                      // only when a DIFFERENT player sits down
   var coMachineMc = 0;               // cashout view: machine credits (millicents)
   var coWalletMc = null;             // wallet balance (millicents); null = no wallet
+  // Restricted promotional credit (2026-11-16): the player's second wallet
+  // balance. On THIS page it is called FREE SLOT PLAY (AJ: "on the players
+  // glass side it should be listed as Free Slot Play"); the operator pages
+  // use the machine's own wording, restricted promotional. When the player
+  // has some, the home page shows it under the credits line and MY WALLET
+  // turns its two balances into radio rows: tap the one to fund from, and
+  // ADD loads that one. No carryover between players.
+  var coRestrMc = 0;                 // restricted balance (millicents)
+  var coUseRestr = false;            // ADD CREDITS loads restricted credit
   var coCanFund = false;             // funding allowed (linked + path available)
   var coHasWallet = false;           // a wallet exists at all (gates the toggle)
   var coCashToWat = false;           // current WAT-cash-out arm state
@@ -1027,6 +1126,9 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
       credits = overlay ? '' : (
         (s.credits === undefined || s.credits === null)
           ? '' : String(s.credits));
+      // Free Slot Play balance: sent only when the player has some, and
+      // hidden with the credits during an overlay
+      setRestrMc(overlay ? 0 : s.restrictedMc);
       var fresh = (s.sess && s.sess !== sess);   // new hub-minted session
       if (s.sess) { sess = s.sess; }
       // Reset the FUND amount when a DIFFERENT player takes the seat, keyed on
@@ -1037,6 +1139,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
       if (!overlay && sinceIso && sinceIso !== lastPlayerSince) {
         lastPlayerSince = sinceIso;
         selIdx = 1; selCents = CHIPS[selIdx];   // no carryover between players
+        coUseRestr = false;
       }
       if (fresh || view === 'attract') {
         show('home');          // card-in (or back from offline) -> home menu
@@ -1053,6 +1156,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     } else {
       sess = null; tier = ''; admin = false; overlay = false; supervising = '';
       who = ''; sinceIso = ''; credits = '';
+      setRestrMc(0);
       if (view !== 'attract') { show('attract'); }   // hub-side card-out wins
     }
     updateTexts();
@@ -1163,12 +1267,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     setStyle($('ph-credits'), 'fontSize',
       (credits && credits.length > 14) ? '13px' : '17px');
     setMoney('wl-bal', credits || '\u2014');
-    // the 232px column clips silently past ~$1M at 40px bold, so step
-    // the font DOWN on long balances: every digit stays on the glass
-    var wlLen = (credits || '\u2014').length;
-    setStyle($('wl-bal'), 'fontSize',
-      wlLen <= 11 ? '40px' : wlLen <= 13 ? '32px'
-        : wlLen <= 16 ? '26px' : '20px');
+    paintWalletKind();      // Free Slot Play line + rows, and the figure fit
     // footer = just the gameroom name (the raw UTC "in since HH:MM" was
     // confusing to players and served no purpose \u2014 dropped 2026-07-14)
     setText('ph-foot', brand);
@@ -1361,15 +1460,78 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
       ? 0 : d.machineCreditsMc;
     coWalletMc = (d.walletMc === undefined || d.walletMc === null)
       ? null : d.walletMc;
+    setRestrMc(d.walletRestrictedMc);
     coCanFund = (d.canFund === true);
     coCashToWat = (d.cashOutToWat === true);
     coHasWallet = (coWalletMc !== null) || coCanFund;
+    paintWalletKind();
     setMoney('wl-mc-v', fmtMc(coMachineMc));
     setText('wl-note', coHasWallet ? ''
       : 'Link a card to move money to and from your wallet.');
     paintWalletChips();
     setBtnOff('wl-add', !coCanFund);
     setWalletToggleFace();
+  }
+  // Free Slot Play = the player's restricted promotional balance. Both the
+  // state poll and the wallet data bring it; with some on the account the
+  // home page shows it under the credits line and MY WALLET turns its two
+  // balances into radio rows (AJ, 2026-11-17: "an option to fund from
+  // wallet or free slot play ... like a check box or radio button"). The
+  // row picked is what ADD loads from; the balances themselves never move.
+  // With none there is nothing to pick and both pages look as they did.
+  function setCls(el, cn) { if (el.className !== cn) { el.className = cn; } }
+  function setHtmlFlag(name, on) {
+    var de = document.documentElement, cur = de.className || '';
+    var has = (' ' + cur + ' ').indexOf(' ' + name + ' ') !== -1;
+    if (has === on) { return; }
+    var cls = (' ' + cur + ' ').replace(' ' + name + ' ', ' ')
+      .replace(/^\s+|\s+$/g, '');
+    de.className = on ? (cls ? cls + ' ' + name : name) : cls;
+  }
+  function setRestrMc(mc) {
+    coRestrMc = (typeof mc === 'number' && mc > 0) ? mc : 0;
+    if (!coRestrMc) { coUseRestr = false; }
+    paintWalletKind();
+  }
+  function paintWalletKind() {
+    var on = coRestrMc > 0;
+    setHtmlFlag('fsp', on);
+    setCls($('wl-k0'), (on && !coUseRestr) ? 'wk wk-on' : 'wk');
+    setCls($('wl-k1'), (on && coUseRestr) ? 'wk wk-on' : 'wk');
+    setText('ph-fsp', on ? ('FREE SLOT PLAY  ' + fmtMc(coRestrMc)) : '');
+    setText('wl-fsp', on ? fmtMc(coRestrMc) : '');
+    setText('wl-add', coUseRestr ? 'ADD FREE PLAY' : 'ADD CREDITS');
+    fitWalletFigures();
+  }
+  // the balance column clips silently on long figures, so step the font
+  // DOWN: every digit stays on the glass. One balance keeps the sizes it
+  // always had; the radio rows are narrower (180px tall lane, 142px wide
+  // lane) and start smaller.
+  function figLen(id) {
+    var f = $(id).firstChild;
+    return f ? String(f.nodeValue).length : 0;
+  }
+  function rowFigSize(n) {
+    if (layoutMode === 'wide') {
+      return n <= 11 ? '20px' : n <= 13 ? '18px' : n <= 16 ? '15px' : '12px';
+    }
+    return n <= 13 ? '24px' : n <= 16 ? '19px' : '15px';
+  }
+  function fitWalletFigures() {
+    var n = figLen('wl-bal');
+    setStyle($('wl-bal'), 'fontSize', coRestrMc > 0 ? rowFigSize(n)
+      : (n <= 11 ? '40px' : n <= 13 ? '32px' : n <= 16 ? '26px' : '20px'));
+    setStyle($('wl-fsp'), 'fontSize', rowFigSize(figLen('wl-fsp')));
+    // home line: "FREE SLOT PLAY  $x" in the 232px tall lane
+    var h = figLen('ph-fsp');
+    setStyle($('ph-fsp'), 'fontSize', (layoutMode === 'wide') ? ''
+      : (h <= 26 ? '' : h <= 30 ? '13px' : '11px'));
+  }
+  function pickWalletKind(restr) {
+    if (!coRestrMc) { return; }
+    coUseRestr = restr;
+    paintWalletKind();
+    setText('wl-fund-msg', '');
   }
   function paintWalletChips() {
     for (var i = 0; i < 3; i++) {
@@ -1736,6 +1898,16 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   $('kp-cancel').onclick = closeKeypad;
   $('wl-add').onclick = function () {
     if (!coCanFund) { return; }
+    if (coUseRestr) {
+      if (selCents * 1000 > coRestrMc) {
+        setText('wl-fund-msg', 'Not enough Free Slot Play'); return;
+      }
+      askConfirm('ADD ' + fmtCents(selCents) + ' FREE SLOT PLAY?',
+        'Moves ' + fmtCents(selCents) + ' of Free Slot Play '
+        + 'from your wallet to this machine. It has to be played.',
+        { action: 'walletFund', cents: selCents, restricted: true }, 'wallet');
+      return;
+    }
     if (coWalletMc !== null && selCents * 1000 > coWalletMc) {
       setText('wl-fund-msg', 'Not enough in your wallet'); return;
     }
@@ -1743,6 +1915,8 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
       'Moves ' + fmtCents(selCents) + ' from your wallet to this machine.',
       { action: 'walletFund', cents: selCents }, 'wallet');
   };
+  $('wl-k0').onclick = function () { pickWalletKind(false); };
+  $('wl-k1').onclick = function () { pickWalletKind(true); };
   $('wl-toggle').onclick = function () {
     if (!coHasWallet || coToggleBusy) { return; }
     coToggleBusy = true;

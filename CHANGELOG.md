@@ -1,5 +1,43 @@
 # Changelog
 
+## v0.3.12
+Restricted promotional credit, end to end. Every player wallet has two
+balances: cash and restricted. Restricted credit has to be played and is
+never paid out as cash. Operator pages call it "restricted promotional",
+the machine's own wording; the player's glass page calls it "Free Slot
+Play".
+- **Sending it to a machine.** The Wallet page has a new step, "As": cash
+  credit or restricted promotional. It comes off the sending account's
+  restricted balance, and the bank can give it freely. It works on SAS
+  machines (the AFT restricted amount) and on G2S machines, where the hub
+  could already move it but the page never offered it.
+- **Giving it to a player.** The Players page fund box has a "restricted
+  promotional" tick box, for giving and for pulling back.
+- **On the player's screen.** On the SMIB player screen and the digital
+  glass, a carded player with Free Slot Play sees it on the home page
+  under their wallet balance. In MY WALLET the two balances are two
+  rows, each with a radio button: tap the one to load from, and the ADD
+  button loads that one. A player with none sees the pages as before.
+- **The SMIB player screen picks up updates by itself.** That screen
+  reloads its page, while nobody is carded in, when the hub says the
+  page changed. The hub was only saying so on a poll that screen never
+  reads, so after an update it kept the old page until its browser was
+  restarted. The signal now goes out on the screen's own poll. A
+  balance of 13 characters (such as $1,058,441.00) also no longer loses
+  the edge of its last digit on the home page.
+- **Cashing it out to the wallet.** A SAS cash-out to the wallet now
+  takes the machine's restricted credit along with its cash and puts
+  each in its own balance. Before, restricted credit was left on the
+  machine.
+- **Tickets.** A SAS machine says what each ticket it prints is. A
+  restricted promotional ticket (titled PLAYABLE ONLY) is tagged in the
+  Cage list and named in its detail, and when it goes back into a
+  machine it is credited as restricted credit, on SAS and on G2S.
+- The default expiry for restricted tickets is set on the machine along
+  with the ordinary one.
+- Seen on a Bluebird 2: a $150 restricted push, and at cash-out a normal
+  ticket for the cash followed by a PLAYABLE ONLY ticket for the $150.
+
 ## v0.3.11
 Third batch from the SAS audit, second part.
 - **The ticket expiry is also set the way the document says.** It was

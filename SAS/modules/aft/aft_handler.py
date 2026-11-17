@@ -589,8 +589,11 @@ def build_aft_transfer_poll(address: int, request: AFTTransferRequest,
     data.append(len(txn))
     data += txn
     data += int_to_bcd(request.expiration_mmddyyyy, 4)
-    data += int_to_bcd(request.pool_id, 2)       # BCD (real 6.02 says BINARY;
-    #                                              inert at pool_id=0 — see note)
+    # Pool ID: "2 binary" (SAS 6.02 Table 8.3a), and binary fields go least
+    # significant byte first (§2). This was packed BCD on saspy's word and
+    # flagged as unresolved; it is the document's layout now that restricted
+    # amounts are sent (2026-11-16). Pool 0000 is the same bytes either way.
+    data += int(request.pool_id).to_bytes(2, "little")
     data.append(0x00)                            # receipt data length: none
     data += int_to_bcd(request.lock_timeout_hundredths, 2)  # trailing lock TO
     body = bytes([address, AFT_CMD_TRANSFER, len(data)]) + bytes(data)
@@ -1181,9 +1184,10 @@ def judge_open_transfer(rec: Dict,
                             different transaction as its latest. Our 0x72
                             never started a cycle, so nothing moved.
 
-    The amount is the machine's own figure. Where it cannot be read, a push
-    falls back to what was asked for and a cash-out credits nothing — the
-    same rule the live paths use."""
+    The amount is the machine's own figure, in the kind of credit the
+    transfer was for (cashable, or restricted for a restricted promotional
+    push). Where it cannot be read, a push falls back to what was asked for
+    and a cash-out credits nothing — the same rule the live paths use."""
     if status is None:
         return None
     if status.transaction_id != rec["txnId"]:
@@ -1196,7 +1200,9 @@ def judge_open_transfer(rec: Dict,
     if event == AFTTxnEvent.STATUS_PENDING:
         return None
     if event in (AFTTxnEvent.STATUS_FULL, AFTTxnEvent.STATUS_PARTIAL):
-        amount = status.cashable_cents
+        amount = (status.restricted_cents
+                  if rec.get("creditType") == "restricted"
+                  else status.cashable_cents)
         note = ""
         if amount is None:
             if rec.get("kind") == "aft_transfer":
@@ -1207,6 +1213,9 @@ def judge_open_transfer(rec: Dict,
         full = event == AFTTxnEvent.STATUS_FULL
         return {"ok": True, "outcome": "completed" if full else "partial",
                 "amountCents": int(amount),
+                # a cash-out can carry restricted credit as well as cash
+                "restrictedCents": int(status.restricted_cents or 0)
+                if rec.get("kind") != "aft_transfer" else 0,
                 "detail": ("full transfer successful" if full else
                            f"partial transfer: {amount} cashable cents")
                 + note}
@@ -1432,9 +1441,11 @@ class AFTHost:
             p._safe(self.on_transfer, p.address, result)
             return result
         try:
-            self.journal.open(request.transaction_id, kind,
-                              request.transfer_type, request.cashable_cents,
-                              account_id, cmd_id)
+            self.journal.open(
+                request.transaction_id, kind, request.transfer_type,
+                request.total_cents, account_id, cmd_id,
+                credit_type=("restricted" if request.restricted_cents
+                             and not request.cashable_cents else "cashable"))
         except OSError as e:
             result = AFTTransferResult(
                 AFTOutcome.NOT_SAVED, AFTTxnState.CREATED, request, None,

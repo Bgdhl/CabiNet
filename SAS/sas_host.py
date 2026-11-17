@@ -381,6 +381,17 @@ def parse_ticket_data_reply(value):
             "expireDays": exp, "rev": rev}
 
 
+def _restricted_moved(res) -> int:
+    """The restricted amount the machine CONFIRMED in a transfer result, in
+    cents; 0 when the transfer did not complete or the figure is
+    unreadable (the same rule the cashable amount follows)."""
+    final = getattr(res, "final", None)
+    if not getattr(res, "ok", False) or final is None \
+            or final.restricted_cents is None:
+        return 0
+    return int(final.restricted_cents)
+
+
 def late_transfer_record(ended):
     """The hub result record for a transfer that ENDED after its own
     command had already answered "unconfirmed" (AFTHost.service_open).
@@ -402,6 +413,9 @@ def late_transfer_record(ended):
            "late": True}
     if rec.get("kind") == "aft_transfer":
         out["cents"] = rec.get("cents")
+        out["creditType"] = rec.get("creditType") or "cashable"
+    else:
+        out["restrictedCents"] = int(ended.get("restrictedCents") or 0)
     if rec.get("accountId"):
         out["accountId"] = rec["accountId"]
     if rec.get("cmdId"):
@@ -732,7 +746,8 @@ def apply_ticket_header(transport, address, target, protocol=None,
         sleep(pace)
         ev = read_extended_validation_status(
             transport, address, proto,
-            cashable_days=9999 if days == 0 else days)
+            cashable_days=9999 if days == 0 else days,
+            restricted_days=9999 if days == 0 else days)
         if ev is not None and ev.cashable_expiration_days is not None:
             edetail += (f" and 0x7B (machine reports "
                         f"{ev.cashable_expiration_days}d)")
@@ -1870,13 +1885,27 @@ def main():
                 # unlocked — bench-proven 2026-07-09). Send lock:false to force
                 # the spec-legal lockless path on firmware that supports it.
                 require_lock = bool(cmd.get("lock", True))
+                # Cash, or RESTRICTED PROMOTIONAL credit (2026-11-16): the
+                # same in-house transfer with the amount in the restricted
+                # field (SAS 6.02 Table 8.3d: type 00 takes cashable,
+                # restricted and nonrestricted). The machine plays it down
+                # first, never pays it out as cash, and at cash-out prints a
+                # restricted promotional ticket for what is left. Pool 0000
+                # and expiration 00000000 (the machine's default for
+                # restricted tickets, which the header apply sets with 7B),
+                # the same pool a redeemed restricted ticket lands in.
+                restricted = cmd.get("creditType") == "restricted"
+                result["creditType"] = "restricted" if restricted \
+                    else "cashable"
                 logger.info("💵 hub command {}: AFT ready ({}) — pushing {}c "
-                            "host->EGM ({})", cmd_id, reg_detail, cents,
+                            "{}host->EGM ({})", cmd_id, reg_detail, cents,
+                            "RESTRICTED PROMOTIONAL " if restricted else "",
                             "lock-first" if require_lock else "lockless")
                 req = AFTTransferRequest(
                     transaction_id=make_transaction_id(),
                     transfer_type=TRANSFER_TYPE_HOST_TO_EGM,
-                    cashable_cents=cents,
+                    cashable_cents=0 if restricted else cents,
+                    restricted_cents=cents if restricted else 0,
                     transfer_code=TRANSFER_CODE_FULL_ONLY,
                     transfer_flags=TRANSFER_FLAGS_NONE)
                 # raw 0x72 req/resp tap — keep the bytes in the journal so any
@@ -1935,10 +1964,10 @@ def main():
                 # Authoritative moved amount = what the MACHINE confirmed (full
                 # == requested; partial < requested). 0 unless it actually
                 # landed — the hub debits House by exactly this.
-                confirmed = (res.final.cashable_cents
-                             if res.final is not None
-                             and res.final.cashable_cents is not None
-                             else cents)
+                moved = None if res.final is None else (
+                    res.final.restricted_cents if restricted
+                    else res.final.cashable_cents)
+                confirmed = moved if moved is not None else cents
                 result["ok"] = res.ok
                 result["outcome"] = res.outcome.value
                 result["detail"] = res.detail + detail_extra
@@ -1981,9 +2010,15 @@ def main():
                 ls = aft_host.read_lock_status()
                 cashable = (ls.current_cashable_cents
                             if ls and ls.current_cashable_cents else 0)
+                # restricted promotional credit comes back too, as
+                # restricted: the hub credits it to the wallet's restricted
+                # balance, never to cash (2026-11-16)
+                restricted_now = (ls.current_restricted_cents
+                                  if ls and ls.current_restricted_cents
+                                  else 0)
                 if ls is not None:
                     result["availXfers"] = ls.available_transfers
-                if cashable <= 0:
+                if cashable + restricted_now <= 0:
                     result["ok"] = False
                     result["outcome"] = "no_credits"
                     result["amountCents"] = 0
@@ -1992,7 +2027,7 @@ def main():
                     logger.info("🏦 hub command {}: host-pull — no cashable "
                                 "credits", cmd_id)
                     return result
-                if cashable > MAX_AFT_CENTS:
+                if cashable + restricted_now > MAX_AFT_CENTS:
                     result["ok"] = False
                     result["outcome"] = "over_ceiling"
                     result["amountCents"] = 0
@@ -2007,6 +2042,7 @@ def main():
                     transaction_id=make_transaction_id(),
                     transfer_type=TRANSFER_TYPE_EGM_TO_HOST,
                     cashable_cents=cashable,
+                    restricted_cents=restricted_now,
                     transfer_code=TRANSFER_CODE_FULL_ONLY,
                     transfer_flags=TRANSFER_FLAGS_NONE)
                 logger.info("🏦 hub command {}: HOST-PULL {}c EGM->host "
@@ -2027,11 +2063,14 @@ def main():
                              else None)
                 credited = (confirmed if res.ok and confirmed is not None
                             else 0)
+                rcredited = _restricted_moved(res)
                 result["ok"] = res.ok
                 result["outcome"] = res.outcome.value
                 result["txnId"] = req.transaction_id
                 result["amountCents"] = credited
-                result["detail"] = (res.detail if credited or not res.ok
+                result["restrictedCents"] = rcredited
+                result["detail"] = (res.detail
+                                    if credited or rcredited or not res.ok
                                     else res.detail + " — amount UNCONFIRMED, "
                                     "NOT credited (verify meters)")
                 result["result"] = "ack" if res.ok else res.outcome.value
@@ -2815,11 +2854,17 @@ def main():
                 ls = aft_host.read_lock_status()
                 cashable = (ls.current_cashable_cents
                             if ls and ls.current_cashable_cents else 0)
-                if cashable <= 0:
+                # restricted promotional credit comes back too, as
+                # restricted: the hub credits it to the wallet's restricted
+                # balance, never to cash (2026-11-16)
+                restricted_now = (ls.current_restricted_cents
+                                  if ls and ls.current_restricted_cents
+                                  else 0)
+                if cashable + restricted_now <= 0:
                     rec.update(ok=False, outcome="no_credits", amountCents=0,
                                detail="machine reports no cashable credits",
                                result="rejected")
-                elif cashable > MAX_AFT_CENTS:
+                elif cashable + restricted_now > MAX_AFT_CENTS:
                     rec.update(ok=False, outcome="over_ceiling", amountCents=0,
                                detail=(f"cashable {cashable}c over the "
                                        f"{MAX_AFT_CENTS}c ceiling — cash out "
@@ -2829,6 +2874,7 @@ def main():
                         transaction_id=make_transaction_id(),
                         transfer_type=TRANSFER_TYPE_EGM_TO_HOST,
                         cashable_cents=cashable,
+                        restricted_cents=restricted_now,
                         transfer_code=TRANSFER_CODE_FULL_ONLY,
                         transfer_flags=TRANSFER_FLAGS_NONE)
                     logger.info("🏦 host-cashout: pushing {}c EGM->host "
@@ -2853,10 +2899,13 @@ def main():
                                  else None)
                     credited = (confirmed if res.ok and confirmed is not None
                                 else 0)
+                    rcredited = _restricted_moved(res)
                     rec.update(ok=res.ok, outcome=res.outcome.value,
                                txnId=req.transaction_id,
                                amountCents=credited,
-                               detail=(res.detail if credited or not res.ok
+                               restrictedCents=rcredited,
+                               detail=(res.detail
+                                       if credited or rcredited or not res.ok
                                        else res.detail + " — amount UNCONFIRMED"
                                        ", NOT credited (verify meters)"),
                                result="ack" if res.ok else res.outcome.value)

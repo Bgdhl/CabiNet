@@ -290,10 +290,29 @@ def main():
     code, body = command(eng, {"action": "addCredits", "egmId": EGM,
                                "cashableMillicents": 1000,
                                "promoMillicents": 1000})
-    check("promo bucket refused (SAS AFT moves cashable only) — nothing "
-          "queued",
+    check("promo bucket refused — nothing queued",
           code == 400 and body.get("ok") is False and len(sent_cmds) == 1,
           (code, body))
+    # 2026-11-16: the restricted (nonCash) bucket rides the SAS leg as a
+    # restricted promotional push
+    code, body = command(eng, {"action": "addCredits", "egmId": EGM,
+                               "nonCashMillicents": 250000})
+    check("linked addCredits with nonCashMillicents -> a restricted "
+          "aft_transfer on the SAS leg",
+          code == 200 and body.get("ok") is True and len(sent_cmds) == 2
+          and sent_cmds[1][1]["type"] == "aft_transfer"
+          and sent_cmds[1][1]["cents"] == 250
+          and sent_cmds[1][1].get("creditType") == "restricted",
+          (code, body, sent_cmds[-1]))
+    check("...and a cash push carries no creditType",
+          "creditType" not in sent_cmds[0][1], sent_cmds[0][1])
+    code, body = command(eng, {"action": "addCredits", "egmId": EGM,
+                               "cashableMillicents": 1000,
+                               "nonCashMillicents": 1000})
+    check("cash and restricted in one push refused — nothing queued",
+          code == 400 and body.get("ok") is False and len(sent_cmds) == 2,
+          (code, body))
+    sent_cmds.pop()          # leave the list as the checks below expect it
     code, body = command(eng, {"action": "addCredits", "egmId": EGM,
                                "cashableMillicents": 1500})
     check("sub-cent amount refused (1500 mc is not a whole cent)",

@@ -1158,11 +1158,22 @@ def main():
     check("glass_state back to the player: no overlay, credits restored",
           st2.get("carded") is True and not st2.get("overlay") and
           st2.get("credits") == "$0.00")
+    # the restricted promotional balance ("Free Slot Play" on the player's
+    # screen) rides the same poll, only when the player has some
+    check("no restricted balance = no restrictedMc on the glass state",
+          "restrictedMc" not in st2)
+    eng.account_store.accounts["p1"]["nonCashMillicents"] = 15000000
+    st2r = eng.glass_state(EGM)
+    check("a restricted balance rides the glass state beside the credits",
+          st2r.get("restrictedMc") == 15000000 and
+          st2r.get("credits") == "$0.00")
 
     print("— admin overlay: a genuine card-out drops the overlay too")
     report(eng, taps=[tap(5, uid="AA11BB22")])       # admin overlays AJ again
     check("overlay back up", (eng.admin_overlays.get(EGM) or {}).get("uid")
           == "AA11BB22")
+    check("the overlay hides the friend's restricted balance with the credits",
+          "restrictedMc" not in eng.glass_state(EGM))
     eng._glass_card_out(EGM)                          # AJ's session truly ends
     check("card-out pops BOTH the player body and the stale overlay",
           eng.card_sessions == {} and eng.admin_overlays == {})
@@ -1543,6 +1554,30 @@ def main():
     gst3 = engG.glass_state(EGM)
     check("a host_setting fault degrades gameroom to '' (poll never 500s)",
           gst3.get("ok") is True and gst3.get("gameroom") == "")
+
+    print("— SMIB player screen: its reload stamp rides the poll it reads")
+    # smib.html has no keyboard, so it reloads itself (while idle) when the
+    # stamp in ITS OWN poll changes. Until 2026-11-17 the hub only put the
+    # stamp on /api/status, which that page never reads, so an update did
+    # not reach the screen until its browser was restarted. Both ends are
+    # pinned here: the name the page watches, and the reply carrying it.
+    smib_page = open(os.path.join(G2S_DIR, "webui", "smib.html"),
+                     encoding="utf-8").read()
+    check("smib.html polls /api/glass/state and watches s.smibStamp",
+          "'/api/glass/state?egm='" in smib_page and
+          "s.smibStamp !== lastSmibStamp" in smib_page)
+    check("glass_state carries smibStamp = smib.html's own mtime",
+          gst.get("smibStamp") == int(os.path.getmtime(
+              os.path.join(G2S_DIR, "webui", "smib.html"))) and
+          gst.get("smibStamp") == gh.smib_ui_stamp())
+    _real_stamp = gh.smib_ui_stamp
+    gh.smib_ui_stamp = lambda: (_ for _ in ()).throw(OSError("gone"))
+    try:
+        gst4 = engG.glass_state(EGM)
+    finally:
+        gh.smib_ui_stamp = _real_stamp
+    check("a missing page just drops the stamp (poll never 500s)",
+          gst4.get("ok") is True and "smibStamp" not in gst4)
 
     devices_fold()
     glass_window_picker()

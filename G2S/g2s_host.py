@@ -125,7 +125,7 @@ if "tournament_names" not in _hub_store_mod.HOST_SETTING_KEYS:
 # the MINOR bump per the repo's version rule). Surfaced in engine_meta() ->
 # /api/status ["_engine"]["version"]; bump this and add a CHANGELOG.md
 # section on every commit with a user-visible change.
-CABINET_VERSION = "0.3.11"
+CABINET_VERSION = "0.3.12"
 
 WSDL_NS = "http://www.gamingstandards.com/wsdl/g2s/v1.0"
 SCHEMA_NS = "http://www.gamingstandards.com/g2s/schemas/v1.0.3"
@@ -3065,8 +3065,12 @@ class TitoAuthority:
     def _adapt(dec):
         """hub {authorized, amountMc, reason, retry} -> voucher dialect."""
         if dec.get("authorized"):
+            # A restricted promotional ticket is credited as non-cashable
+            # credit: G2S_nonCash to a G2S machine, and the SAS edge turns
+            # that into the restricted transfer code (2026-11-16).
             return {"exc": 0, "amt": str(int(dec.get("amountMc", 0))),
-                    "creditType": "G2S_cashable",
+                    "creditType": "G2S_nonCash"
+                    if dec.get("restrictedPromo") else "G2S_cashable",
                     "retry": bool(dec.get("retry")),
                     "reason": dec.get("reason", "authorized")}
         reason = dec.get("reason", "rejected")
@@ -6507,9 +6511,16 @@ class G2SHost:
             acct_id = r.get("accountId")
             acct_id = acct_id.strip()[:64] if isinstance(acct_id, str) \
                 and acct_id.strip() else "house"
-            note = f"AFT credit push to {key} ({r.get('outcome')})"
+            # The KIND the satellite says it moved decides the bucket: a
+            # restricted promotional push comes off the funding account's
+            # restricted balance (nonCashMillicents), never its cash.
+            restricted = r.get("creditType") == "restricted"
+            delta = ({"d_non": -cents * 1000} if restricted
+                     else {"d_cash": -cents * 1000})
+            note = (f"AFT {'restricted promotional ' if restricted else ''}"
+                    f"credit push to {key} ({r.get('outcome')})")
             acct, err = self.account_store.adjust(
-                acct_id, d_cash=-cents * 1000, note=note, ref=ref, once=True)
+                acct_id, note=note, ref=ref, once=True, **delta)
             if err and acct_id != "house":
                 # The player couldn't cover it at settle time (balance moved
                 # in the queue->confirm gap, or the account vanished). The
@@ -6522,9 +6533,9 @@ class G2SHost:
                 log.warning("💵 [sas:%s] %s debit for AFT push %r failed "
                             "(%s) — House covers it", key, acct_id, txn, err)
                 acct, err = self.account_store.adjust(
-                    "house", d_cash=-cents * 1000,
+                    "house",
                     note=note + f" — {acct_id} couldn't cover it, House "
-                                "covered", ref=ref, once=True)
+                                "covered", ref=ref, once=True, **delta)
                 acct_id = "house"
             self._aft_pushes_settled.add(ref)
             if len(self._aft_pushes_settled) > 2048:
@@ -6536,10 +6547,15 @@ class G2SHost:
                 log.warning("💵 [sas:%s] %s debit for AFT push %r FAILED: "
                             "%s", key, acct_id, txn, err)
             else:
-                bal = int((acct or {}).get("cashableMillicents", 0))
-                log.info("💵 [sas:%s] AFT push CONFIRMED — debited %s $%.2f "
-                         "(txn %s); cashable now $%.2f",
-                         key, acct_id, cents / 100, txn, bal / 100000)
+                bal = int((acct or {}).get(
+                    "nonCashMillicents" if restricted
+                    else "cashableMillicents", 0))
+                log.info("💵 [sas:%s] AFT %spush CONFIRMED — debited %s "
+                         "$%.2f (txn %s); %s now $%.2f", key,
+                         "RESTRICTED PROMOTIONAL " if restricted else "",
+                         acct_id, cents / 100, txn,
+                         "restricted" if restricted else "cashable",
+                         bal / 100000)
 
     def _sas_cashout_pin(self, key):
         """The hub's OWN armed cash-out destination for a reporting SAS machine
@@ -6798,8 +6814,14 @@ class G2SHost:
                 if len(self._aft_cashouts_settled) > 2048:
                     self._aft_cashouts_settled = {ref}
                 continue
+            # Restricted promotional credit that came off the machine with
+            # (or without) cash: credited to the SAME wallet's restricted
+            # balance, never to its cash (2026-11-16).
+            rc = r.get("restrictedCents")
+            rc = rc if isinstance(rc, int) and not isinstance(rc, bool) \
+                and rc > 0 else 0
             if (isinstance(cents, bool) or not isinstance(cents, int)
-                    or cents <= 0):
+                    or cents < 0 or (cents == 0 and rc == 0)):
                 # CONFIRMED completion (passed the ok+completed/partial gate)
                 # but the cashable amount is unreadable — the satellite reports
                 # cents=0 with an UNCONFIRMED marker when the completion BCD
@@ -6817,10 +6839,10 @@ class G2SHost:
                         "amount UNCONFIRMED (completion BCD unreadable) — "
                         "verify meters", path="SAS AFT (amount unconfirmed)")
                 continue
-            if cents > self.SAS_AFT_MAX_CENTS:
+            if cents + rc > self.SAS_AFT_MAX_CENTS:
                 log.warning("💵 [sas:%s] AFT cash-out %r reports %d cents — "
                             "over the %d ceiling; NOT credited", key, txn,
-                            cents, self.SAS_AFT_MAX_CENTS)
+                            cents + rc, self.SAS_AFT_MAX_CENTS)
                 continue
             # Destination wallet: THE HUB'S OWN ARM (_glass_cash_out_pin for
             # this machine), NEVER the wire's echoed accountId. The
@@ -6837,9 +6859,11 @@ class G2SHost:
             note = f"AFT cash-out from {key} to wallet ({r.get('outcome')})"
             acct = err = None
             if acct_id:
+                # one adjust, both buckets: cash and restricted land
+                # together under the same ref, or neither does
                 acct, err = self.account_store.adjust(
-                    acct_id, d_cash=cents * 1000, note=note, ref=ref,
-                    once=True)
+                    acct_id, d_cash=cents * 1000, d_non=rc * 1000,
+                    note=note, ref=ref, once=True)
             self._aft_cashouts_settled.add(ref)
             if len(self._aft_cashouts_settled) > 2048:
                 self._aft_cashouts_settled = {ref}
@@ -6850,14 +6874,16 @@ class G2SHost:
                 # goes unanswered → the machine tickets (it is answering
                 # cash-outs the hub can't home — stop the bleeding).
                 self._flag_unhomed_cashout(
-                    key, txn, cents * 1000, acct_id or wire_acct, err,
+                    key, txn, (cents + rc) * 1000, acct_id or wire_acct, err,
                     path="SAS AFT")
                 self._disarm_sas_leg(key)
             else:
                 bal = int((acct or {}).get("cashableMillicents", 0))
                 log.info("💵 [sas:%s] AFT CASH-OUT CONFIRMED — credited %s "
-                         "$%.2f (txn %s); cashable now $%.2f",
-                         key, acct_id, cents / 100, txn, bal / 100000)
+                         "$%.2f%s (txn %s); cashable now $%.2f",
+                         key, acct_id, cents / 100,
+                         f" and ${rc / 100:.2f} restricted" if rc else "",
+                         txn, bal / 100000)
                 if acct_id == "house":
                     # only a tournament sweep ever pins the House — this
                     # settle IS that sweep landing, so consume its pins:
@@ -8717,6 +8743,10 @@ class G2SHost:
                         "cents must be non-zero (negative pulls back "
                         "to the house)"}
             mc = cents * 1000
+            # Cash, or RESTRICTED PROMOTIONAL credit (2026-11-16): the same
+            # two-leg move in the restricted balance. The bank gives
+            # promotional credit freely, so floor mode does not gate it.
+            restricted = req.get("restricted") is True
             # Floor mode (Options ▸ "let the bank go negative" = OFF): giving
             # a friend money that would take the bank below $0 is refused up
             # front, BEFORE any ledger write, with a friendly nudge — the
@@ -8726,7 +8756,7 @@ class G2SHost:
             # two funds racing a near-empty bank could each pass and dip it
             # slightly negative — harmless, money is still conserved, and a
             # home floor never has concurrent funders.)
-            if mc > 0 and not self.house_allow_negative():
+            if mc > 0 and not restricted and not self.house_allow_negative():
                 house = store.get("house") or {}
                 if int(house.get("cashableMillicents", 0) or 0) < mc:
                     return {"ok": False, "error":
@@ -8740,15 +8770,19 @@ class G2SHost:
             # player leg FIRST: a pull-back that would take the player
             # negative refuses HERE, atomically inside adjust, before the
             # house leg ever writes.
+            kind = " (restricted promotional)" if restricted else ""
+            leg = (lambda v: {"d_non": v}) if restricted \
+                else (lambda v: {"d_cash": v})
             account, err = store.adjust(
-                aid, d_cash=mc,
-                note=("house fund" if mc > 0 else "pull back to house"),
-                ref=ref)
+                aid,
+                note=("house fund" if mc > 0 else "pull back to house") + kind,
+                ref=ref, **leg(mc))
             if err:
                 return {"ok": False, "error": err}
             _, err = store.adjust(
-                "house", d_cash=-mc,
-                note=f"{'fund' if mc > 0 else 'pull back'} {aid}", ref=ref)
+                "house",
+                note=f"{'fund' if mc > 0 else 'pull back'} {aid}{kind}",
+                ref=ref, **leg(-mc))
             if err:
                 log.error("🧑 player fund %s: house leg FAILED (%s) — see "
                           "ledger ref %s", aid, err, ref)
@@ -8759,7 +8793,7 @@ class G2SHost:
                      "cashable now %s mc", aid, account.get("name"), cents,
                      ref, account.get("cashableMillicents"))
             return {"ok": True, "player": account, "ref": ref,
-                    "movedMillicents": mc}
+                    "movedMillicents": mc, "restricted": restricted}
         if action == "rename":
             account, err = store.rename(req.get("accountId"),
                                         req.get("name"))
@@ -8975,6 +9009,15 @@ class G2SHost:
         out = {"ok": True, "egmId": egm_id, "nick": nick, "carded": False,
                "gameroom": gameroom, "uiBuild": self._glass_ui_build(),
                "currency": money_symbol()}
+        # The SMIB player screen (smib.html) polls this same endpoint and
+        # reloads itself, while idle, when smibStamp changes. Until
+        # 2026-11-17 the stamp only went out on /api/status, which that
+        # page never reads, so an update did not reach the screen until
+        # its browser was restarted.
+        try:
+            out["smibStamp"] = smib_ui_stamp()
+        except OSError:
+            pass
         try:
             # PIN login (2026-09-14): the attract screen shows ENTER PIN
             # only while some player actually has a PIN; minDigits sizes
@@ -9090,6 +9133,12 @@ class G2SHost:
                 mc = int(acct.get("cashableMillicents") or 0)
                 out["creditsMc"] = mc
                 out["credits"] = f"{money_symbol()}{mc / 100000:,.2f}"
+                # the restricted promotional balance ("Free Slot Play" on
+                # the player's screen), sent only when there is some, so
+                # the home page can show it beside the wallet balance
+                non = int(acct.get("nonCashMillicents") or 0)
+                if non > 0:
+                    out["restrictedMc"] = non
                 if str(acct.get("name") or "").strip():
                     out["name"] = acct.get("name")
         except Exception as e:  # noqa: BLE001 — poll keeps answering
@@ -9298,6 +9347,10 @@ class G2SHost:
                 out["walletMc"] = mc
                 out["walletCredits"] = f"{money_symbol()}{mc / 100000:,.2f}"
                 out["canFund"] = True
+                # the player's restricted promotional balance, so the glass
+                # can offer to load it (0 = nothing to offer)
+                out["walletRestrictedMc"] = int(
+                    acct.get("nonCashMillicents") or 0)
         except Exception:  # noqa: BLE001 — no wallet, not a fault
             pass
         # cashOutToWat: this session's own pin (armed here) OR the wat device
@@ -9499,7 +9552,7 @@ class G2SHost:
         return (isinstance(xf, int) and not isinstance(xf, bool)
                 and bool(xf & AVAIL_XFER_FROM_EGM))
 
-    def glass_wallet_fund(self, egm_id, account_id, cents):
+    def glass_wallet_fund(self, egm_id, account_id, cents, restricted=False):
         """walletFund — push the carded player's OWN wallet onto THIS machine,
         reusing the EXACT money paths sendCredits drives: a SAS-linked cabinet
         takes the satellite aft_transfer (sas_enqueue_command, CENTS); a plain
@@ -9519,9 +9572,12 @@ class G2SHost:
         if acct is None or acct.get("kind") != "player":
             return 403, {"ok": False,
                          "error": "no linked player wallet on this session"}
+        # restricted=True funds from the player's RESTRICTED PROMOTIONAL
+        # balance, as restricted credit on the machine (2026-11-16).
+        bucket = "nonCashMillicents" if restricted else "cashableMillicents"
         # Courtesy overdraft gate (players can never go negative). The reused
         # money path re-checks at escrow/settle — this is the up-front refuse.
-        have = int(acct.get("cashableMillicents") or 0)
+        have = int(acct.get(bucket) or 0)
         if have < cents * 1000:
             return 400, {"ok": False,
                          "error": f"{acct.get('name') or account_id} has "
@@ -9544,7 +9600,7 @@ class G2SHost:
                     "exp": time.time() + self.GLASS_FUND_RESERVE_TTL}
             with self._glass_fund_lock:
                 cur = self.account_store.get(account_id) or {}
-                live = int(cur.get("cashableMillicents") or 0)
+                live = int(cur.get(bucket) or 0)
                 avail = live - self._glass_fund_reserved_mc(account_id)
                 if avail < need_mc:
                     return 400, {"ok": False,
@@ -9557,6 +9613,8 @@ class G2SHost:
             cmd = {"id": f"glass{next(self._fob_seq)}-{int(time.time())}",
                    "type": "aft_transfer", "cents": cents,
                    "accountId": account_id}
+            if restricted:
+                cmd["creditType"] = "restricted"
             reply = self.sas_enqueue_command(smib, cmd)
             ok = bool(reply.get("ok"))
             if not ok:
@@ -9580,7 +9638,9 @@ class G2SHost:
             return 404, {"ok": False, "error": "machine not connected"}
         res = self.start_wat_credit_push(
             assoc, device_id=self.default_wat_device(assoc),
-            account_id=account_id, cashable=cents * 1000)
+            account_id=account_id,
+            **({"non_cash": cents * 1000} if restricted
+               else {"cashable": cents * 1000}))
         ok = not (isinstance(res, dict) and res.get("ok") is False)
         log.info("🪙 [glass:%s] walletFund $%.2f from %s -> WAT addCredits "
                  "(%s)", egm_id, cents / 100, account_id,
@@ -21948,6 +22008,16 @@ class G2SHost:
 # HTTP layer
 # ----------------------------------------------------------------------------
 
+def smib_ui_stamp():
+    """The SMIB player screen's build watermark: smib.html's mtime. That
+    screen is a kiosk with no keyboard; its page reloads itself, while
+    idle, when this changes. It rides /api/status (smibStamp) and the
+    page's own poll, /api/glass/state. Raises OSError if the page is
+    missing (callers treat that as "no stamp")."""
+    return int(os.path.getmtime(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "webui", "smib.html")))
+
+
 def home_ui_stamp():
     """The Home page's build watermark (/api/status uiStamp): the newest
     mtime of home.html AND the script it loads, osk.js. An open kiosk page
@@ -22708,9 +22778,7 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                     # (attract). A webui deploy then reaches the panel without bouncing
                     # its kiosk browser. One extra stat per poll — negligible.
                     try:
-                        snap["smibStamp"] = int(os.path.getmtime(os.path.join(
-                            os.path.dirname(os.path.abspath(__file__)),
-                            "webui", "smib.html")))
+                        snap["smibStamp"] = smib_ui_stamp()
                     except OSError:
                         pass
                     # board.html's OWN mtime (board v2): the wall TV is a kiosk too
@@ -24056,7 +24124,8 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                                            "wallet"})
             if action == "walletFund":
                 status, payload = engine.glass_wallet_fund(
-                    egm_id, acct_id, req.get("cents"))
+                    egm_id, acct_id, req.get("cents"),
+                    restricted=req.get("restricted") is True)
                 return done(status, payload)
             if action == "cashOutNow":
                 # HOST-CONTROL immediate cash-out (SAS/BB2): the panel button
@@ -24229,11 +24298,17 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
             issued_at = req.get("issuedAt")
             issued_at = issued_at.strip()[:32] \
                 if isinstance(issued_at, str) else None
+            # What the machine said the ticket IS (SAS 6.02 Table 15.13c),
+            # from a satellite that reads it. Kept with the row so the
+            # ticket pages can flag a restricted promotional ticket.
+            vt = req.get("validationType")
+            vt = {"validationType": vt} if isinstance(vt, int) \
+                and not isinstance(vt, bool) and 0 <= vt <= 255 else None
             try:
                 r = engine.hub_store.tito_record_issued(
                     vn, cents * 1000, f"sas:{smib}", address,
                     ticket_number=tno, source=src or "egm",
-                    issued_at=issued_at)
+                    issued_at=issued_at, extra=vt)
             except ValueError as e:
                 return fail(400, str(e))
             except Exception as e:  # noqa: BLE001
@@ -24310,20 +24385,27 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                     return ok(authorized=False, amountCents=0,
                               reason="amount not a whole cent — cannot "
                                      "represent on SAS", retry=False)
-                if dec["creditType"] != "G2S_cashable":
+                # Cashable, or restricted promotional (the hub's nonCash),
+                # which SAS redeems with transfer code 01. Anything else
+                # (promo) has no SAS ticket form.
+                restricted = dec["creditType"] == "G2S_nonCash"
+                if dec["creditType"] != "G2S_cashable" and not restricted:
                     engine.tito.close(machine, txn, validation,
                                       "G2S_rejected")
                     return ok(authorized=False, amountCents=0,
                               reason=f"creditType {dec['creditType']} not "
-                                     "redeemable on SAS (cashable only)",
+                                     "redeemable on SAS",
                               retry=False)
                 log.info("=" * 64)
-                log.info("🎟️ TICKET IN at %s — %s AUTHORIZED $%.2f%s",
+                log.info("🎟️ TICKET IN at %s — %s AUTHORIZED $%.2f%s%s",
                          machine, validation, amt_mc / 100000,
+                         " as restricted promotional credit"
+                         if restricted else "",
                          " (retry)" if dec["retry"] else "")
                 log.info("=" * 64)
                 return ok(authorized=True, amountCents=amt_mc // 1000,
-                          reason=dec["reason"], retry=dec["retry"])
+                          reason=dec["reason"], retry=dec["retry"],
+                          restricted=restricted)
             log.info("🎟️ TICKET REJECTED at %s — %s: %s", machine,
                      validation, dec["reason"])
             return ok(authorized=False, amountCents=0,
@@ -24675,18 +24757,25 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
         def bad(code, msg):
             return self._send(code, json.dumps({"ok": False, "error": msg}),
                               "application/json", soap=False)
-        for f in ("promoMillicents", "nonCashMillicents"):
-            if req.get(f):
-                return bad(400, "this machine is SAS-linked — the SAS "
-                                "transfer moves cashable credits only "
-                                f"({f} must be 0)")
-        mc = req.get("cashableMillicents")
+        if req.get("promoMillicents"):
+            return bad(400, "this machine is SAS-linked — the SAS transfer "
+                            "moves cashable or restricted credits "
+                            "(promoMillicents must be 0)")
+        # One kind per push: cash, or restricted promotional (the G2S
+        # nonCash bucket), which the satellite sends in the AFT restricted
+        # field (2026-11-16).
+        restricted = bool(req.get("nonCashMillicents"))
+        if restricted and req.get("cashableMillicents"):
+            return bad(400, "this machine is SAS-linked — send cashable OR "
+                            "restricted credits in one push, not both")
+        field = "nonCashMillicents" if restricted else "cashableMillicents"
+        mc = req.get(field)
         if isinstance(mc, bool) or not isinstance(mc, int) or mc < 1000:
-            return bad(400, "cashableMillicents must be an integer ≥ 1000 "
+            return bad(400, f"{field} must be an integer ≥ 1000 "
                             "($0.01) — this machine is SAS-linked and SAS "
                             "is natively cents")
         if mc % 1000:
-            return bad(400, "cashableMillicents must be a whole cent "
+            return bad(400, f"{field} must be a whole cent "
                             "(divisible by 1000) — SAS is natively cents")
         cents = mc // 1000
         if cents > engine.SAS_AFT_MAX_CENTS:
@@ -24697,7 +24786,7 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
         if acct is None:
             return bad(400, f"unknown account {account_id!r}")
         if acct.get("kind") != "house":
-            have = int(acct.get("cashableMillicents") or 0)
+            have = int(acct.get(field) or 0)
             if have < mc:
                 return bad(400, f"{acct.get('name') or account_id} has "
                                 f"{money_symbol()}{have / 100000:.2f} — can't fund a "
@@ -24714,6 +24803,8 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
         cmd = {"id": f"cmd{next(self._SAS_CMD_SEQ)}-{int(time.time())}",
                "type": "aft_transfer", "cents": cents,
                "accountId": account_id}
+        if restricted:
+            cmd["creditType"] = "restricted"
         reply = engine.sas_enqueue_command(smib, cmd)
         ok = bool(reply.get("ok"))
         log.info("🪙 [wallet:%s] addCredits $%.2f from %s routed over the "
@@ -24956,6 +25047,20 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                      f"{engine.SAS_AFT_MAX_CENTS} (SAS uses cents; $1 = 100)"}),
                     "application/json", soap=False)
             cmd["cents"] = cents
+            # Cash, or RESTRICTED PROMOTIONAL credit (2026-11-16): the
+            # satellite sends the amount in the AFT restricted field. The
+            # machine plays it down first, never pays it out as cash, and
+            # prints a restricted promotional ticket for what is left at
+            # cash-out. Booked against the funding account's restricted
+            # balance (nonCashMillicents), never its cash.
+            credit = req.get("creditType")
+            if credit not in (None, "cashable", "restricted"):
+                return self._send(400, json.dumps(
+                    {"ok": False, "error": "creditType must be \"cashable\" "
+                     "or \"restricted\""}), "application/json", soap=False)
+            restricted = credit == "restricted"
+            if restricted:
+                cmd["creditType"] = "restricted"
             # Optional lock:false forces the spec-legal LOCKLESS path; default
             # (absent) is lock-first, which the WMS BB2 requires for host->EGM.
             lock = req.get("lock")
@@ -24987,7 +25092,8 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                          "error": f"unknown account {account_id!r}"}),
                         "application/json", soap=False)
                 if acct.get("kind") != "house":
-                    have = int(acct.get("cashableMillicents") or 0)
+                    have = int(acct.get("nonCashMillicents" if restricted
+                                        else "cashableMillicents") or 0)
                     if have < cents * 1000:
                         return self._send(400, json.dumps(
                             {"ok": False, "error":

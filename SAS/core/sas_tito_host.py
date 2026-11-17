@@ -82,7 +82,8 @@ __all__ = [
     "VALIDATION_ID_NOT_CONFIGURED_EXCEPTION",
     "TICKET_INSERTED_EXCEPTION", "TICKET_TRANSFER_COMPLETE_EXCEPTION",
     "CMD_SEND_TICKET_VALIDATION_DATA", "CMD_REDEEM_TICKET",
-    "REDEEM_AUTHORIZE_CASHABLE", "REDEEM_REJECT", "REDEEM_INTERROGATE",
+    "REDEEM_AUTHORIZE_CASHABLE", "REDEEM_AUTHORIZE_RESTRICTED",
+    "REDEEM_REJECT", "REDEEM_INTERROGATE",
     "REDEEM_STATUS_REDEEMED", "REDEEM_STATUS_PENDING",
     "REDEEM_STATUS_REJECTED", "PARSING_CODE_BCD", "redeem_status_kind",
     "REDEMPTION_RETRY_SEC", "read_redemption_status",
@@ -158,6 +159,8 @@ CMD_REDEEM_TICKET = 0x71                  # VERIFY_ON_BENCH
 
 # 0x71 transfer-code byte (host -> EGM)          VERIFY_ON_BENCH, all three
 REDEEM_AUTHORIZE_CASHABLE = 0x00      # authorize: credit as cashable
+REDEEM_AUTHORIZE_RESTRICTED = 0x01    # authorize: a valid restricted
+#                                       promotional ticket (Table 15.12c)
 REDEEM_REJECT = 0x80                  # deny: return the ticket
 REDEEM_INTERROGATE = 0xFF             # status interrogate (no other data)
 
@@ -410,7 +413,8 @@ def build_redeem_ticket_poll(address: int, transfer_code: int,
     (sas.py:1264-1275) uses the longer form; the BB2 wants the ArduinoTITO
     form. Restricted/promo redemptions (with a real pool/expiry) are untested
     and out of scope here — cashable only."""
-    if transfer_code not in (REDEEM_AUTHORIZE_CASHABLE, REDEEM_REJECT):
+    if transfer_code not in (REDEEM_AUTHORIZE_CASHABLE,
+                             REDEEM_AUTHORIZE_RESTRICTED, REDEEM_REJECT):
         raise ValueError(f"unknown redeem transfer code 0x{transfer_code:02X}")
     if not validation:
         raise ValueError("redeem needs the raw validation field to echo")
@@ -795,8 +799,7 @@ def _persist_4d(store, rec, address, note="") -> TicketCaptureResult:
             None, f"{label} — not a ticket, not stored{note}",
             validation_type=rec.validation_type)
     if kind == "playable":
-        note = (f" · {label} (playable only): stored as an ordinary ticket, "
-                f"the hub cannot flag it yet{note}")
+        note = f" · {label}{note}"
     elif kind == "unknown":
         note = f" · {label}; stored as a cash ticket{note}"
     out = _persist(store, rec.validation_number, rec.amount_cents, address,
@@ -1187,8 +1190,15 @@ def redeem_inserted_ticket(transport, address: int, store: TicketStore,
             False, f"host denied redemption: {decision['reason']}")
 
     amount = decision["amount_cents"]
+    # A restricted promotional ticket goes back in as restricted credit:
+    # transfer code 01 (SAS 6.02 Table 15.12c). The frame is otherwise the
+    # proven cashable one. The restricted expiration and pool id fields are
+    # left off, which the document allows: "If omitted, the default
+    # expiration and pool ID 0000 will be used" — the same pool a
+    # restricted AFT push lands in (2026-11-16).
     auth_frame = build_redeem_ticket_poll(
-        address, REDEEM_AUTHORIZE_CASHABLE, amount, ticket.validation_raw)
+        address, REDEEM_AUTHORIZE_RESTRICTED if decision.get("restricted")
+        else REDEEM_AUTHORIZE_CASHABLE, amount, ticket.validation_raw)
     resp, _h, _n = transact_reread(transport, auth_frame)
     status = _redeem_status(resp, address, proto)
     # the exact wire, so a 0x71 the machine refuses can be matched to what

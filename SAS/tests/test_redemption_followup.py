@@ -245,6 +245,53 @@ class TestAnswersThatSayNothing:
         assert store.get(VN16)["state"] == ISSUED
 
 
+class TestARestrictedPromotionalTicketGoesInAsRestrictedCredit:
+    """2026-11-16. A ticket the machine printed as a restricted promotional
+    ticket (Table 15.13c type 01 or 03) is authorised with transfer code 01
+    (Table 15.12c), so the machine credits it as restricted credit. The
+    frame is otherwise the cashable one."""
+
+    def _redeem(self, tmp_path, extra):
+        machine = TITOMachine(escrow={"vn": VN16, "amount": AMOUNT})
+        store = _store(tmp_path)
+        store.record_issued(VN16, AMOUNT, 1, extra=extra)
+        port = ImpliedAckTransport(MockSASSerialPort(machine))
+        poller = SASPoller(port, address=1, meters=[])
+        seen = []
+        SASTITOHost(poller, store, sleep=NO_SLEEP,
+                    on_redemption=lambda a, r: seen.append(r))
+        _insert(machine, poller)
+        auth = [bytes(f) for f, _ in port.sent_frames
+                if len(f) > 4 and f[1] == CMD_REDEEM_TICKET
+                and f[3] != REDEEM_INTERROGATE]
+        return seen, auth, store, machine
+
+    @pytest.mark.parametrize("vtype", [1, 3])
+    def test_transfer_code_01(self, tmp_path, vtype):
+        seen, auth, store, machine = self._redeem(
+            tmp_path, {"validationType": vtype})
+        assert [r.outcome for r in seen] == [RedemptionOutcome.REDEEMED]
+        assert len(auth) == 1 and auth[0][3] == 0x01
+        assert store.get(VN16)["state"] == REDEEMED
+        assert machine.credited_cents == AMOUNT
+
+    @pytest.mark.parametrize("extra", [{"validationType": 0},
+                                       {"validationType": 2}, None])
+    def test_any_other_ticket_is_still_code_00(self, tmp_path, extra):
+        seen, auth, store, machine = self._redeem(tmp_path, extra)
+        assert [r.outcome for r in seen] == [RedemptionOutcome.REDEEMED]
+        assert len(auth) == 1 and auth[0][3] == 0x00
+
+    def test_the_two_frames_differ_only_in_the_code(self, tmp_path):
+        from core.sas_tito_host import build_redeem_ticket_poll
+        val = bytes([0x01]) + bytes.fromhex(VN16)
+        cash = build_redeem_ticket_poll(1, 0x00, AMOUNT, val)
+        restricted = build_redeem_ticket_poll(1, 0x01, AMOUNT, val)
+        assert len(cash) == len(restricted)
+        assert [i for i in range(len(cash) - 2)
+                if cash[i] != restricted[i]] == [3]
+
+
 class TestAskedAgain:
     def test_a_damaged_escrow_read_is_asked_for_again(self, tmp_path):
         machine = TITOMachine(escrow={"vn": VN16, "amount": AMOUNT})
