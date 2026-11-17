@@ -125,7 +125,7 @@ if "tournament_names" not in _hub_store_mod.HOST_SETTING_KEYS:
 # the MINOR bump per the repo's version rule). Surfaced in engine_meta() ->
 # /api/status ["_engine"]["version"]; bump this and add a CHANGELOG.md
 # section on every commit with a user-visible change.
-CABINET_VERSION = "0.3.11"
+CABINET_VERSION = "0.3.12"
 
 WSDL_NS = "http://www.gamingstandards.com/wsdl/g2s/v1.0"
 SCHEMA_NS = "http://www.gamingstandards.com/g2s/schemas/v1.0.3"
@@ -6507,9 +6507,16 @@ class G2SHost:
             acct_id = r.get("accountId")
             acct_id = acct_id.strip()[:64] if isinstance(acct_id, str) \
                 and acct_id.strip() else "house"
-            note = f"AFT credit push to {key} ({r.get('outcome')})"
+            # The KIND the satellite says it moved decides the bucket: a
+            # restricted promotional push comes off the funding account's
+            # restricted balance (nonCashMillicents), never its cash.
+            restricted = r.get("creditType") == "restricted"
+            delta = ({"d_non": -cents * 1000} if restricted
+                     else {"d_cash": -cents * 1000})
+            note = (f"AFT {'restricted promotional ' if restricted else ''}"
+                    f"credit push to {key} ({r.get('outcome')})")
             acct, err = self.account_store.adjust(
-                acct_id, d_cash=-cents * 1000, note=note, ref=ref, once=True)
+                acct_id, note=note, ref=ref, once=True, **delta)
             if err and acct_id != "house":
                 # The player couldn't cover it at settle time (balance moved
                 # in the queue->confirm gap, or the account vanished). The
@@ -6522,9 +6529,9 @@ class G2SHost:
                 log.warning("💵 [sas:%s] %s debit for AFT push %r failed "
                             "(%s) — House covers it", key, acct_id, txn, err)
                 acct, err = self.account_store.adjust(
-                    "house", d_cash=-cents * 1000,
+                    "house",
                     note=note + f" — {acct_id} couldn't cover it, House "
-                                "covered", ref=ref, once=True)
+                                "covered", ref=ref, once=True, **delta)
                 acct_id = "house"
             self._aft_pushes_settled.add(ref)
             if len(self._aft_pushes_settled) > 2048:
@@ -6536,10 +6543,15 @@ class G2SHost:
                 log.warning("💵 [sas:%s] %s debit for AFT push %r FAILED: "
                             "%s", key, acct_id, txn, err)
             else:
-                bal = int((acct or {}).get("cashableMillicents", 0))
-                log.info("💵 [sas:%s] AFT push CONFIRMED — debited %s $%.2f "
-                         "(txn %s); cashable now $%.2f",
-                         key, acct_id, cents / 100, txn, bal / 100000)
+                bal = int((acct or {}).get(
+                    "nonCashMillicents" if restricted
+                    else "cashableMillicents", 0))
+                log.info("💵 [sas:%s] AFT %spush CONFIRMED — debited %s "
+                         "$%.2f (txn %s); %s now $%.2f", key,
+                         "RESTRICTED PROMOTIONAL " if restricted else "",
+                         acct_id, cents / 100, txn,
+                         "restricted" if restricted else "cashable",
+                         bal / 100000)
 
     def _sas_cashout_pin(self, key):
         """The hub's OWN armed cash-out destination for a reporting SAS machine
@@ -24681,18 +24693,25 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
         def bad(code, msg):
             return self._send(code, json.dumps({"ok": False, "error": msg}),
                               "application/json", soap=False)
-        for f in ("promoMillicents", "nonCashMillicents"):
-            if req.get(f):
-                return bad(400, "this machine is SAS-linked — the SAS "
-                                "transfer moves cashable credits only "
-                                f"({f} must be 0)")
-        mc = req.get("cashableMillicents")
+        if req.get("promoMillicents"):
+            return bad(400, "this machine is SAS-linked — the SAS transfer "
+                            "moves cashable or restricted credits "
+                            "(promoMillicents must be 0)")
+        # One kind per push: cash, or restricted promotional (the G2S
+        # nonCash bucket), which the satellite sends in the AFT restricted
+        # field (2026-11-16).
+        restricted = bool(req.get("nonCashMillicents"))
+        if restricted and req.get("cashableMillicents"):
+            return bad(400, "this machine is SAS-linked — send cashable OR "
+                            "restricted credits in one push, not both")
+        field = "nonCashMillicents" if restricted else "cashableMillicents"
+        mc = req.get(field)
         if isinstance(mc, bool) or not isinstance(mc, int) or mc < 1000:
-            return bad(400, "cashableMillicents must be an integer ≥ 1000 "
+            return bad(400, f"{field} must be an integer ≥ 1000 "
                             "($0.01) — this machine is SAS-linked and SAS "
                             "is natively cents")
         if mc % 1000:
-            return bad(400, "cashableMillicents must be a whole cent "
+            return bad(400, f"{field} must be a whole cent "
                             "(divisible by 1000) — SAS is natively cents")
         cents = mc // 1000
         if cents > engine.SAS_AFT_MAX_CENTS:
@@ -24703,7 +24722,7 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
         if acct is None:
             return bad(400, f"unknown account {account_id!r}")
         if acct.get("kind") != "house":
-            have = int(acct.get("cashableMillicents") or 0)
+            have = int(acct.get(field) or 0)
             if have < mc:
                 return bad(400, f"{acct.get('name') or account_id} has "
                                 f"{money_symbol()}{have / 100000:.2f} — can't fund a "
@@ -24720,6 +24739,8 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
         cmd = {"id": f"cmd{next(self._SAS_CMD_SEQ)}-{int(time.time())}",
                "type": "aft_transfer", "cents": cents,
                "accountId": account_id}
+        if restricted:
+            cmd["creditType"] = "restricted"
         reply = engine.sas_enqueue_command(smib, cmd)
         ok = bool(reply.get("ok"))
         log.info("🪙 [wallet:%s] addCredits $%.2f from %s routed over the "
@@ -24962,6 +24983,20 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                      f"{engine.SAS_AFT_MAX_CENTS} (SAS uses cents; $1 = 100)"}),
                     "application/json", soap=False)
             cmd["cents"] = cents
+            # Cash, or RESTRICTED PROMOTIONAL credit (2026-11-16): the
+            # satellite sends the amount in the AFT restricted field. The
+            # machine plays it down first, never pays it out as cash, and
+            # prints a restricted promotional ticket for what is left at
+            # cash-out. Booked against the funding account's restricted
+            # balance (nonCashMillicents), never its cash.
+            credit = req.get("creditType")
+            if credit not in (None, "cashable", "restricted"):
+                return self._send(400, json.dumps(
+                    {"ok": False, "error": "creditType must be \"cashable\" "
+                     "or \"restricted\""}), "application/json", soap=False)
+            restricted = credit == "restricted"
+            if restricted:
+                cmd["creditType"] = "restricted"
             # Optional lock:false forces the spec-legal LOCKLESS path; default
             # (absent) is lock-first, which the WMS BB2 requires for host->EGM.
             lock = req.get("lock")
@@ -24993,7 +25028,8 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                          "error": f"unknown account {account_id!r}"}),
                         "application/json", soap=False)
                 if acct.get("kind") != "house":
-                    have = int(acct.get("cashableMillicents") or 0)
+                    have = int(acct.get("nonCashMillicents" if restricted
+                                        else "cashableMillicents") or 0)
                     if have < cents * 1000:
                         return self._send(400, json.dumps(
                             {"ok": False, "error":

@@ -291,7 +291,8 @@ class ByTheBookAFTMachine(ByTheBookMachine):
         self.asset = bytes([0x92, 0x10, 0x00, 0x00])
         self.key = bytes(range(20))
         self.pos = b"\x01\x00\x00\x00"
-        self.credits = credits
+        self.credits = credits               # cashable
+        self.restricted = 0                  # restricted promotional
         self.honours_cancel = honours_cancel
         self.complete_after = complete_after
         self.hears_initiate = hears_initiate    # False: the 0x72 is lost
@@ -312,10 +313,9 @@ class ByTheBookAFTMachine(ByTheBookMachine):
         c = self.cycle
         if c is None or c["status"] != 0x40:
             return
-        if c["type"] == 0x80:                       # machine -> host
-            self.credits -= c["cents"]
-        else:                                       # host -> machine
-            self.credits += c["cents"]
+        sign = -1 if c["type"] == 0x80 else 1       # 80: machine -> host
+        self.credits += sign * c["cents"]
+        self.restricted += sign * c.get("restricted", 0)
         c["status"] = 0x00
         self._69_due = True
 
@@ -377,9 +377,12 @@ class ByTheBookAFTMachine(ByTheBookMachine):
 
     def _status(self, t):
         txn = t["txn"].encode("ascii")
-        moved = t["cents"] if t["status"] in (0x00, 0x40) else 0
+        live = t["status"] in (0x00, 0x40)
         return self._framed(0x72, bytes([0x00, t["status"], 0xFF, t["type"]])
-                            + int_to_bcd(moved, 5) + bytes(10) + bytes([0x00])
+                            + int_to_bcd(t["cents"] if live else 0, 5)
+                            + int_to_bcd(t.get("restricted", 0)
+                                         if live else 0, 5)
+                            + bytes(5) + bytes([0x00])
                             + self.asset + bytes([len(txn)]) + txn)
 
     def _report(self, t):
@@ -415,6 +418,6 @@ class ByTheBookAFTMachine(ByTheBookMachine):
         txn_len = d[43]
         self.cycle = {"txn": d[44:44 + txn_len].decode("ascii"),
                       "type": d[2], "cents": int(d[3:8].hex()),
-                      "status": 0x40}
+                      "restricted": int(d[8:13].hex()), "status": 0x40}
         self.started.append(self.cycle["txn"])
         return self._status(self.cycle)

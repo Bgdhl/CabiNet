@@ -195,12 +195,15 @@ def build_extended_validation_status_poll(address: int,
 
 
 def read_extended_validation_status(transport, address: int, protocol,
-                                    cashable_days: int = 0):
-    """Send long poll 7B (optionally setting the cashable expiration) and
-    return the parsed answer, or None when it did not arrive intact or the
-    machine does not speak it."""
+                                    cashable_days: int = 0,
+                                    restricted_days: int = 0):
+    """Send long poll 7B (optionally setting the cashable expiration and
+    the default expiration for restricted tickets) and return the parsed
+    answer, or None when it did not arrive intact or the machine does not
+    speak it."""
     resp = transport.transact(build_extended_validation_status_poll(
-        address, cashable_days=cashable_days))
+        address, cashable_days=cashable_days,
+        restricted_days=restricted_days))
     if not resp or len(resp) < 4:
         return None
     packet = protocol.parse_packet(resp)

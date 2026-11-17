@@ -231,6 +231,58 @@ def main():
           len(rows) == 1 and rows[0]["accountId"] == "house"
           and "p999" in rows[0]["note"])
 
+    print("— restricted promotional pushes come off the restricted balance")
+    # 2026-11-16: the satellite's record says which KIND of credit it moved.
+    def non(acct):
+        return store.get(acct)["nonCashMillicents"]
+    cash_before, non_before = _house_cash(store), non("house")
+    eng._settle_aft_credit_pushes(
+        [{"type": "aft_transfer", "ok": True, "outcome": "completed",
+          "amountCents": 500, "txnId": "CNR01", "creditType": "restricted"}],
+        "bb2/1")
+    check("House restricted balance debited $5.00",
+          non("house") == non_before - 500_000)
+    check("...and House cash untouched", _house_cash(store) == cash_before)
+    rows = [e for e in store.state["ledger"]
+            if e.get("ref") == "aftpush:CNR01"]
+    check("one ledger row, in the restricted bucket, saying what it was",
+          len(rows) == 1 and rows[0].get("kind") == "nonCash"
+          and "restricted promotional" in rows[0]["note"])
+    eng._settle_aft_credit_pushes(
+        [{"type": "aft_transfer", "ok": True, "outcome": "completed",
+          "amountCents": 500, "txnId": "CNR01", "creditType": "restricted"}],
+        "bb2/1")
+    check("the same record again books nothing more",
+          non("house") == non_before - 500_000)
+
+    q, _ = store.create("Promo Pat")
+    qid = q["id"]
+    store.adjust(qid, d_cash=1_000_000, d_non=300_000)   # $10 cash, $3 promo
+    eng._settle_aft_credit_pushes(
+        [{"type": "aft_transfer", "ok": True, "outcome": "completed",
+          "amountCents": 200, "txnId": "CNR02", "accountId": qid,
+          "creditType": "restricted"}], "bb2/1")
+    check("a player's restricted push comes off their restricted balance",
+          non(qid) == 100_000
+          and store.get(qid)["cashableMillicents"] == 1_000_000)
+    house_non = non("house")
+    eng._settle_aft_credit_pushes(
+        [{"type": "aft_transfer", "ok": True, "outcome": "completed",
+          "amountCents": 200, "txnId": "CNR03", "accountId": qid,
+          "creditType": "restricted"}], "bb2/1")
+    check("a player short on restricted is not dipped into for cash: "
+          "House's restricted balance covers it",
+          non(qid) == 100_000
+          and store.get(qid)["cashableMillicents"] == 1_000_000
+          and non("house") == house_non - 200_000)
+    eng._settle_aft_credit_pushes(
+        [{"type": "aft_transfer", "ok": True, "outcome": "completed",
+          "amountCents": 100, "txnId": "CNR04", "accountId": qid,
+          "creditType": "cashable"}], "bb2/1")
+    check("creditType cashable (and none at all) is a cash push as before",
+          store.get(qid)["cashableMillicents"] == 900_000
+          and non(qid) == 100_000)
+
     print("=" * 50)
     print(f"RESULT: {_passed} passed, {_failed} failed")
     return 1 if _failed else 0

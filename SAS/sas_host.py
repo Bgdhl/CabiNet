@@ -402,6 +402,7 @@ def late_transfer_record(ended):
            "late": True}
     if rec.get("kind") == "aft_transfer":
         out["cents"] = rec.get("cents")
+        out["creditType"] = rec.get("creditType") or "cashable"
     if rec.get("accountId"):
         out["accountId"] = rec["accountId"]
     if rec.get("cmdId"):
@@ -732,7 +733,8 @@ def apply_ticket_header(transport, address, target, protocol=None,
         sleep(pace)
         ev = read_extended_validation_status(
             transport, address, proto,
-            cashable_days=9999 if days == 0 else days)
+            cashable_days=9999 if days == 0 else days,
+            restricted_days=9999 if days == 0 else days)
         if ev is not None and ev.cashable_expiration_days is not None:
             edetail += (f" and 0x7B (machine reports "
                         f"{ev.cashable_expiration_days}d)")
@@ -1870,13 +1872,27 @@ def main():
                 # unlocked — bench-proven 2026-07-09). Send lock:false to force
                 # the spec-legal lockless path on firmware that supports it.
                 require_lock = bool(cmd.get("lock", True))
+                # Cash, or RESTRICTED PROMOTIONAL credit (2026-11-16): the
+                # same in-house transfer with the amount in the restricted
+                # field (SAS 6.02 Table 8.3d: type 00 takes cashable,
+                # restricted and nonrestricted). The machine plays it down
+                # first, never pays it out as cash, and at cash-out prints a
+                # restricted promotional ticket for what is left. Pool 0000
+                # and expiration 00000000 (the machine's default for
+                # restricted tickets, which the header apply sets with 7B),
+                # the same pool a redeemed restricted ticket lands in.
+                restricted = cmd.get("creditType") == "restricted"
+                result["creditType"] = "restricted" if restricted \
+                    else "cashable"
                 logger.info("💵 hub command {}: AFT ready ({}) — pushing {}c "
-                            "host->EGM ({})", cmd_id, reg_detail, cents,
+                            "{}host->EGM ({})", cmd_id, reg_detail, cents,
+                            "RESTRICTED PROMOTIONAL " if restricted else "",
                             "lock-first" if require_lock else "lockless")
                 req = AFTTransferRequest(
                     transaction_id=make_transaction_id(),
                     transfer_type=TRANSFER_TYPE_HOST_TO_EGM,
-                    cashable_cents=cents,
+                    cashable_cents=0 if restricted else cents,
+                    restricted_cents=cents if restricted else 0,
                     transfer_code=TRANSFER_CODE_FULL_ONLY,
                     transfer_flags=TRANSFER_FLAGS_NONE)
                 # raw 0x72 req/resp tap — keep the bytes in the journal so any
@@ -1935,10 +1951,10 @@ def main():
                 # Authoritative moved amount = what the MACHINE confirmed (full
                 # == requested; partial < requested). 0 unless it actually
                 # landed — the hub debits House by exactly this.
-                confirmed = (res.final.cashable_cents
-                             if res.final is not None
-                             and res.final.cashable_cents is not None
-                             else cents)
+                moved = None if res.final is None else (
+                    res.final.restricted_cents if restricted
+                    else res.final.cashable_cents)
+                confirmed = moved if moved is not None else cents
                 result["ok"] = res.ok
                 result["outcome"] = res.outcome.value
                 result["detail"] = res.detail + detail_extra

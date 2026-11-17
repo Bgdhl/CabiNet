@@ -359,6 +359,25 @@ class TestFollowedToItsEnd:
         assert (e["rec"]["kind"], e["ok"], e["outcome"],
                 e["amountCents"]) == ("aft_cashout", True, "completed", CENTS)
 
+    def test_a_restricted_promotional_push_that_lands_late(self):
+        """The END names the amount in the kind of credit that was sent."""
+        machine, port, poller, host, clock = _rig()
+        req = AFTTransferRequest(transaction_id=TXN,
+                                 transfer_type=TRANSFER_TYPE_HOST_TO_EGM,
+                                 restricted_cents=500)
+        _start_unconfirmed(host, req, kind="aft_transfer", account_id="house")
+        assert host.journal.current["creditType"] == "restricted"
+        assert host.journal.current["cents"] == 500
+        machine.complete()
+        assert (machine.credits, machine.restricted) == (0, 500)
+        poller.poll_once()
+        e = host.service_open()[0]
+        assert (e["ok"], e["outcome"], e["amountCents"]) == (
+            True, "completed", 500)
+        record = sas_host.late_transfer_record(e)
+        assert (record["creditType"], record["amountCents"],
+                record["cents"]) == ("restricted", 500, 500)
+
     def test_exception_69_with_nothing_of_ours_open_is_still_read(self):
         machine, port, poller, host, clock = _rig()
         machine.cycle = {"txn": "FROM-BEFORE", "type": 0x00, "cents": 700,

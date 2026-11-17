@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.3.12
+Restricted promotional credit and tickets.
+- **Credits can be sent to a machine as restricted promotional credit.**
+  The Wallet page has a new step, "As": cash credit or restricted
+  promotional. Restricted credit has to be played; the machine never pays
+  it out as cash, and cashing it out prints a restricted promotional
+  ticket. It comes off the sending account's restricted balance, and the
+  bank can give it freely. It works on SAS machines (the AFT restricted
+  amount) and on G2S machines, where the hub could already move it but
+  the page never offered it.
+- **Restricted promotional tickets are flagged.** A SAS machine says what
+  each ticket it prints is. The hub now keeps that, tags the ticket
+  "restricted promotional" in the Cage list and names the kind in the
+  ticket's detail. Such a ticket still redeems like any other for now.
+- The default expiry for restricted tickets is set on the machine along
+  with the ordinary one.
+- Not done yet: redeeming a restricted promotional ticket as restricted
+  credit, cashing restricted credit out to a player's wallet over SAS,
+  and the choice on the player's glass page.
+
 ## v0.3.11
 Third batch from the SAS audit, second part.
 - **The ticket expiry is also set the way the document says.** It was

@@ -650,6 +650,8 @@
                 <button class="clr" onclick="padClear()">clear amount</button>
               </div>
             </div></div>
+          <div class="step"><label>4 · As</label>
+            <div class="pickrow" id="w-kindpick"></div></div>
           <div class="step" id="w-send"></div>
         </div>
       </div>
@@ -4028,18 +4030,33 @@ function renderWallet(){
     +(hidden?`<p class="none" style="margin:6px 0 0">${hidden} machine${hidden>1?"s":""} hidden —
       offline, SAS off, or transfers disabled on the game.</p>`:""));
 
+  /* cash, or restricted promotional credit: the machine plays it down
+     first, never pays it out as cash, and prints a restricted promotional
+     ticket for what is left at cash-out. It comes off the account's
+     restricted balance. Works on SAS (the AFT restricted amount) and G2S
+     (the WAT nonCash amount). */
+  const restr=S.wallet.kind==="restricted";
+  setHTML($("w-kindpick"),
+    `<button class="fchip ${restr?"":"on"}" aria-pressed="${!restr}"
+       onclick="walletKind('cash')">Cash credit</button>
+     <button class="fchip ${restr?"on":""}" aria-pressed="${restr}"
+       onclick="walletKind('restricted')">Restricted promotional</button>`
+    +(restr?`<p class="none" style="margin:6px 0 0">Has to be played. Cashing it
+      out prints a restricted promotional ticket.</p>`:""));
+
   /* send summary + button */
   const amt=S.wallet.amount;
   const accName=accs.length?acctName(S.wallet.account):"House";
   const mach=S.wallet.egm?machineName(snap(S.wallet.egm),S.wallet.egm):null;
   const acc=acctById(S.wallet.account);
-  const overdraft=acc && acc.kind!=="house" && amt>Number(acc.cashableMillicents||0);
+  const have=acc?Number((restr?acc.nonCashMillicents:acc.cashableMillicents)||0):0;
+  const overdraft=acc && acc.kind!=="house" && amt>have;
   const ready=amt>0 && S.wallet.egm && !overdraft;
   setHTML($("w-send"),
     (overdraft?`<p class="none" style="color:var(--ruby);font-style:normal;margin:0 0 8px">
-      ${esc(accName)} only has ${esc(fmtAmt(acc.cashableMillicents))} — give them a little less, or top up their card first.</p>`:"")+
+      ${esc(accName)} only has ${esc(fmtAmt(have))}${restr?" restricted":""} — give them a little less, or top up their card first.</p>`:"")+
     `<button class="btn gold ${ready?"":"off"}" onclick="sendCredits(this)">
-      <span class="bl">${amt>0?`Send ${esc(fmtAmt(amt))}`:"Send credits"}</span>
+      <span class="bl">${amt>0?`Send ${esc(fmtAmt(amt))}`:"Send credits"}${restr?" · restricted promotional":""}</span>
       <span class="ba">${esc(accName)} → ${mach?esc(mach):"pick a machine"}</span>
     </button>`);
 
@@ -4136,6 +4153,10 @@ function walletPick(kind,id){
   if(kind==="account") S.wallet.account=id; else S.wallet.egm=id;
   renderWallet();
 }
+function walletKind(kind){
+  S.wallet.kind=kind==="restricted"?"restricted":"cash";
+  renderWallet();
+}
 function padChip(mc){
   S.wallet.amount=(S.wallet.amount||0)+mc;
   $("w-custom").value=(S.wallet.amount/100000).toFixed(2);
@@ -4158,6 +4179,7 @@ function padClear(){
 async function sendCredits(btn){
   const amt=S.wallet.amount, egm=S.wallet.egm;
   if(!(amt>0)||!egm) return;
+  const restr=S.wallet.kind==="restricted";
   const sm=((S.status||{}).sas||{})[egm];
   if(sm){
     if(!sm.smibId){toast("Machine unknown — refresh and retry",false); return;}
@@ -4168,13 +4190,15 @@ async function sendCredits(btn){
     try{
       const r=await fetch("/api/sas/command",{method:"POST",
         headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({smibId:sm.smibId, type:"aft_transfer", cents,
-                             accountId:S.wallet.account||"house"})});
+        body:JSON.stringify(Object.assign(
+          {smibId:sm.smibId, type:"aft_transfer", cents,
+           accountId:S.wallet.account||"house"},
+          restr?{creditType:"restricted"}:{}))});
       if(r.status===404){toast("Add credits — awaiting host update",false);
         flash(btn,false); return;}
       const j=await r.json().catch(()=>({}));
       if(j.ok){
-        toast(`🪙 Credits queued — ${CUR()}${(cents/100).toFixed(2)} to ${name} (verdict ~2s)`, true);
+        toast(`🪙 ${restr?"Restricted promotional credits":"Credits"} queued — ${CUR()}${(cents/100).toFixed(2)} to ${name} (verdict ~2s)`, true);
         flash(btn,true); padClear(); S.accountsAt=0; auxFetch(true);
       }else{
         toast("Add credits refused · "
@@ -4186,8 +4210,10 @@ async function sendCredits(btn){
     return;
   }
   const body={action:"addCredits", egmId:egm,
-    accountId:S.wallet.account||"house", cashableMillicents:amt};
-  const r=await cmd(body, "Send "+fmtAmt(amt)+" to "+machineName(snap(egm),egm));
+    accountId:S.wallet.account||"house"};
+  body[restr?"nonCashMillicents":"cashableMillicents"]=amt;
+  const r=await cmd(body, "Send "+fmtAmt(amt)+(restr?" restricted promotional":"")
+                    +" to "+machineName(snap(egm),egm));
   flash(btn,r.ok);
   if(r.ok){padClear(); S.accountsAt=0; auxFetch(true);}
 }
