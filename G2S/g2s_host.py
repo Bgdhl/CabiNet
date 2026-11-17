@@ -125,7 +125,7 @@ if "tournament_names" not in _hub_store_mod.HOST_SETTING_KEYS:
 # the MINOR bump per the repo's version rule). Surfaced in engine_meta() ->
 # /api/status ["_engine"]["version"]; bump this and add a CHANGELOG.md
 # section on every commit with a user-visible change.
-CABINET_VERSION = "0.3.18"
+CABINET_VERSION = "0.3.19"
 
 WSDL_NS = "http://www.gamingstandards.com/wsdl/g2s/v1.0"
 SCHEMA_NS = "http://www.gamingstandards.com/g2s/schemas/v1.0.3"
@@ -415,6 +415,25 @@ HOST_KEEPALIVE_SEC = 10
 # rejoin's commsOnLineAck can wait a whole timeout behind an in-flight stale
 # keepAlive. At 5s the worker fails fast and the queue drains ahead.
 EGM_POST_TIMEOUT_SEC = 5
+# Sending a message again (§1.18.2: "The originator of a message MUST NOT
+# discard the message until it has been acknowledged by the recipient").
+# Two cases are re-sent, both where the machine cannot have acted on the
+# message: the POST failed before the request went out (RESEND_*), and the
+# machine answered G2S_MSX006, its inbound queue is full (QUEUE_FULL_*,
+# §1.18.11: the commands "MUST NOT be discarded"). A POST that went out and
+# then drew no answer is NOT sent again: the machine may have acted on it,
+# and one that does not recognise the repeat by its commandId would act
+# twice (a second key-off, a second transfer request).
+RESEND_AFTER_SEC = 2.0            # wait before sending again
+RESEND_TRIES = 3                  # sends in all
+RESEND_ONLY_IF_FAILED_WITHIN = 1.5  # s. Refused or reset comes back at
+#                                   once: the machine is there, its listener
+#                                   is not. A connect that times out means
+#                                   it is off; the keepAlive pinger finds
+#                                   that out, and re-sending would only
+#                                   hold up the queue behind it.
+QUEUE_FULL_RESEND_SEC = 5.0
+QUEUE_FULL_TRIES = 5
 
 # Dead-link demotion (GR-01). The overnight 8h EGM power-off proved the host
 # had NO lost-comms state: it stayed 'onLine', POSTed a doomed keepAlive every
@@ -1746,6 +1765,32 @@ class EgmAssociation:
         # answers with a voucherStatus, which lands back in the reconcile that
         # sent it. Cleared when the replacement list actually goes out.
         self.voucher_reconciling = False
+        # Every REQUEST this host has sent, by its sessionId: which command
+        # it was and that command's own attributes (note_request). An error
+        # answer carries no command element (§1.18.3.3), only the class and
+        # the sessionId of the request it answers, so this is the one way to
+        # know WHAT was refused. Kept across epochs: sessionIds never repeat.
+        self.sent_requests = {}
+        # the hostId a machine addressed us by, when it is not ours (§1.18.1)
+        self.host_id_seen = None
+        # requests the machine sent after their own time-to-live had run
+        # out (handle_g2s_message); processed all the same
+        self.stale_requests = 0
+        # Communications are established in this epoch: our commsOnLineAck
+        # reached the machine (its POST was answered, or the machine went on
+        # to send commsDisabled, which it only does after that ack). Until
+        # then, and again once the link is found down or the machine says it
+        # is closing, everything but the handshake is answered G2S_MSX003
+        # (§1.18.2; handle_g2s_message).
+        self.established = False
+        # how the last POST to the machine ended (post_to_egm), for the
+        # send worker: "acked", "answered", "error:<code>", "queue_full",
+        # "not_sent" (failed before the request went out), "no_answer"
+        self.post_verdict = ""
+        self.post_reached = False     # the request was written to the socket
+        self.post_took = 0.0          # seconds the last POST took
+        # parts of a response sent in several commands (sessionMore, §1.18.3.2)
+        self.partial = {}
         self.vouchers = []
         self.voucher_count = 0
         # voucher redemption tier-2 (G2S-26): redemptions is a bounded ring
@@ -1944,6 +1989,25 @@ class EgmAssociation:
         self.host_session_id += 1
         return self.host_session_id
 
+    SENT_REQUESTS_KEPT = 400
+    _CMD_NAME = re.compile(r"<\s*(?:[\w.-]+:)?([\w.-]+)")
+    _CMD_ATTR = re.compile(r"(?:[\w.-]+:)?([\w.-]+)\s*=\s*\"([^\"]*)\"")
+
+    def note_request(self, cls, device_id, command_xml, session_id):
+        """Remember a request as it is built (see sent_requests). MUST be
+        called holding self.lock, as the builders are. Only the first tag
+        of the command is read: its name and its own attributes."""
+        head = command_xml.split(">", 1)[0]
+        m = self._CMD_NAME.search(head)
+        if not m:
+            return
+        self.sent_requests[str(session_id)] = {
+            "class": cls, "deviceId": str(device_id), "command": m.group(1),
+            "attrs": dict(self._CMD_ATTR.findall(head[m.end():])),
+        }
+        while len(self.sent_requests) > self.SENT_REQUESTS_KEPT:
+            self.sent_requests.pop(next(iter(self.sent_requests)))
+
     def new_epoch(self):
         """A (re-)commsOnLine implies our counters may reset (spec §2.2).
         MUST be called holding self.lock. Bumping epoch invalidates any
@@ -1959,6 +2023,7 @@ class EgmAssociation:
         confirm/disagree it in /api/status. Monotonic sids can never repeat,
         so cross-epoch attribution is impossible."""
         self.epoch += 1
+        self.established = False
         self.host_command_id = 0
         self.set_comms_state_sent = 0.0
         self.keepalive_sent = False
@@ -2218,6 +2283,12 @@ class EgmAssociation:
             "cabinet": cabinet,
             "cabinetStateChange": cabinet_state_change,
             "egmClockSkewSec": self.egm_clock_skew_sec,
+            # the host number the machine addresses the hub by, when it is
+            # not the hub's own (None otherwise)
+            "hostIdSeen": self.host_id_seen,
+            # requests the machine sent later than their own time-to-live
+            # allowed (counted, still processed)
+            "staleRequests": self.stale_requests,
             "clockSync": clock_sync,
             "meterCount": len(meters),
             "meters": meters,
@@ -12375,11 +12446,22 @@ class G2SHost:
                         lead, extra_ms)
         return ttl + extra_ms
 
+    @staticmethod
+    def _note_request(assoc, cls, device_id, command_xml, session_id):
+        """EgmAssociation.note_request, for an association that has one (a
+        gate's stand-in association need not)."""
+        note = getattr(assoc, "note_request", None)
+        if note is not None:
+            note(cls, device_id, command_xml, session_id)
+
     def build_inner_command(self, assoc, command_xml, session_type, session_id,
                             time_to_live):
         cid = assoc.next_command_id()
         ts = now_iso()
         time_to_live = self._ttl_for(assoc, time_to_live)
+        if session_type == "G2S_request":
+            self._note_request(assoc, "communications", assoc.device_id,
+                               command_xml, session_id)
         return (
             f'<g2s:g2sMessage xmlns:g2s="{SCHEMA_NS}">\n'
             f'   <g2s:g2sBody g2s:hostId="{self.host_id}" '
@@ -12403,6 +12485,7 @@ class G2SHost:
         cid = assoc.next_command_id()
         ts = now_iso()
         time_to_live = self._ttl_for(assoc, time_to_live)
+        self._note_request(assoc, cls, device_id, command_xml, session_id)
         return (
             f'<g2s:g2sMessage xmlns:g2s="{SCHEMA_NS}">\n'
             f'   <g2s:g2sBody g2s:hostId="{self.host_id}" '
@@ -12444,6 +12527,8 @@ class G2SHost:
         cid = assoc.next_command_id()
         ts = now_iso()
         time_to_live = self._ttl_for(assoc, time_to_live)
+        self._note_request(assoc, class_local, device_id, command_xml,
+                           session_id)
         pfx = EXT_NS_PREFIX.get(class_ns, "ext")
         return (
             f'<g2s:g2sMessage xmlns:g2s="{SCHEMA_NS}" '
@@ -12514,6 +12599,56 @@ class G2SHost:
         return inner, egm_id, host_id
 
     @staticmethod
+    def ack_error_code(resp_body):
+        """The errorCode of the g2sAck in a machine's synchronous reply to
+        one of our POSTs: "G2S_none" for a clean ack, None when the reply
+        holds no g2sAck at all.
+
+        The reply is read as XML: the SOAP element's text is the inner
+        message, whose g2sAck carries the code. Until v0.3.19 a regular
+        expression looked for errorCode="G2S_..." in the raw reply, which
+        could not see a code written with single quotes or outside the
+        G2S_ prefix (a vendor's own). That expression is still the
+        fallback for a reply that does not parse."""
+        if "g2sAck" not in resp_body:
+            return None
+        try:
+            for el in ET.fromstring(resp_body).iter():
+                if not (el.text and "g2sAck" in el.text):
+                    continue
+                inner = ET.fromstring(G2SHost.inner_payload(el.text))
+                for a in inner.iter():
+                    if localname(a.tag) == "g2sAck":
+                        return attr(a, "errorCode") or "G2S_none"
+        except ET.ParseError:
+            pass
+        m = re.search(r'errorCode="(G2S_\w+)"', html.unescape(resp_body))
+        return m.group(1) if m else "G2S_none"
+
+    @staticmethod
+    def inner_payload(text):
+        """The inner g2sMessage as XML, from the text of the SOAP element
+        that carried it.
+
+        That text has ALREADY been decoded once: the SOAP body was parsed,
+        and reading an element's text turns its &lt; and &amp; back into
+        characters. What remains is the message itself, in which the
+        characters & < " inside an attribute are still written as entity
+        references, as §1.11 Table 1.1 requires ("MUST be specified using
+        their corresponding entity references"). Until v0.3.19 the text
+        was decoded a second time here, which turned those into bare
+        characters: a message with "Cats &amp; Dogs" in any attribute (a
+        game name, ticket text, an option's help text) was no longer XML
+        and was refused with G2S_MSX004.
+
+        A sender that wraps its payload twice is still read: text that is
+        not XML as it stands is decoded once more, which is what was done
+        to every message before."""
+        if text.lstrip().startswith("<"):
+            return text
+        return html.unescape(text)
+
+    @staticmethod
     def parse_inner(inner_xml):
         """Parse an unescaped inner g2sMessage into a flat description."""
         root = ET.fromstring(inner_xml)
@@ -12542,6 +12677,13 @@ class G2SHost:
                 "commandId": attr(cls, "commandId"),
                 "sessionType": attr(cls, "sessionType") or "G2S_request",
                 "sessionId": attr(cls, "sessionId") or "0",
+                # true on every part but the last of a response sent in
+                # several commands (§1.18.3.2, Table 1.5)
+                "sessionMore": g2s_true(attr(cls, "sessionMore")),
+                # when the command was made and how long it stays good, in
+                # ms, 0 = for ever (see the note in handle_g2s_message)
+                "dateTime": attr(cls, "dateTime"),
+                "timeToLive": attr(cls, "timeToLive"),
                 "errorCode": attr(cls, "errorCode"),
                 # errorText rides beside errorCode on §1.18.9 error
                 # responses — the AVP puts real diagnostics there (RB:
@@ -12581,11 +12723,13 @@ class G2SHost:
                 assoc.egm_conn = conn
                 assoc.egm_conn_target = target
             try:
+                assoc.post_reached = False
                 conn.request("POST", path, body=body.encode("utf-8"), headers={
                     "Content-Type": "text/xml; charset=utf-8",
                     "SOAPAction": f'"{SOAPACTION_SEND}"',
                     "User-Agent": "CabiNet-G2S/1.0",
                 })
+                assoc.post_reached = True     # the request is on the wire
                 resp = conn.getresponse()
                 # http.client requires the response fully read before the
                 # connection can be reused.
@@ -12613,25 +12757,44 @@ class G2SHost:
         url = urllib.parse.urlsplit(assoc.egm_location)
         path = url.path or "/"
         wire.info("OUT >>> %s to %s\n%s", label, assoc.egm_location, body)
+        assoc.post_verdict, assoc.post_reached = "", False
+        epoch_at_send = assoc.epoch
+        began = time.time()
         try:
             resp_status, resp_body = self._egm_http_post(assoc, url, path,
                                                          body)
+            assoc.post_took = time.time() - began
             wire.info("OUT <<< HTTP %s for %s\n%s", resp_status, label,
                       resp_body)
             assoc.outbound_ok += 1
+            # The machine answered the POST that carried our commsOnLineAck:
+            # communications are established for this epoch (§1.18.2).
+            if label.startswith("commsOnLineAck("):
+                with assoc.lock:
+                    if assoc.epoch == epoch_at_send:
+                        assoc.established = True
             # GR-01: any COMPLETED keepAlive POST (regardless of ack verdict)
             # proves the transport path is up — reset the demotion streak.
             if label.startswith("keepAlive("):
                 assoc.keepalive_fail_streak = 0
             # The EGM's message-level ack rides in this synchronous response.
             clean_ack = False
-            if "g2sAck" in resp_body:
-                m = re.search(r'errorCode="(G2S_\w+)"', html.unescape(resp_body))
-                if m and m.group(1) != "G2S_none":
+            assoc.post_verdict = "answered"
+            ack_code = self.ack_error_code(resp_body)
+            if ack_code is not None:
+                if ack_code != "G2S_none":
+                    # G2S_MSX006: the machine's inbound queue is full and it
+                    # took none of these commands. §1.18.11: "The commands
+                    # contained within the original message MUST NOT be
+                    # discarded"; the send worker sends them again.
+                    assoc.post_verdict = ("queue_full"
+                                          if ack_code == "G2S_MSX006"
+                                          else f"error:{ack_code}")
                     log.warning("[%s] EGM g2sAck for %s carried errorCode=%s",
-                                assoc.egm_id, label, m.group(1))
+                                assoc.egm_id, label, ack_code)
                 else:
                     clean_ack = True
+                    assoc.post_verdict = "acked"
                     log.info("[%s] EGM acked %s", assoc.egm_id, label)
             # A host->EGM keepAlive that the EGM cleanly g2sAck'd (HTTP 200, no
             # error) proves the link is alive in BOTH directions. The real AVP
@@ -12657,6 +12820,9 @@ class G2SHost:
                                                         time.time())
                         suppressed = assoc.offline_suppressed
                         assoc.comms_state = "onLine"
+                        # the machine answers us again: no new handshake is
+                        # needed for its messages to be taken
+                        assoc.established = True
                         assoc.offline_since = 0.0
                         assoc.offline_suppressed = 0
                 if restored_after:
@@ -12713,6 +12879,10 @@ class G2SHost:
             return True
         except (OSError, http.client.HTTPException) as e:
             assoc.outbound_fail += 1
+            assoc.post_took = time.time() - began
+            # did the request go out before it failed? (see RESEND_*)
+            assoc.post_verdict = ("no_answer" if assoc.post_reached
+                                  else "not_sent")
             # GR-01: while OFFLINE each failed attempt is expected — count it,
             # log at DEBUG, and emit a paced reminder instead of the CRITICAL
             # storm (2,900 of them across the overnight 8h power-off).
@@ -12768,6 +12938,11 @@ class G2SHost:
             if assoc.comms_state != "onLine":
                 return
             assoc.comms_state = "offline"
+            # we cannot reach the machine: until it hands us a fresh
+            # egmLocation in a commsOnLine (or a probe gets through), what
+            # it sends is answered G2S_MSX003 and not processed (§1.18.1:
+            # "if the host cannot reach the EGM at the location given")
+            assoc.established = False
             assoc.offline_since = time.time()
             assoc.offline_suppressed = 0
             assoc.last_offline_reminder = time.time()
@@ -12840,6 +13015,41 @@ class G2SHost:
                 continue
             inner, label = built
             self.post_to_egm(assoc, inner, label)
+            # Send it again when the machine cannot have acted on it (see
+            # RESEND_AFTER_SEC). A stand-in post_to_egm leaves no verdict
+            # and is never re-sent.
+            sends = 1
+            while not label.startswith("keepAlive("):
+                verdict = getattr(assoc, "post_verdict", "")
+                if verdict == "not_sent" and sends < RESEND_TRIES and \
+                        assoc.post_took <= RESEND_ONLY_IF_FAILED_WITHIN:
+                    wait, why = RESEND_AFTER_SEC, "it did not go out"
+                elif verdict == "queue_full" and sends < QUEUE_FULL_TRIES:
+                    wait, why = (QUEUE_FULL_RESEND_SEC,
+                                 "the machine's inbound queue was full")
+                else:
+                    break
+                time.sleep(wait)
+                with assoc.lock:
+                    current = (job["epoch"] == assoc.epoch
+                               and assoc.comms_state != "offline")
+                if not current:
+                    break                   # a new handshake, or link down
+                sends += 1
+                log.info("[%s] sending %s again (%d of %d): %s",
+                         assoc.egm_id, label, sends,
+                         RESEND_TRIES if verdict == "not_sent"
+                         else QUEUE_FULL_TRIES, why)
+                self.post_to_egm(assoc, self.restamped(inner), label)
+
+    @staticmethod
+    def restamped(inner_xml):
+        """The same message for sending again: the same commands with the
+        same commandIds, so the machine can tell it is a repeat, under a
+        current dateTimeSent."""
+        return re.sub(r'(g2s:dateTimeSent=")[^"]*(")',
+                      lambda m: m.group(1) + now_iso() + m.group(2),
+                      inner_xml, count=1)
 
     def enqueue_comms_online_ack(self, assoc, req):
         def build(a):
@@ -12956,12 +13166,21 @@ class G2SHost:
 
         threading.Thread(target=loop, daemon=True).start()
 
-    def enqueue_class_response(self, assoc, req, command_xml, label):
+    def enqueue_class_response(self, assoc, req, command_xml, label,
+                               retry=False):
         """Class-level response carried under the REQUEST'S OWN class element
         (echoed deviceId/sessionId, host's own next commandId, timeToLive=0).
         Unlike build_inner_command this does NOT hardcode <g2s:communications>,
         so it is correct for host-owned classes such as optionConfig where that
-        wrapper would produce a malformed reply."""
+        wrapper would produce a malformed reply.
+
+        retry=True marks the answer as a repeat (§1.18.3.2): a recipient
+        that finds it has already processed a logical transaction "MUST
+        construct the same logical response to the command and set the
+        session retry indicator to true in that response". Pass it from the
+        branches that recognised the request as one they had answered."""
+        again = ' g2s:sessionRetry="true"' if retry else ""
+
         def build(a):
             cid = a.next_command_id()
             ts = now_iso()
@@ -12973,7 +13192,7 @@ class G2SHost:
                 f'      <g2s:{cls} g2s:deviceId="{req["deviceId"]}" '
                 f'g2s:dateTime="{ts}" g2s:commandId="{cid}" '
                 f'g2s:sessionType="G2S_response" g2s:sessionId="{req["sessionId"]}" '
-                f'g2s:timeToLive="0">\n'
+                f'g2s:timeToLive="0"{again}>\n'
                 f"         {command_xml}\n"
                 f"      </g2s:{cls}>\n"
                 f"   </g2s:g2sBody>\n"
@@ -17835,6 +18054,68 @@ class G2SHost:
         assoc = self.assoc(egm_id)
         assoc.last_seen = time.time()
 
+        # The hostId the machine addressed this message to (§1.18.1). The
+        # document has a host refuse a message whose hostId is not its own
+        # with G2S_MSX001 and process nothing. This host does NOT refuse:
+        # like an unknown egmId (never answered MSX002), a machine set up
+        # with this hub under another host number is let in, because a
+        # machine that tolerates the difference works today and a refusal
+        # would cut it off. What it does do is say so, once per number, in
+        # the log and in /api/status (hostIdSeen): a machine that follows
+        # §1.10 refuses OUR messages, which carry our own hostId, and loops
+        # on commsOnLine, and this line is then the explanation.
+        body_host = (msg.get("hostId") or "").strip()
+        if body_host and body_host != str(self.host_id) \
+                and assoc.host_id_seen != body_host:
+            assoc.host_id_seen = body_host
+            log.warning("[%s] this machine addresses the hub as host %s; "
+                        "the hub runs as host %s. A machine that checks the "
+                        "number refuses the hub's messages (G2S_MSX001). "
+                        "Set the hub's host number on the machine to %s, or "
+                        "start the hub with --host-id %s.", egm_id,
+                        body_host, self.host_id, self.host_id, body_host)
+
+        # A request past its timeToLive (§1.18.3.2: one not started within
+        # it, "counted from its dateTime", is answered G2S_APX011). Every
+        # command is started the moment its message arrives, so the only
+        # request that can be past it is one the machine held back: made at
+        # one time, sent later. That shows in the machine's OWN two stamps,
+        # the command's dateTime and the message's dateTimeSent, so it can
+        # be told without the two clocks having to agree (they do agree:
+        # the hub is the machines' time server, and corrects a clock that
+        # is more than CLOCK_SKEW_SYNC_SEC out; the two on the owner's
+        # floor read 0.2 s and 4 s off on 2026-11-17).
+        #
+        # Such a request is COUNTED AND STILL PROCESSED, not refused. What
+        # a machine holds back and sends late is what it must not lose: an
+        # issueVoucher, a commitTransfer, a keyedOff, a persisted event,
+        # all of which it re-sends until acknowledged. Whether real machines
+        # give those a current dateTime when they re-send, as §1.18.4 asks,
+        # is not known; one that does not would be answered APX011 for
+        # ever and could never close the transaction. None was seen stale
+        # in 600 requests across two restarts. staleRequests in
+        # /api/status says how often it happens, which is what is needed
+        # before deciding to refuse.
+        sent_at = parse_g2s_datetime(msg.get("dateTimeSent"))
+        for c in msg["classes"]:
+            if c.get("sessionType") != "G2S_request" or sent_at is None:
+                continue
+            try:
+                ttl_ms = int(c.get("timeToLive") or 0)
+            except ValueError:
+                ttl_ms = 0
+            made_at = parse_g2s_datetime(c.get("dateTime"))
+            if ttl_ms <= 0 or made_at is None:
+                continue
+            held_ms = (sent_at - made_at).total_seconds() * 1000
+            if held_ms > ttl_ms:
+                assoc.stale_requests += 1
+                log.warning("[%s] %s.%s was made %.0f s before the machine "
+                            "sent it, past its own time-to-live of %.0f s; "
+                            "processed anyway (%d such so far)", egm_id,
+                            c.get("class"), c.get("command"), held_ms / 1000,
+                            ttl_ms / 1000, assoc.stale_requests)
+
         # G2S-20: every inbound g2sBody timestamps the EGM's clock. Track the
         # rolling skew vs ours (negative = EGM behind) — it feeds the join-time
         # auto clock-sync and /api/status egmClockSkewSec.
@@ -17858,6 +18139,26 @@ class G2SHost:
         if assoc.comms_online_seen == 0 and not has_comms_online:
             log.warning("[%s] %s before commsOnLine -> G2S_MSX003", egm_id,
                         [c["command"] for c in commands])
+            return self.build_inner_g2s_ack(
+                egm_id, "G2S_MSX003", "Communications not online.")
+        # ...and again whenever communications are not established in this
+        # epoch (§1.18.2: until its commsOnLineAck has been acknowledged
+        # "the host MUST continue to respond to the EGM with the G2S_MSX003
+        # errorCode"; §1.18.1: likewise when the host "cannot reach the EGM
+        # at the location given"). Until v0.3.19 the gate above was the only
+        # one, and it opens for good at the first commsOnLine: a machine
+        # whose address had changed, or that we could no longer reach, had
+        # its requests acknowledged and processed with every answer lost,
+        # where an MSX003 makes it start again with a commsOnLine that
+        # carries its current location. commsDisabled is let through: a
+        # machine only sends it once it has our commsOnLineAck, so it is
+        # the proof that the ack arrived even if its POST seemed to fail.
+        handshake = any(c["command"] in ("commsOnLine", "commsDisabled")
+                        for c in commands)
+        if not assoc.established and not handshake:
+            log.warning("[%s] %s while communications are not established "
+                        "(state %s) -> G2S_MSX003", egm_id,
+                        [c["command"] for c in commands], assoc.comms_state)
             return self.build_inner_g2s_ack(
                 egm_id, "G2S_MSX003", "Communications not online.")
 
@@ -17903,9 +18204,27 @@ class G2SHost:
         rerr = req.get("errorCode")
         if rerr and rerr != "G2S_none":
             rtext = req.get("errorText")
+            # WHICH request this refuses. An error response carries no
+            # command element (§1.18.3.3), only the sessionId of the request
+            # it answers ("assigned by the requestor and returned by the
+            # responder", Table 1.5), so the request is looked up by that.
+            # Until v0.3.19 most branches below charged the error to
+            # whatever was in flight in the class: a refused getWatStatus
+            # parked the newest open transfer as failed, a refused
+            # getOptionList failed a ticket-header change or a denomination
+            # ceremony that was waiting on the machine, a refused
+            # getHandpayLog was reported as a refused key-off. ans_cmd is
+            # the refused request's command name (None when this host has
+            # no record of the sessionId, in which case nothing in flight
+            # is touched) and ans_attrs its own attributes.
+            with assoc.lock:
+                answered = assoc.sent_requests.get(str(req["sessionId"]))
+            ans_cmd = (answered or {}).get("command")
+            ans_attrs = (answered or {}).get("attrs") or {}
             log.warning("[%s] %s.%s carried class-level errorCode=%s — the EGM "
-                        "REJECTED our request%s", assoc.egm_id, req["class"],
-                        cmd, rerr, f' (errorText="{rtext}")' if rtext else "")
+                        "REJECTED our %s%s", assoc.egm_id, req["class"],
+                        cmd, rerr, ans_cmd or "request",
+                        f' (errorText="{rtext}")' if rtext else "")
             # wat + "Invalid Device Identifier" = the join-window rejection. A
             # cabinet can refuse reads for its OWN active, host-owned wat
             # devices for a moment after commsOnLine (a tester's floor,
@@ -18083,7 +18402,8 @@ class G2SHost:
                 failed = None
                 with assoc.lock:
                     c = assoc.denom_ceremony
-                    if c and c.get("stage") == "entering":
+                    if c and c.get("stage") == "entering" \
+                            and ans_cmd == "enterOptionConfigMode":
                         c["stage"] = "failed"
                         c["outcome"] = f"error:{rerr}"
                         c["errorCode"] = rerr
@@ -18114,7 +18434,10 @@ class G2SHost:
                 failed_mid_cycle = False
                 with assoc.lock:
                     if assoc.commconfig_stage in ("entering", "changing",
-                                                  "authorizing"):
+                                                  "authorizing") \
+                            and ans_cmd in ("enterCommConfigMode",
+                                            "setCommChange",
+                                            "authorizeCommChange"):
                         assoc.commconfig_stage = "failed"
                         failed_mid_cycle = True
                 if failed_mid_cycle:
@@ -18188,19 +18511,20 @@ class G2SHost:
                                 if rerr == "G2S_CBX001" else "")
             # G2S-25: a handpay-class error while a setRemoteKeyOff is in
             # flight is its verdict (Table 11.22; no remoteKeyOffAck, no
-            # JPE103). Attribute it to the most recently sent key-off —
-            # best-effort like the cabinet case; the record stays PENDING
+            # JPE103), when it IS the setRemoteKeyOff that was refused (a
+            # refused getHandpayLog says nothing about a key-off). The
+            # record is the one the refused request named. It stays PENDING
             # because keyedOff is authoritative (§11.16): after G2S_JPX003
             # an attendant's local key-off is likely already racing us and
             # its keyedOff will close the entry out.
             elif req["class"] == "handpay":
                 target = None
                 with assoc.lock:
-                    for rec in assoc.handpays_pending.values():
-                        if rec.get("state") in ("keyOffSent", "keyOffAcked") \
-                                and (target is None
-                                     or rec.get("keyOffSentTs", 0)
-                                     > target.get("keyOffSentTs", 0)):
+                    if ans_cmd == "setRemoteKeyOff":
+                        rec = assoc.handpays_pending.get(
+                            ans_attrs.get("transactionId"))
+                        if rec is not None and rec.get("state") in (
+                                "keyOffSent", "keyOffAcked"):
                             target = rec
                     if target is not None:
                         target["state"] = f"error:{rerr}"
@@ -18284,6 +18608,9 @@ class G2SHost:
                     oc = assoc.option_change
                     if assoc.optionconfig_stage in (
                             "setting", "authorizing", "cancelling") and \
+                            ans_cmd in ("setOptionChange",
+                                        "authorizeOptionChange",
+                                        "cancelOptionChange") and \
                             oc.get("result") in ("sent", "acked", "pending",
                                                  "authorized"):
                         assoc.optionconfig_stage = "failed"
@@ -18296,26 +18623,31 @@ class G2SHost:
                     log.warning("[%s] ⚙️ OPTION CHANGE REJECTED (option=%s) — "
                                 "%s%s", assoc.egm_id, oid, rerr,
                                 f" ({hint})" if hint else "")
-            # G2S-39: a wat-class error while a transfer request is in flight
-            # is its verdict (error responses carry NO child command per
-            # §1.18.9). Best-effort attribution to the newest still-live
-            # transfer record — wat traffic is sparse and the window is
-            # seconds wide (the cabinet clock-sync treatment). The durable
+            # G2S-39: a wat-class error is the verdict on a transfer only
+            # when the request it refuses is that transfer's own: our
+            # initiateRequest (found by its requestId) or our cancelRequest
+            # (by its transactionId). A refused getWatStatus, getWatProfile,
+            # setWatCashOut, setWatState or getWatLog touches no transfer:
+            # one floor drew 88 such refusals in a day at join. The durable
             # store record parks at error:* so the escrow-free request can't
             # wedge the pending list forever; a later commitTransfer (the
             # §22.26 mandate once a transactionId exists) still closes it out.
             elif req["class"] == "wat":
                 target = None
+                cancel_refused = ans_cmd == "cancelRequest"
                 with assoc.lock:
                     for r in assoc.wat_transfers:
-                        if r.get("state") in WAT_ACTIVE_STATES and \
-                                (target is None
-                                 or (r.get("createdAt") or "")
-                                 > (target.get("createdAt") or "")):
+                        if r.get("state") not in WAT_ACTIVE_STATES:
+                            continue
+                        if ans_cmd == "initiateRequest" and \
+                                str(r.get("requestId")) \
+                                == str(ans_attrs.get("requestId")):
                             target = r
-                if target is not None and \
-                        target.get("cancelRequestedAt") and \
-                        not target.get("cancelAckedAt"):
+                        elif cancel_refused and \
+                                str(r.get("transactionId")) \
+                                == str(ans_attrs.get("transactionId")):
+                            target = r
+                if target is not None and cancel_refused:
                     # The in-flight command on this record is OUR OWN
                     # cancelRequest — the error is ITS verdict (G2S_WTX009
                     # "unable to cancel", ...): the CANCEL failed, not the
@@ -18345,6 +18677,20 @@ class G2SHost:
                                 "%s%s", assoc.egm_id, target.get("requestId"),
                                 target.get("transactionId"), rerr,
                                 f" ({hint})" if hint else "")
+            # A refused setBonusAward (G2S_BNX002 invalid award, G2S_BNX008
+            # award queue full, Table 19.22). The award is the one the
+            # refused request named; until v0.3.19 nothing marked it, so it
+            # showed as 'sent' for good and invited a second send. No money
+            # is involved: the debit waits for commitBonus.
+            elif req["class"] == "bonus" and ans_cmd == "setBonusAward" \
+                    and ans_attrs.get("bonusId"):
+                self._bonus_award_update(
+                    assoc, ans_attrs.get("bonusId"),
+                    state=f"error:{rerr}", errorCode=rerr,
+                    errorText=rtext or "")
+                log.warning("[%s] 🎁 BONUS AWARD REFUSED bonusId=%s — %s%s",
+                            assoc.egm_id, ans_attrs.get("bonusId"), rerr,
+                            f' "{rtext}"' if rtext else "")
             # RB: a download-class error is the reboot script's verdict —
             # the ONLY download traffic this host originates is the
             # setDownloadState + setScript(resetEgm) pair. Wire-proven
@@ -18526,6 +18872,8 @@ class G2SHost:
             self.enqueue_comms_online_ack(assoc, req)
 
         elif cmd == "commsDisabled":
+            # the machine has our commsOnLineAck (see handle_g2s_message)
+            assoc.established = True
             if assoc.comms_state in ("sync(expected)", "opening"):
                 assoc.comms_state = "sync"
                 log.info("[%s] EGM is in SYNC state (commsDisabled heartbeat) "
@@ -18761,6 +19109,23 @@ class G2SHost:
                 "deviceId": attr(d, "deviceId"),
                 "active": attr(d, "deviceActive") or attr(d, "active"),
             } for d in el]
+            # A list too long for one command arrives in several, all with
+            # the request's sessionId and sessionMore=true on every part
+            # but the last (§1.18.3.2). The parts are gathered and the list
+            # is replaced once, when the last one is in. Until v0.3.19
+            # each part replaced the one before, so only the last was kept.
+            part_key = ("descriptorList", str(req["sessionId"]))
+            with assoc.lock:
+                earlier = assoc.partial.pop(part_key, [])
+                if req.get("sessionMore"):
+                    assoc.partial[part_key] = earlier + descs
+                    while len(assoc.partial) > 8:      # abandoned lists
+                        assoc.partial.pop(next(iter(assoc.partial)))
+            if req.get("sessionMore"):
+                log.info("[%s] descriptorList part (%d devices so far, more "
+                         "to come)", assoc.egm_id, len(earlier) + len(descs))
+                return None
+            descs = earlier + descs
             assoc.descriptors = descs
             assoc.descriptors_rx += 1  # GR-30 rescan waits on this bump
             # Cabinet IDENTITY (2026-07-07, AJ): the G2S_cabinet descriptor
@@ -20150,6 +20515,7 @@ class G2SHost:
             log.warning("[%s] commsClosing reason=%s — EGM is tearing down",
                         assoc.egm_id, attr(req["commandEl"], "reason"))
             assoc.comms_state = "closing"
+            assoc.established = False     # it starts again with commsOnLine
             if self.inline:
                 return self._inline(assoc, "<g2s:commsClosingAck/>",
                                     req["sessionId"])
@@ -20758,7 +21124,7 @@ class G2SHost:
                 assoc, req,
                 f'<g2s:issueVoucherAck '
                 f'g2s:transactionId="{rec["transactionId"]}"/>',
-                "issueVoucherAck")
+                "issueVoucherAck", retry=dup)
 
         elif cmd == "redeemVoucher" and stype == "G2S_request":
             # A ticket just went into the note acceptor (spec §21.19): the
@@ -20849,7 +21215,7 @@ class G2SHost:
                     f'g2s:validationId="{vid}" '
                     f'g2s:voucherAmt="{dec["amt"]}" '
                     f'g2s:creditType="{dec["creditType"]}"{exc_attr}/>',
-                    "authorizeVoucher")
+                    "authorizeVoucher", retry=bool(dec.get("retry")))
 
         elif cmd == "commitVoucher" and stype == "G2S_request":
             # Final leg of a redemption (spec §21.21) — the EGM ALWAYS sends
@@ -20953,7 +21319,7 @@ class G2SHost:
                 assoc, req,
                 f'<g2s:commitVoucherAck '
                 f'g2s:transactionId="{rec["transactionId"]}"/>',
-                "commitVoucherAck")
+                "commitVoucherAck", retry=dup)
 
         elif cmd == "handpayLogList":
             # Join-time lockup recovery (2026-07-29, §11.21/Table 11.17):
@@ -21157,7 +21523,7 @@ class G2SHost:
                 log.info("=" * 64)
             self.enqueue_class_response(
                 assoc, req, f'<g2s:handpayAck g2s:transactionId="{txn}"/>',
-                "handpayAck")
+                "handpayAck", retry=dup)
 
         elif cmd == "remoteKeyOffAck" and stype == "G2S_response":
             # The EGM ACCEPTED our setRemoteKeyOff (spec §11.15) and fires
@@ -21292,7 +21658,7 @@ class G2SHost:
                                  hp_who, txn, hp_ref)
             self.enqueue_class_response(
                 assoc, req, f'<g2s:keyedOffAck g2s:transactionId="{txn}"/>',
-                "keyedOffAck")
+                "keyedOffAck", retry=dup)
 
         elif cmd == "requestPending" and stype == "G2S_response":
             # wat (G2S-39, §22.26): the EGM accepted our initiateRequest and
@@ -21346,6 +21712,10 @@ class G2SHost:
                     assoc.egm_id, txn, rid, req["deviceId"], direction,
                     pay_method, egm_amounts, max_amt,
                     attr(el, "accountId") or "")
+                # the same initiateTransfer again: the verdict already
+                # given is drawn a second time and marked as a repeat
+                redraw = not created and rec.get("state") in (
+                    "authorized", "denied")
                 if created:
                     log.info("🏦 [%s] EGM-initiated WAT transfer — txn=%s "
                              "%s (requestId=%s%s)", assoc.egm_id, txn,
@@ -21390,7 +21760,7 @@ class G2SHost:
                     f'g2s:authPromoAmt="{amounts[1]}" '
                     f'g2s:authNonCashAmt="{amounts[2]}" '
                     f'g2s:hostException="{exc}"/>',
-                    "authorizeTransfer")
+                    "authorizeTransfer", retry=redraw)
 
         elif cmd == "commitTransfer" and stype == "G2S_request":
             # wat (G2S-39, §22.31): the mandated close-out — ACTUAL amounts
@@ -21590,7 +21960,7 @@ class G2SHost:
                 assoc, req,
                 f'<g2s:commitTransferAck g2s:transactionId="{txn}" '
                 f'g2s:requestId="{rid}"/>',
-                "commitTransferAck")
+                "commitTransferAck", retry=dup)
 
         elif cmd == "cancelRequestAck" and stype == "G2S_response":
             # wat (G2S-39, §22.28): the EGM acknowledged our cancelRequest.
@@ -21973,6 +22343,10 @@ class G2SHost:
                             " missing/invalid transactionId ="
                             " no idempotency key = no debit")
                 log.warning("=" * 64)
+            with assoc.lock:
+                bonus_again = any(
+                    str(r.get("transactionId")) == str(txn)
+                    and r.get("committedAt") for r in assoc.bonus_awards)
             self._bonus_award_update(
                 assoc, bid, txn=txn,
                 state="committed" if success else "failed",
@@ -21992,7 +22366,7 @@ class G2SHost:
                 assoc, req,
                 f'<g2s:commitBonusAck g2s:transactionId="{txn}" '
                 f'g2s:bonusId="{html.escape(bid, quote=True)}"/>',
-                "commitBonusAck")
+                "commitBonusAck", retry=bonus_again)
 
         elif cmd == "bonusActivity":
             # bonus (G2S-41, dossier §19.18) — direction/trigger UNKNOWN in
@@ -26402,7 +26776,7 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
             egm_id, self.connection)
 
         reply_inner = self.host_engine.handle_g2s_message(
-            html.unescape(inner), egm_id)
+            self.host_engine.inner_payload(inner), egm_id)
         body = self.host_engine.wrap_sync_response(reply_inner)
         wire.info("IN  >>> sync reply to %s\n%s", peer, body)
         self._send(200, body)

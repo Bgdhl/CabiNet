@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.3.19
+Second batch from the G2S audit: how the hub reads, answers and sends
+G2S messages. Nine items.
+- **A message with `&`, `<` or `"` in it is no longer refused.** A game
+  name, ticket text or option description containing one of those made
+  the hub answer "malformed" and drop the whole message.
+- **A machine's refusal is charged to the request it refuses.** The hub
+  used to pin a refusal on whatever it had in flight for that kind of
+  thing. A machine refusing a status read could mark a wallet transfer
+  as failed, stop a ticket-header change, or abandon a denomination
+  change after the machine had been asked to lock, leaving it locked. A
+  refused bonus award now shows as refused instead of staying "sent".
+- **A machine the hub cannot reach is told to start over.** If the hub
+  could not send to a machine, for example after the machine's address
+  changed, it kept accepting what the machine sent and answered into
+  nowhere. It now tells the machine communications are not established,
+  which makes the machine sign on again with its current address.
+- **A message that did not go out is sent again.** When a machine's
+  listener refused the connection, the hub dropped that message for
+  good. It now tries twice more. A message that went out and drew no
+  answer is not repeated, since the machine may have acted on it.
+- **A machine that says its queue is full is sent the message again**
+  after a pause, up to five times, instead of losing it.
+- **A long device list sent in several parts is kept whole.** The hub
+  kept only the last part.
+- A repeated answer to a repeated request is marked as a repeat.
+- A machine set up with the hub under a different host number is still
+  let in, and the hub's log and status now say which number it uses.
+
 ## v0.3.18
 First batch from an audit of the G2S host against the G2S Message
 Protocol 1.0.3 document: the four items where money or a locked machine
