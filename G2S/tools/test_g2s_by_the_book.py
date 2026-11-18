@@ -3492,7 +3492,12 @@ def ticket_expiry_by_the_hub():
 
     def printed(days_ago):
         vid, _t, _a = egm.issue_voucher(400_000)
-        when = datetime.now().astimezone() - timedelta(days=days_ago)
+        # the same time of day, that many DATES back, with the offset
+        # that date had. Subtracting from an aware "now" keeps today's
+        # offset, which is an hour off across a clock change: from 11 pm
+        # to midnight the ticket then carried the next day's date (this
+        # gate failed at 23:06 on 2026-11-17, after the Nov 1 change).
+        when = (datetime.now() - timedelta(days=days_ago)).astimezone()
         with store.lock:
             ids[vid]["issuedAt"] = when.isoformat(timespec="milliseconds")
         return vid
@@ -3560,8 +3565,8 @@ def ticket_expiry_by_the_hub():
     hs = host.hub_store
     m = hs.tito_mint("sas:smib-x", 1, 10_000)
     hs.tito_record_issued(m["validationNumber"], 10_000, "sas:smib-x", 1)
-    back = time.strftime("%Y-%m-%dT%H:%M:%S",
-                         time.localtime(time.time() - 40 * 86400))
+    back = (datetime.now() - timedelta(days=40)).strftime(
+        "%Y-%m-%dT%H:%M:%S")
     with hs.lock:
         hs._conn.execute("UPDATE tito_tickets SET issued_at=?, "
                          "expire_days=30 WHERE canonical=?",
