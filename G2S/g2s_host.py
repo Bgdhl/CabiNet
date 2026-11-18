@@ -8830,6 +8830,8 @@ class G2SHost:
         tabs)."""
         why = self.LINKED_REFUSED.get(action)
         if why:
+            log.info("🔗 [%s] %s refused: this machine has a SAS link (%s)",
+                     egm_id, action, why)
             return 409, {"ok": False, "via": "sas", "egmId": egm_id,
                          "error": "this machine has a SAS link: " + why}
         if action not in ("resetHandpay", "clearHandpay", "setCabinetState",
@@ -27250,6 +27252,13 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
             payload.setdefault("ok", status == 200)
             payload.setdefault("action", action)
             payload.setdefault("egmId", egm_id)
+            if status != 200 or payload.get("ok") is False:
+                # What the player was told. A refusal used to leave no
+                # line at all: on 2026-11-18 a CASH OUT TO WALLET that
+                # "failed" at the Bluebird's screen could not be traced.
+                log.info("🪟 [glass:%s] %s refused (%s): %s", egm_id,
+                         action or "(no action)", status,
+                         str(payload.get("error") or "")[:200])
             return self._send(status, json.dumps(payload),
                               "application/json", soap=False)
 
