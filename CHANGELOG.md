@@ -31,6 +31,17 @@ pending: a machine with no G2S side showed no amount and booked nothing.
   only, so a SAS-only machine listed nothing there.
 - A bonus sent to a linked machine is sized by the same denomination
   as its credit meter (a cent while none is set for it).
+- **CASH OUT TO WALLET on a machine's screen is no longer refused on an
+  old status read.** The hub went by the machine's last "can a transfer
+  come off it" reading, up to 30 seconds old, and a reading from a bad
+  moment answered "can't send its credits to the wallet right now"
+  about a machine that could. The pull is now sent whenever the SAS
+  side is reporting, and the satellite reads the machine live. If the
+  machine does not make it, the reason shows under the button in both
+  menus for half a minute; before, the tap answered "pending" and a
+  failure said nothing.
+- A refused action from a machine's screen is logged with what the
+  player was told.
 Needs the satellite's own update, which the hub sends after its own.
 
 ## v0.3.27

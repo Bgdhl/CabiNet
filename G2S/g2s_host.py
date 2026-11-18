@@ -7588,6 +7588,49 @@ class G2SHost:
         except Exception:  # noqa: BLE001 — best-effort, never fatal
             log.exception("boot cash-out disarm (%s) failed (ignored)", key)
 
+    #: how long a failed cash-out to wallet stays on the player's screen
+    CASH_OUT_ERROR_SEC = 30
+
+    def _cash_out_pull_failed(self, key, r):
+        """A cash-out to wallet the player asked for from the screen and
+        the machine did not make. The answer to the tap was "pending", so
+        without this the screen went back to the menu and said nothing.
+        Kept for CASH_OUT_ERROR_SEC against the machine (and the G2S
+        machine linked to it) and handed to its screen in the cash-out
+        data. Each result is taken once: the satellite repeats its last
+        results in every report."""
+        cid = str(r.get("id") or "")
+        if not cid.startswith("copull"):
+            return                      # not a pull asked from a screen
+        seen = getattr(self, "_cash_out_pulls_seen", None)
+        if seen is None:
+            seen = self._cash_out_pulls_seen = set()
+            self._cash_out_errors = {}
+        if cid in seen:
+            return
+        seen.add(cid)
+        if len(seen) > 512:
+            seen.clear()
+            seen.add(cid)
+        outcome = str(r.get("outcome") or "")
+        msg = {
+            "no_credits": "This machine has no cashable credits to send "
+                          "to your wallet.",
+            "not_registered": "This machine is not set up for transfers "
+                              "yet. Its CASH OUT button still works.",
+            "asset_unknown": "This machine is not set up for transfers "
+                             "yet. Its CASH OUT button still works.",
+        }.get(outcome, "The machine did not send its credits to your "
+                       "wallet just now. Try again, or use its CASH OUT "
+                       "button.")
+        log.warning("🏦 [sas:%s] cash-out to wallet %s did not happen: %s "
+                    "(%s)", key, cid, outcome or "failed",
+                    str(r.get("detail") or "")[:160])
+        note = {"ts": time.time(), "msg": msg}
+        for owner in [m for m, sk in self.sas_links.items()
+                      if sk == key] + [key]:
+            self._cash_out_errors[owner] = note
+
     def _settle_aft_cashouts(self, command_results, key):
         """Credit-on-confirm the hub-pinned wallet for a button-driven SAS
         AFT host-cashout (EGM_TO_HOST) — the machine->wallet RETURN leg, the
@@ -7634,6 +7677,8 @@ class G2SHost:
                 continue
             if not r.get("ok") or r.get("outcome") not in ("completed",
                                                            "partial"):
+                if not r.get("ok"):
+                    self._cash_out_pull_failed(key, r)
                 continue
             txn = r.get("txnId")
             cents = r.get("amountCents")
@@ -10499,6 +10544,10 @@ class G2SHost:
         # it, and a cash-out with no wallet behind it is refused and
         # prints a ticket. The hub's note alone is not enough either: a
         # machine that did not take the arm prints a ticket too.
+        # a cash-out to wallet that was asked for here and did not happen
+        note = (getattr(self, "_cash_out_errors", None) or {}).get(egm_id)
+        if note and time.time() - note["ts"] <= self.CASH_OUT_ERROR_SEC:
+            out["cashOutError"] = note["msg"]
         try:
             if (getattr(self, "sas_links", None) or {}).get(egm_id):
                 who = self._cash_out_armed().get(egm_id)
@@ -11024,14 +11073,24 @@ class G2SHost:
                                   "on this machine — use the cash-out button"}
         with self.sas_lock:
             entry = self.sas_machines.get(leg) or {}
-        if not self.sas_from_egm_ready(entry):
-            # The machine's last status did not say a transfer from it is
-            # possible. (This used to advise turning on "soft cash-out to
-            # host", which a pull does not need and which makes every
-            # CASH OUT press ask the host first.)
+        # Refused only when the SAS side is not reporting: a pull sent
+        # blind would sit in a queue nobody is reading. NOT refused on the
+        # machine's cached "transfer from the machine OK" bit, as it was
+        # until v0.3.28: that bit is a snapshot from the satellite's last
+        # status read, up to 30 s old, and one taken at a bad moment said
+        # "can't send its credits to the wallet right now" about a machine
+        # that could (the owner at the Bluebird, 2026-11-18: "all it said
+        # was that it wasnt available but the cashout button always
+        # works!!"). The tournament pull dropped the same check on
+        # 2026-07-21 for the same reason. The satellite reads the
+        # machine's status LIVE when it makes the pull and says why if it
+        # cannot; that answer is shown to the player (cashOutError).
+        if not entry or entry.get("online") is False \
+                or time.time() - (entry.get("receivedAt") or 0) \
+                > self.SAS_STALE_SEC:
             return 400, {"ok": False, "egmId": egm_id, "path": "sas",
-                         "error": "This machine can't send its credits to "
-                                  "the wallet right now. Its CASH OUT button "
+                         "error": "This machine is not reporting to the "
+                                  "hub right now. Its CASH OUT button "
                                   "still works."}
         smib = entry.get("smibId") or str(leg).split("/", 1)[0]
         # Pin the destination FIRST (TOCTOU-guarded) so the pull never fires

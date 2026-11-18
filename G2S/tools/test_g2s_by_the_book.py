@@ -4904,6 +4904,55 @@ def sas_handpays_have_an_amount_and_are_booked():
           [p["amount"] for p in view["pending"]] == ["$9.99"]
           and view["canClear"] is True and "via" not in view, view)
 
+    print("— CASH OUT TO WALLET from the machine's screen (the owner, at "
+          "the Bluebird: \"all it said was that it wasnt available but the "
+          "cashout button always works!!\")")
+    host = make_host()
+    egm = online(joined(host, "BTB_pull"))
+    host.sas_links[egm.egm_id] = "smib-x/1"
+    acct, _ = host.account_store.create("Player Three")
+    uid = gh.PIN_UID_PREFIX + acct["id"]
+    # the machine's last status read: no transfer from it possible (0x15)
+    report(host, aft={"registered": True, "availXfers": 0x15,
+                      "aftStatus": 0xFF, "hostCashoutStatus": 0})
+    code, reply = host.glass_cash_out_now(egm.egm_id, acct["id"])
+    pulls = [c for c in host.sas_commands.get("smib-x", ())
+             if c["type"] == "aft_cashout_pull"]
+    check("a status read that said \"no transfer from the machine\" does "
+          "not refuse it: the pull is sent and the satellite reads the "
+          "machine live (the read is up to 30 s old; the player was "
+          "refused on it)", code == 200 and len(pulls) == 1, (code, reply))
+    shown = host._glass_data_cashout(egm.egm_id, egm.assoc, uid)
+    check("nothing to say while it is on its way",
+          "cashOutError" not in shown, shown)
+    failed = {"id": pulls[0]["id"], "type": "aft_cashout", "ok": False,
+              "outcome": "no_credits", "amountCents": 0,
+              "detail": "machine reports no cashable credits"}
+    for _ in range(3):
+        report(host, commandResults=[failed])
+    shown = host._glass_data_cashout(egm.egm_id, egm.assoc, uid)
+    check("when the machine does not make it, the screen is told why "
+          "(the tap had only ever answered \"pending\")",
+          "no cashable credits" in shown.get("cashOutError", ""), shown)
+    host._cash_out_errors[egm.egm_id]["ts"] -= host.CASH_OUT_ERROR_SEC + 1
+    for _ in range(2):
+        report(host, commandResults=[failed])     # the satellite repeats it
+    shown = host._glass_data_cashout(egm.egm_id, egm.assoc, uid)
+    check("for half a minute, and a result the satellite repeats does not "
+          "bring it back", "cashOutError" not in shown, shown)
+    report(host, commandResults=[dict(failed, id="cmd9-1", outcome="x")])
+    check("a failed transfer that no screen asked for says nothing there",
+          "cashOutError" not in host._glass_data_cashout(
+              egm.egm_id, egm.assoc, uid))
+    with host.sas_lock:
+        host.sas_machines["smib-x/1"]["receivedAt"] -= 120
+    queued = len(host.sas_commands.get("smib-x", ()))
+    code, reply = host.glass_cash_out_now(egm.egm_id, acct["id"])
+    check("a SAS side that is not reporting is the one thing it is "
+          "refused for at once", code == 400
+          and "not reporting" in reply["error"]
+          and len(host.sas_commands.get("smib-x", ())) == queued, reply)
+
     print("— what comes off the wire is held to its shape")
     host = make_host()
     start = cash(host, "house")
