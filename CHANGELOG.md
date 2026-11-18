@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.3.27
+A machine with a SAS companion takes its commands over SAS. G2S on it is
+for reading: events, meters, status, the handpay record.
+- **Nothing is sent to it over G2S by the hub itself** beyond what keeps
+  the G2S link up and reporting. At a sign-on the hub no longer changes
+  its options (the remote handpay reset switch, the ticket header, the
+  ticket expiry: the SAS side already sets the ticket text and expiry,
+  and keeps the clock), sets its clock, or reads a transfer device it
+  does not have. At a card-in it no longer sends the card or the glass
+  window.
+- **A command SAS can carry goes over SAS whichever button asked.** A
+  handpay reset from any page or from the admin view on the machine's
+  screen, enable and disable, and a bonus (as whole credits) are sent
+  to the satellite. Pushes, cash-outs, the floor lock and tournaments
+  already were.
+- **A G2S command on something SAS owns there is refused, and says what
+  does the job**: the cash-out switch, the transfer device, the ticket
+  device, the clock.
+- A ticket header or expiry saved in Settings is not pushed to it over
+  G2S; the answer says SAS has it.
+- Left on G2S, when someone asks: a reboot, an Options-tab change, the
+  Games tab, the bill acceptor switch.
+- An enable also lifts an old G2S disable if the machine still reports
+  one. That is the one G2S command this rule sends.
+
 ## v0.3.26
 Seventh and last batch from the G2S audit: the card reader, the bill
 acceptor, bonus awards, handpays and transfers. Sixteen items and seven

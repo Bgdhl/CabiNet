@@ -125,7 +125,7 @@ if "tournament_names" not in _hub_store_mod.HOST_SETTING_KEYS:
 # the MINOR bump per the repo's version rule). Surfaced in engine_meta() ->
 # /api/status ["_engine"]["version"]; bump this and add a CHANGELOG.md
 # section on every commit with a user-visible change.
-CABINET_VERSION = "0.3.26"
+CABINET_VERSION = "0.3.27"
 
 WSDL_NS = "http://www.gamingstandards.com/wsdl/g2s/v1.0"
 SCHEMA_NS = "http://www.gamingstandards.com/g2s/schemas/v1.0.3"
@@ -8523,6 +8523,8 @@ class G2SHost:
             return
         if assoc is None or assoc.comms_state != "onLine":
             return
+        if self.linked_leg(assoc):
+            return      # the linked-machine rule: its screen is the Pi's
         dev = self.glass_target_device(assoc)
         now = time.time()
         with assoc.lock:
@@ -8760,6 +8762,137 @@ class G2SHost:
                             device_id=self.default_wat_device(a))
         except Exception:  # noqa: BLE001 — rides report ingest, never fatal
             log.exception("cash-out pin sweep failed (ignored)")
+
+    # ------------------------------------------------ the linked-machine rule
+    #
+    # The owner, 2026-11-18: "machines with SAS companions assigned use SAS
+    # for all commands instead of G2S. we can use info from G2S or
+    # whatever." (and the day before: "a machine with a sas link sends
+    # commands via sas not G2S"). A linked machine is a G2S machine with a
+    # SAS leg (sas_links). For it:
+    #   * the hub sends NOTHING over G2S by itself except what keeps the
+    #     G2S link up and reporting (the join reads, subscriptions, acks).
+    #     No option change at a join (remote handpay arm, ticket header,
+    #     ticket expiry: the SAS side sets the ticket text and expiry and
+    #     keeps the clock), no clock set, no transfer reads, no card push
+    #     and no glass window push at a card-in;
+    #   * a command SAS can carry goes over SAS whatever asked for it: the
+    #     lock, transfers, cash-out, handpay reset, a bonus (linked_command
+    #     below, and the callers that already asked sas_links);
+    #   * a G2S-only action someone asks for by hand stays: a reboot, an
+    #     Options-tab change, the Games tab, the bill acceptor switch.
+    # Reading stays G2S: events, meters, status, the handpay record.
+
+    def linked_leg(self, assoc_or_id):
+        """The SAS leg key of a machine with a SAS link, else None."""
+        egm_id = getattr(assoc_or_id, "egm_id", assoc_or_id)
+        return (getattr(self, "sas_links", None) or {}).get(egm_id)
+
+    def _linked_smib(self, leg):
+        with self.sas_lock:
+            entry = dict(self.sas_machines.get(leg) or {})
+        return entry.get("smibId") or str(leg).split("/", 1)[0], entry
+
+    #: /api/command actions refused for a linked machine, with what does
+    #: the job instead. Each is a G2S command whose subject SAS owns there.
+    LINKED_REFUSED = {
+        "setWatCashOut": "cash-out to a wallet is armed over SAS on this "
+                         "machine (the player's TO WALLET switch)",
+        "watEnable": "transfers go over SAS on this machine",
+        "watDisable": "transfers go over SAS on this machine",
+        "setVoucherState": "tickets go over SAS on this machine",
+        "setDateTime": "the SAS side keeps this machine's clock",
+    }
+
+    def linked_command(self, action, egm_id, leg, req):
+        """A command asked of a linked machine through /api/command (or
+        the admin view on its screen): sent over SAS where SAS can carry
+        it, refused where SAS owns the subject and the G2S command would
+        work against it. Returns (httpStatus, dict), or None for an action
+        the rule leaves on G2S (reads, a reboot, the Options and Games
+        tabs)."""
+        why = self.LINKED_REFUSED.get(action)
+        if why:
+            return 409, {"ok": False, "via": "sas", "egmId": egm_id,
+                         "error": "this machine has a SAS link: " + why}
+        if action not in ("resetHandpay", "clearHandpay", "setCabinetState",
+                          "bonusAward"):
+            return None
+        if (self.hub_store.machine_prefs(leg) or {}).get("sasEnabled") \
+                is False:
+            return 409, {"ok": False, "via": "sas", "egmId": egm_id,
+                         "error": "SAS is disabled for this machine "
+                                  "(Settings)"}
+        smib, entry = self._linked_smib(leg)
+
+        def queue(cmd):
+            cmd = dict(cmd, id=f"lnk{next(self._fob_seq)}-{int(time.time())}")
+            r = self.sas_enqueue_command(smib, cmd)
+            return bool(r.get("ok")), r
+
+        if action in ("resetHandpay", "clearHandpay"):
+            ok, r = queue({"type": "handpay_reset"})
+            log.info("🔑 [%s] handpay reset asked over G2S's action %s — "
+                     "sent over SAS leg %s (%s)", egm_id, action, smib,
+                     r.get("id") if ok else r.get("error"))
+            return 200, {"ok": ok, "via": "sas", "egmId": egm_id,
+                         "id": r.get("id"),
+                         "error": None if ok else str(r.get("error")
+                                                      or "queue refused")}
+        if action == "setCabinetState":
+            enable = str(req.get("enable", True)).lower() \
+                not in ("false", "0", "")
+            ok, r = queue({"type": "sas_enable" if enable
+                           else "sas_disable"})
+            reply = {"ok": ok, "via": "sas", "egmId": egm_id,
+                     "id": r.get("id"),
+                     "error": None if ok else str(r.get("error")
+                                                  or "queue refused")}
+            if enable:
+                # An old G2S host-disable (from before this rule, or from
+                # before the link) is a second latch only G2S can lift.
+                # Lifting it is the one G2S command this path sends.
+                with self.assoc_lock:
+                    assoc = self.associations.get(egm_id)
+                if assoc is not None and assoc.comms_state == "onLine":
+                    with assoc.lock:
+                        latched = assoc.cabinet.get("hostEnabled") == "false"
+                    if latched:
+                        self.enqueue_set_cabinet_state(assoc, enable=True)
+                        reply["g2sLatchCleared"] = True
+            log.info("🔒 [%s] %s asked through setCabinetState — sent over "
+                     "SAS leg %s%s", egm_id, "enable" if enable else
+                     "disable", smib, " (and an old G2S host-disable lifted)"
+                     if reply.get("g2sLatchCleared") else "")
+            return 200, reply
+        # bonusAward: a SAS bonus is a number of credits
+        try:
+            amount_mc = int(req.get("amountMillicents") or 0)
+            denom_c = int(entry.get("denomCents") or 0)
+        except (TypeError, ValueError):
+            amount_mc, denom_c = 0, 0
+        if denom_c <= 0:
+            return 409, {"ok": False, "via": "sas", "egmId": egm_id,
+                         "error": "this machine has a SAS link and its SAS "
+                                  "side has not reported its denomination "
+                                  "yet, so a bonus cannot be sized"}
+        credits, rest = divmod(amount_mc, denom_c * 1000)
+        if amount_mc <= 0 or rest or not \
+                1 <= credits <= self.SAS_BONUS_MAX_CREDITS:
+            return 400, {"ok": False, "via": "sas", "egmId": egm_id,
+                         "error": "this machine has a SAS link: a bonus "
+                                  "goes over SAS as whole credits of "
+                                  f"{money_symbol()}{denom_c / 100:.2f} "
+                                  f"(1..{self.SAS_BONUS_MAX_CREDITS})"}
+        ok, r = queue({"type": "legacy_bonus", "credits": credits})
+        log.info("🎁 [%s] bonus of %s asked through bonusAward — sent over "
+                 "SAS leg %s as %d credit(s) (%s)", egm_id,
+                 denom_dollars(amount_mc), smib, credits,
+                 r.get("id") if ok else r.get("error"))
+        return 200, {"ok": ok, "via": "sas", "egmId": egm_id,
+                     "credits": credits, "id": r.get("id"),
+                     "error": None if ok else str(r.get("error")
+                                                  or "queue refused")}
 
     def _fob_handpay_reset(self, comp, fob, uid):
         """Reset-tier fob: queue a handpay_reset for the BOUND SAS
@@ -17027,6 +17160,8 @@ class G2SHost:
         hub keeps no locale per player, and for "unknown" Table 18.9 gives
         the cabinet's own, so that is what is sent (en_US only for a
         machine that has not said)."""
+        if self.linked_leg(assoc):
+            return                  # the linked-machine rule: no card push
         if locale_id is None:
             locale_id = self.cabinet_locale(assoc) or "en_US"
 
@@ -17899,6 +18034,8 @@ class G2SHost:
         flight is left alone. This is how a tap after a machine/hub
         reboot self-heals the page — and the ONLY glassShow trigger
         besides /api/command (nothing fires at join)."""
+        if self.linked_leg(assoc):
+            return      # the linked-machine rule: its screen is the Pi's
         # Resolved ONCE and handed to the show below: the residency it
         # judges and the window it then pushes to must be the same one,
         # even if a census answer lands in between.
@@ -19335,6 +19472,11 @@ class G2SHost:
                 opt = dict(opt) if opt else None
             if not online:
                 continue
+            if self.linked_leg(a):
+                # the linked-machine rule: its ticket text is set over SAS
+                verdicts.append({"egmId": a.egm_id, "ok": True,
+                                 "via": "sas", "alreadyApplied": True})
+                continue
             v = {"egmId": a.egm_id, "ok": False}
             if not opt:
                 v["error"] = ("voucher text fields not in the config-sync "
@@ -19433,6 +19575,8 @@ class G2SHost:
         was saved. A number of days is re-applied at every join; "never"
         (0, also what a hub that was never given a number holds) is left
         to the Save, so a hub nobody has configured changes nothing."""
+        if self.linked_leg(assoc):
+            return      # the linked-machine rule: SAS sets its ticket data
         hdr = self.ticket_header()
         if not hdr.get("propName") and not int(hdr.get("expireDays") or 0):
             return
@@ -19514,6 +19658,8 @@ class G2SHost:
         Read-probe, never model-branch: a machine that does not advertise
         the option is skipped on the read, one already at target costs
         zero option-change cycles (enable_remote_handpay's no-op guard)."""
+        if self.linked_leg(assoc):
+            return      # the linked-machine rule: its reset goes over SAS
         with assoc.lock:
             if assoc.handpay_arm_epoch == assoc.epoch:
                 return
@@ -19603,6 +19749,12 @@ class G2SHost:
                 opt = a.config_options.get(f"{dc}/{di}/{gid}/{oid}")
                 opt = dict(opt) if opt else None
             if not online:
+                continue
+            if self.linked_leg(a):
+                # the linked-machine rule: its ticket expiry is set over SAS
+                verdicts.append({"egmId": a.egm_id, "ok": True,
+                                 "via": "sas", "days": days,
+                                 "alreadyApplied": True})
                 continue
             v = {"egmId": a.egm_id, "ok": False, "days": days}
             if not opt:
@@ -19913,7 +20065,8 @@ class G2SHost:
             # page had nothing to show. Arm ONE deferred re-read. Triggered by
             # the REJECTION itself, never by "we have no data yet" — absence
             # races with an answer still in flight.
-            if req["class"] == "wat" and rerr == "G2S_APX003":
+            if req["class"] == "wat" and rerr == "G2S_APX003" \
+                    and not self.linked_leg(assoc):
                 self._arm_wat_reprobe(assoc)
             # Glass sequencer fail-fast (live-hit 2026-07-10: MDX003 "Must
             # release loaded content." rejected the load itself): a
@@ -20744,7 +20897,13 @@ class G2SHost:
                     # leaves clock_sync at sent -> lazy timeout (no retry).
                     big_skew = skew is not None and \
                         abs(skew) > CLOCK_SKEW_SYNC_SEC
-                    if big_skew and self.auto_clock:
+                    if big_skew and self.linked_leg(assoc):
+                        log.warning("[%s] 🕒 EGM clock skew %+.1fs exceeds "
+                                    "%ds. This machine has a SAS link: its "
+                                    "clock is set from the SAS side, "
+                                    "nothing is sent over G2S", assoc.egm_id,
+                                    skew, CLOCK_SKEW_SYNC_SEC)
+                    elif big_skew and self.auto_clock:
                         log.info("=" * 64)
                         log.info("🕒 [%s] AUTO CLOCK-SYNC — EGM clock skew "
                                  "%+.1fs exceeds %ds; sending cabinet."
@@ -20806,7 +20965,11 @@ class G2SHost:
                     # harvest, so it uses that; only a first-ever join falls
                     # back to the ("1","2") every IGT cabinet has answered to,
                     # and a join-window refusal arms the deferred re-probe.
-                    for wat_dev in (self._known_wat_ids(assoc) or ("1", "2")):
+                    # Not for a machine with a SAS link: its transfers are
+                    # SAS's, and the Bluebird refuses each of these reads.
+                    for wat_dev in (() if self.linked_leg(assoc) else
+                                    (self._known_wat_ids(assoc)
+                                     or ("1", "2"))):
                         self.enqueue_get_wat_status(assoc, wat_dev,
                                                     epoch=epoch)
                         self.enqueue_get_wat_profile(assoc, wat_dev,
@@ -26300,6 +26463,17 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
             _leg = engine.sas_links.get(_target) if _target else None
             if _leg:
                 return self._add_credits_via_sas(engine, _target, _leg, req)
+        # The linked-machine rule for every other command (the owner,
+        # 2026-11-18: SAS for all commands on a machine with a SAS link).
+        # Here for the same reason as addCredits above: every client gets
+        # the right wire without knowing about linking, and the SAS leg
+        # works while the G2S leg is down.
+        _leg = engine.sas_links.get(egm_id) if egm_id else None
+        if _leg:
+            routed = engine.linked_command(action, egm_id, _leg, req)
+            if routed is not None:
+                return self._send(routed[0], json.dumps(routed[1]),
+                                  "application/json", soap=False)
         with engine.assoc_lock:
             egms = list(engine.associations)
             if egm_id:
@@ -26962,6 +27136,13 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                 # reset the pending lockup to credits — the SAME reset a
                 # reset-fob fires. A specific transactionId keys THAT lockup
                 # off; omitted keys the NEWEST (the one the operator just saw).
+                # A machine with a SAS link is reset over SAS (the
+                # linked-machine rule).
+                _leg = engine.linked_leg(egm_id)
+                if _leg:
+                    code, payload = engine.linked_command(
+                        "clearHandpay", egm_id, _leg, req)
+                    return done(code, payload)
                 txn = req.get("transactionId")
                 if txn is not None:
                     txn = str(txn)
