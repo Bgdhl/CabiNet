@@ -3594,6 +3594,503 @@ def ticket_expiry_by_the_hub():
           and len(ran) == 1)
 
 
+# ---------------------------------------------------------------------------
+# Batch 6: cabinet and events
+
+def sent_to(host, mark, command):
+    """The class-level deviceId of every message since `mark` that carried
+    that command."""
+    out = []
+    for _l, xml in host.sent[mark:]:
+        body = ET.fromstring(xml).find(f"{{{gh.SCHEMA_NS}}}g2sBody")
+        for cls in (body if body is not None else []):
+            if any(gh.localname(c.tag) == command for c in cls):
+                out.append(cls.get(f"{{{gh.SCHEMA_NS}}}deviceId"))
+    return out
+
+
+def descriptors(*devices):
+    """A descriptorList: (deviceClass, deviceId, active)."""
+    return "<g2s:descriptorList>" + "".join(
+        f'<g2s:descriptor g2s:deviceClass="{c}" g2s:deviceId="{i}" '
+        f'g2s:deviceActive="{a}" g2s:vendorId="X" g2s:productId="X" '
+        f'g2s:releaseNum="1" g2s:vendorName="X" g2s:productName="X" '
+        f'g2s:serialNum="1"/>' for c, i, a in devices) \
+        + "</g2s:descriptorList>"
+
+
+def cabinet_status(**attrs):
+    return "<g2s:cabinetStatus " + " ".join(
+        f'g2s:{k}="{v}"' for k, v in attrs.items()) \
+        + ' g2s:egmState="G2S_enabled"/>'
+
+
+def status_read(host, egm, **attrs):
+    """The machine's answer to a getCabinetStatus the host makes (as at a
+    join). Returns what the host sent on the strength of it."""
+    host.enqueue_get_cabinet_status(egm.assoc)
+    drain(host, egm.assoc)
+    mark = len(host.sent)
+    answer_to(egm, "cabinet", "getCabinetStatus", cabinet_status(**attrs))
+    return sent_since(host, mark)
+
+
+def item_46_which_device():
+    print("— audit item 46: a machine has one active cabinet device and one "
+          "active handpay device; the document does not say they are "
+          "number 1 (§3.1, §11.1), and a host's eventHandler and meters "
+          "devices are the ones numbered as the host is (§4.1, §5.2)")
+    host = make_host()
+    egm = online(joined(host, "BTB_devices"))
+    a = egm.assoc
+    mark = len(host.sent)
+    host.enqueue_get_cabinet_status(a)
+    drain(host, a)
+    check("before the machine's device list is in: device 1",
+          sent_to(host, mark, "getCabinetStatus") == ["1"])
+    host.enqueue_get_descriptor(a)
+    drain(host, a)
+    answer_to(egm, "communications", "getDescriptor", descriptors(
+        ("G2S_cabinet", 1, "false"), ("G2S_cabinet", 3, "true"),
+        ("G2S_handpay", 2, "true")))
+    drain(host, a)
+    mark = len(host.sent)
+    host.enqueue_get_cabinet_status(a)
+    host.enqueue_set_cabinet_state(a, enable=False, disable_text="x")
+    host.enqueue_get_handpay_log(a)
+    drain(host, a)
+    check("cabinet commands go to the cabinet device the machine marks "
+          "active (they all went to 1)",
+          set(sent_to(host, mark, "getCabinetStatus")) == {"3"}
+          and sent_to(host, mark, "setCabinetState") == ["3"],
+          sent_to(host, mark, "getCabinetStatus"))
+    check("and the handpay log is read from its handpay device",
+          sent_to(host, mark, "getHandpayLog") == ["2"],
+          sent_to(host, mark, "getHandpayLog"))
+    a.handpay_arm_epoch = -1
+    mark = len(host.sent)
+    host._maybe_arm_remote_handpay_on_join(a)
+    drain(host, a)
+    asked = asks(sent_since(host, mark), "getOptionList")
+    check("as are its handpay options at a join",
+          asked and asked[-1].get("deviceClass") == "G2S_handpay"
+          and asked[-1].get("deviceId") == "2", asked)
+    mark = len(host.sent)
+    answer_to(egm, "optionConfig", "getOptionList", handpay_options().replace(
+        'g2s:deviceClass="G2S_handpay" g2s:deviceId="1"',
+        'g2s:deviceClass="G2S_handpay" g2s:deviceId="2"'))
+    sent = values_sent(sent_since(host, mark))
+    check("and the change that follows is for that device",
+          sent is not None and sent.get("G2S_enabledRemoteCredit") == "true",
+          sent)
+
+    host = make_host()
+    host.host_id = "7"
+    egm = online(joined(host, "BTB_host7"))
+    egm.host_no = "7"
+    a = egm.assoc
+    mark = len(host.sent)
+    host.enqueue_set_event_sub(a)
+    host.enqueue_get_event_handler_log(a)
+    host.enqueue_get_meter_info(a)
+    drain(host, a)
+    check("a hub that is host 7 addresses eventHandler 7 and meters 7 "
+          "(both went to 1, another host's)",
+          sent_to(host, mark, "setEventSub") == ["7"]
+          and sent_to(host, mark, "getEventHandlerLog") == ["7"]
+          and sent_to(host, mark, "getMeterInfo") == ["7"],
+          (sent_to(host, mark, "setEventSub"),
+           sent_to(host, mark, "getMeterInfo")))
+
+
+def item_48_a_text_no_longer_than_its_type():
+    print("— audit item 48: disableText is a textMessage, 256 characters "
+          "at most (Appendix A, Table A.1)")
+    check("a longer text is cut, and a control character taken out",
+          len(gh.text_message("x" * 300)) == 256
+          and gh.text_message("ab\x07cd\n") == "ab cd "
+          and gh.text_message(None) == "" and gh.text_message("ok") == "ok")
+    host = make_host()
+    egm = online(joined(host, "BTB_text"))
+    a = egm.assoc
+    long_text = "L" * 300
+    mark = len(host.sent)
+    host.enqueue_set_cabinet_state(a, enable=False, disable_text=long_text)
+    host.enqueue_set_game_play_state(a, enable=False, disable_text=long_text)
+    host.enqueue_set_voucher_state(a, enable=False, disable_text=long_text)
+    host.enqueue_set_note_acceptor_state(a, enable=False,
+                                         disable_text=long_text)
+    drain(host, a)
+    lengths = {n: len(x.get("disableText", "")) for _c, n, x, _e
+               in sent_since(host, mark) if n.startswith("set")}
+    check("every state command carries no more than 256 (they went out "
+          "at any length, and a machine that checks the schema rejects "
+          "the command)", lengths == {
+              "setCabinetState": 256, "setGamePlayState": 256,
+              "setVoucherState": 256, "setNoteAcceptorState": 256}, lengths)
+
+
+def item_44_cabinet_status_defaults():
+    print("— audit item 44: enableGamePlay, enableMoneyIn and "
+          "enableMoneyOut default to true in a cabinetStatus (Table 3.3)")
+    host = make_host()
+    egm = online(joined(host, "BTB_flags"))
+    a = egm.assoc
+    status_read(host, egm, hostEnabled="false", enableGamePlay="false")
+    status_read(host, egm, hostEnabled="true")
+    check("left out of a later status, the partial lock reads as off "
+          "again (it kept reading false)",
+          a.cabinet.get("enableGamePlay") == "true"
+          and a.cabinet.get("enableMoneyIn") == "true"
+          and a.cabinet.get("hardMetersDisconnected") == "false",
+          {k: a.cabinet.get(k) for k in ("enableGamePlay", "enableMoneyIn")})
+    host.enqueue_set_cabinet_state(a, enable=False, disable_text="x",
+                                   enable_game_play=False)
+    drain(host, a)
+    answer_to(egm, "cabinet", "setCabinetState",
+              cabinet_status(hostEnabled="false"))
+    check("a partial lock the machine does not echo is not \"confirmed\"",
+          a.cabinet_state_change.get("result") == "disagree",
+          a.cabinet_state_change)
+    host.enqueue_set_cabinet_state(a, enable=False, disable_text="x",
+                                   enable_game_play=False)
+    drain(host, a)
+    answer_to(egm, "cabinet", "setCabinetState", cabinet_status(
+        hostEnabled="false", enableGamePlay="false"))
+    check("one it does echo is", a.cabinet_state_change.get("result")
+          == "confirmed", a.cabinet_state_change)
+
+
+def item_47_a_door_opened_with_the_power_off():
+    print("— audit item 47: G2S_CBE317/318/319 report a door \"opened when "
+          "EGM power has been removed\" (§3.27.2-4); G2S_CBE324 is the "
+          "power loss")
+    host = make_host()
+    egm = online(joined(host, "BTB_door"))
+    event(egm, "G2S_CBE318", cls="G2S_cabinet")
+    first = host.activity[0] if host.activity else {}
+    check("it is filed as a door opening, marked as found at power-up (it "
+          "was filed as a power loss)", first.get("hook") == "door_open"
+          and (first.get("extras") or {}).get("door") == "auxiliary"
+          and (first.get("extras") or {}).get("whilePowerOff") is True,
+          first)
+    event(egm, "G2S_CBE324", cls="G2S_cabinet")
+    check("a loss of power is still that",
+          host.activity[0].get("hook") == "power_loss", host.activity[0])
+
+
+def event_xml(code, event_id, when, cls="G2S_cabinet", dev="1"):
+    return (f'<g2s:eventReport g2s:deviceClass="{cls}" g2s:deviceId="{dev}" '
+            f'g2s:eventCode="{code}" g2s:eventId="{event_id}" '
+            f'g2s:eventDateTime="{when}" g2s:transactionId="0"/>')
+
+
+def event_log(*entries):
+    """An eventHandlerLogList: (logSequence, code, eventId, when, acked)."""
+    return "<g2s:eventHandlerLogList>" + "".join(
+        f'<g2s:eventHandlerLog g2s:logSequence="{seq}" '
+        f'g2s:deviceClass="G2S_cabinet" g2s:deviceId="1" '
+        f'g2s:eventCode="{code}" g2s:eventId="{eid}" '
+        f'g2s:eventDateTime="{when}" g2s:eventAck="{acked}"/>'
+        for seq, code, eid, when, acked in entries) \
+        + "</g2s:eventHandlerLogList>"
+
+
+def item_50_an_event_the_machine_is_still_sending():
+    print("— audit item 50: a log entry with eventAck false is an event "
+          "the machine \"must\" still retry \"until acknowledged\" (§1.16)")
+    host = make_host()
+    egm = online(joined(host, "BTB_backfill"))
+    a = egm.assoc
+    t1, t2 = "2026-11-17T09:00:01.000-05:00", "2026-11-17T09:00:02.000-05:00"
+    host.enqueue_get_event_handler_log(a)
+    drain(host, a)
+    answer_to(egm, "eventHandler", "getEventHandlerLog", event_log(
+        (1, "G2S_CBE307", 900, t1, "false"),
+        (2, "G2S_CBE305", 901, t2, "true")))
+    count = a.event_count
+    tape = len(host.activity)
+    got = egm.send("eventHandler", event_xml("G2S_CBE307", 900, t1))
+    check("its retry, arriving after the log was read, is handled as the "
+          "event it is: on the tape, and acknowledged (it was taken for a "
+          "repeat and dropped)", len(host.activity) == tape + 1
+          and host.activity[0].get("hook") == "door_open"
+          and "eventAck" in names(got), names(got))
+    check("and counted once", a.event_count == count
+          and sum(1 for e in a.events if e.get("eventId") == "900") == 1,
+          a.event_count)
+    tape = len(host.activity)
+    got = egm.send("eventHandler", event_xml("G2S_CBE305", 901, t2))
+    check("an entry the log shows as acknowledged is still a repeat",
+          len(host.activity) == tape and "eventAck" in names(got))
+    egm.send("eventHandler", event_xml("G2S_CBE303", 950,
+                                       "2026-11-17T09:00:03.000-05:00"))
+    tape = len(host.activity)
+    egm.resend()
+    check("and so is an event delivered live and then delivered again",
+          len(host.activity) == tape
+          and sum(1 for e in a.events if e.get("eventId") == "950") == 1)
+
+
+def item_45_a_button_press_delivered_late():
+    print("— audit item 45: a service-button event raised while the hub "
+          "was away is re-sent when it returns (§4.1.4), which is not a "
+          "press now")
+    host = make_host()
+    egm = online(joined(host, "BTB_button"))
+    a = egm.assoc
+
+    def stamped(seconds_ago):
+        when = datetime.now().astimezone() - timedelta(seconds=seconds_ago)
+        return when.isoformat(timespec="milliseconds")
+
+    def pressed(seconds_ago, code="G2S_CBE301"):
+        a.glass_button_ts = 0.0
+        a.glass_button_code = None
+        try:
+            host._glass_service_button({"egmId": egm.egm_id, "code": code,
+                                        "dateTime": stamped(seconds_ago)})
+        except Exception:               # no display to drive in the gate
+            pass
+        return a.glass_button_ts > 0
+    a.egm_clock_skew_sec = 0.0
+    check("a press from ten minutes ago, delivered now, is not acted on "
+          "(it opened or closed the player menu then)",
+          pressed(600) is False)
+    check("a press from a few seconds ago is", pressed(5) is True)
+    a.egm_clock_skew_sec = -40.0        # the machine's clock runs behind
+    check("a machine whose clock runs 40 seconds behind stamps a fresh "
+          "press 40 seconds old: it is acted on", pressed(40) is True)
+    a.egm_clock_skew_sec = 40.0         # the machine's clock runs ahead
+    check("and one whose clock runs 40 seconds ahead stamps a press from "
+          "half a minute ago as ten seconds in the future: it is not",
+          pressed(-10) is False)
+    a.egm_clock_skew_sec = None         # not measured yet
+    check("with its clock not yet compared, a press within the 30 "
+          "seconds the hub leaves a clock alone is acted on",
+          pressed(30) is True and pressed(120) is False)
+
+
+def item_15_a_lock_and_a_machine_restart():
+    print("— audit item 15, decided: the document has a machine set "
+          "hostEnabled at restart from its restartStatus (§1.20.3); the "
+          "machines on the owner's floor keep a host lock until the host "
+          "lifts it. The hub sends no lock or unlock by itself")
+    host = make_host()
+    egm = online(joined(host, "BTB_lock"))
+    a = egm.assoc
+    host.enqueue_set_cabinet_state(a, enable=False,
+                                   disable_text="Floor locked by the hub")
+    drain(host, a)
+    answer_to(egm, "cabinet", "setCabinetState",
+              cabinet_status(hostEnabled="false"))
+    egm.comms_online(reset=True)                    # the machine restarts
+    online(egm)
+    got = status_read(host, egm, hostEnabled="true")
+    check("a machine locked from the hub that comes back enabled is left "
+          "as it comes back", asks(got, "setCabinetState") == [], got)
+    got = status_read(host, egm, hostEnabled="false")
+    check("and one that comes back still locked is left locked",
+          asks(got, "setCabinetState") == [], got)
+    host.enqueue_set_cabinet_state(a, enable=True)
+    drain(host, a)
+    answer_to(egm, "cabinet", "setCabinetState",
+              cabinet_status(hostEnabled="true"))
+    egm.comms_online(reset=True)
+    online(egm)
+    got = status_read(host, egm, hostEnabled="false")
+    check("a machine last enabled from the hub that comes back disabled "
+          "is not enabled by the hub", asks(got, "setCabinetState") == [],
+          got)
+    check("nothing about a lock is kept in the machine's stored facts",
+          "cabinetWanted" not in (host.config_store.get(egm.egm_id) or {})
+          and "cabinetWanted" not in a.snapshot())
+
+
+def supported(*pairs):
+    return "<g2s:supportedEvents>" + "".join(
+        f'<g2s:supportedEvent g2s:deviceClass="{c}" g2s:deviceId="1" '
+        f'g2s:eventCode="{e}" g2s:eventText="x"/>' for c, e in pairs) \
+        + "</g2s:supportedEvents>"
+
+
+CATALOG = (("G2S_cabinet", "G2S_CBE307"), ("G2S_gamePlay", "G2S_GPE103"),
+           ("G2S_gamePlay", "G2S_GPE112"), ("G2S_gamePlay", "G2S_GPE111"),
+           ("G2S_handpay", "G2S_JPE101"))
+
+
+def subscriptions(cmds):
+    """{eventCode: eventPersist} of the newest setEventSub in there."""
+    for _c, name, _a, el in reversed(cmds):
+        if name == "setEventSub":
+            return {s.get(f"{{{gh.SCHEMA_NS}}}eventCode"):
+                    s.get(f"{{{gh.SCHEMA_NS}}}eventPersist") for s in el}
+    return None
+
+
+def the_catalog_arrives(host, egm):
+    a = egm.assoc
+    host.enqueue_get_supported_events(a)
+    drain(host, a)
+    mark = len(host.sent)
+    answer_to(egm, "eventHandler", "getSupportedEvents", supported(*CATALOG))
+    return mark
+
+
+def items_17_and_49_event_subscriptions():
+    print("— audit item 49: an event asked for with eventPersist is kept "
+          "in the machine's log until acknowledged, and that log is small "
+          "(minLogEntries defaults to 35)")
+    host = make_host()
+    egm = online(joined(host, "BTB_subs"))
+    a = egm.assoc
+    mark = the_catalog_arrives(host, egm)
+    subs = subscriptions(sent_since(host, mark)) or {}
+    check("the two per-game events are asked for without it, the rest "
+          "with it, and the ones the hub does not want not at all (every "
+          "one was persisted: a hub outage filled the log in some "
+          "seventeen games)", subs == {
+              "G2S_CBE307": "true", "G2S_GPE103": "false",
+              "G2S_GPE112": "false", "G2S_JPE101": "true"}, subs)
+    host.enqueue_get_event_handler_profile(a)
+    drain(host, a)
+    answer_to(egm, "eventHandler", "getEventHandlerProfile",
+              '<g2s:eventHandlerProfile g2s:configurationId="0" '
+              'g2s:queueBehavior="G2S_disable" g2s:minLogEntries="35" '
+              'g2s:requiredForPlay="1"/>')
+    check("what the machine does with a full log is kept and shown",
+          a.snapshot().get("eventHandler", {}).get("queueBehavior")
+          == "G2S_disable"
+          and a.event_handler.get("requiredForPlay") == "true",
+          a.event_handler)
+    event(egm, "G2S_EHE102", cls="G2S_eventHandler")
+    check("G2S_EHE102, the log is full: noted",
+          a.snapshot().get("eventQueueFullAt") is not None)
+    mark = len(host.sent)
+    event(egm, "G2S_EHE103", cls="G2S_eventHandler")
+    check("G2S_EHE103, it has room again: cleared, and the log is read "
+          "back", a.event_queue_full_at is None
+          and "getEventHandlerLog" in names(sent_since(host, mark)),
+          names(sent_since(host, mark)))
+
+    print("— audit item 17: the hub clears its subscriptions and then "
+          "sets the list it wants; if that list is refused it held none "
+          "(§4.10: setEventSub can return G2S_EHX001 or G2S_EHX003)")
+    host = make_host()
+    egm = online(joined(host, "BTB_subs_refused"))
+    a = egm.assoc
+    a.subscribed = True
+    mark = the_catalog_arrives(host, egm)
+    check("from the clear until the new list is acknowledged the hub says "
+          "it is not subscribed (it went on saying it was)",
+          [n for n in names(sent_since(host, mark))
+           if n.endswith("EventSub")] == ["clearEventSub", "setEventSub"]
+          and a.subscribed is False, names(sent_since(host, mark)))
+    sid = [s for s, r in a.sent_requests.items()
+           if r["command"] == "setEventSub"][-1]
+    mark = len(host.sent)
+    egm.refuse("eventHandler", sid, "G2S_EHX003")
+    subs = subscriptions(sent_since(host, mark)) or {}
+    check("the list is refused: the wildcard is asked for, so that events "
+          "still arrive (nothing was sent, and no event came until the "
+          "next sign-on)", subs == {"G2S_all": "true"}, subs)
+    answer_to(egm, "eventHandler", "setEventSub", "<g2s:setEventSubAck/>")
+    check("acknowledged: subscribed again", a.subscribed is True)
+    host.enqueue_set_event_sub(a, wildcard=True)
+    drain(host, a)
+    sid = [s for s, r in a.sent_requests.items()
+           if r["command"] == "setEventSub"][-1]
+    mark = len(host.sent)
+    egm.refuse("eventHandler", sid, "G2S_EHX003")
+    check("a refused wildcard is not asked for again in a loop",
+          subscriptions(sent_since(host, mark)) is None
+          and a.subscribed is False)
+
+    print("— the list is sent and nothing comes back")
+    host = make_host()
+    egm = online(joined(host, "BTB_subs_silent"))
+    a = egm.assoc
+    the_catalog_arrives(host, egm)
+    mark = len(host.sent)
+    host.sweep_event_subs()
+    drain(host, a)
+    check("it is given time", subscriptions(sent_since(host, mark)) is None)
+    a.eventsub_cleared_at -= host.EVENT_SUB_ACK_SEC + 1
+    host.sweep_event_subs()
+    host.sweep_event_subs()
+    drain(host, a)
+    wild = [1 for _c, n, _a, el in sent_since(host, mark)
+            if n == "setEventSub"]
+    check("then the wildcard is asked for, once per sign-on",
+          len(wild) == 1 and subscriptions(sent_since(host, mark))
+          == {"G2S_all": "true"}, len(wild))
+    host = make_host()
+    egm = online(joined(host, "BTB_subs_acked"))
+    a = egm.assoc
+    the_catalog_arrives(host, egm)
+    answer_to(egm, "eventHandler", "setEventSub", "<g2s:setEventSubAck/>")
+    a.eventsub_cleared_at = time.time() - 600
+    mark = len(host.sent)
+    host.sweep_event_subs()
+    drain(host, a)
+    check("an acknowledged list is left alone",
+          subscriptions(sent_since(host, mark)) is None)
+
+
+def items_43_and_53_restarting_a_machine():
+    print("— audit items 43 and 53: a restart the hub asks for cuts across "
+          "whatever is in progress (§3.16: \"the host should first attempt "
+          "to disable the EGM\"; the restart script asks for "
+          "G2S_immediate)")
+    host = make_host()
+    egm = online(joined(host, "BTB_restart"))
+    a = egm.assoc
+    mark = len(host.sent)
+    r = host.enqueue_reboot_script(a)
+    drain(host, a)
+    check("with nothing in progress the restart script goes out as "
+          "before", r is None and names(sent_since(host, mark))
+          == ["setDownloadState", "setScript"], names(sent_since(host, mark)))
+    egm.handpay_request(5_000_000)
+    mark = len(host.sent)
+    r1 = host.enqueue_reboot_script(a)
+    r2 = host.enqueue_reset_processor(a)
+    drain(host, a)
+    check("with a handpay waiting, neither restart is sent, and the "
+          "answer says why (both went out regardless)",
+          sent_since(host, mark) == [] and r1.get("ok") is False
+          and r2.get("ok") is False
+          and "handpay" in r1.get("error", ""), (r1, r2))
+    mark = len(host.sent)
+    host.enqueue_reboot_script(a, force=True)
+    host.enqueue_reset_processor(a, force=True)
+    drain(host, a)
+    check("unless the caller insists",
+          sorted(names(sent_since(host, mark))) == [
+              "resetProcessor", "setDownloadState", "setScript"],
+          names(sent_since(host, mark)))
+    host = make_host()
+    egm = online(joined(host, "BTB_restart_wat"))
+    a = egm.assoc
+    host.start_wat_credit_push(a, cashable=100_000)
+    drain(host, a)
+    r = host.enqueue_reboot_script(a)
+    check("a transfer in progress holds it too",
+          isinstance(r, dict) and "transfer" in r.get("error", ""), r)
+    host = make_host()
+    egm = online(joined(host, "BTB_restart_config"))
+    a = egm.assoc
+    a.optionconfig_stage = "authorizing"
+    r1 = host.enqueue_reboot_script(a)
+    a.optionconfig_stage = None
+    a.denom_ceremony = {"stage": "writing", "dev": "1"}
+    r2 = host.enqueue_reboot_script(a)
+    check("and so does an option change or a denomination change that is "
+          "running", isinstance(r1, dict) and "option change" in r1["error"]
+          and isinstance(r2, dict) and "denomination" in r2["error"],
+          (r1, r2))
+
+
 def main():
     logging.basicConfig(level=logging.CRITICAL + 1)
     logging.getLogger("g2s_host").setLevel(logging.CRITICAL + 1)
@@ -3636,6 +4133,15 @@ def main():
     item_54_never_expires()
     the_expiry_follows_the_machine()
     ticket_expiry_by_the_hub()
+    item_46_which_device()
+    item_48_a_text_no_longer_than_its_type()
+    item_44_cabinet_status_defaults()
+    item_47_a_door_opened_with_the_power_off()
+    item_50_an_event_the_machine_is_still_sending()
+    item_45_a_button_press_delivered_late()
+    item_15_a_lock_and_a_machine_restart()
+    items_17_and_49_event_subscriptions()
+    items_43_and_53_restarting_a_machine()
     print("=" * 50)
     print(f"RESULT: {_p} passed, {_f} failed")
     return 1 if _f else 0

@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.3.24
+Sixth batch from the G2S audit: the cabinet and events. Eleven items,
+one of them (a lock and a machine restart) settled with no change: a
+machine locked from the hub stays locked until the hub unlocks it, and
+the hub sends no lock or unlock by itself.
+- **The hub is not left with no event subscription.** At each sign-on
+  it clears its subscriptions and sets the list it wants. If the
+  machine refused that list, or never acknowledged it, the hub held
+  none and went on showing "subscribed". It now asks for everything
+  instead, and shows "not subscribed" in between.
+- **Game started and game ended are no longer kept by the machine until
+  acknowledged.** A machine holds only so many unsent events for the
+  hub (35 by default). With the hub off and a machine being played,
+  those two filled it in about seventeen games, and the machine then
+  dropped events or switched its event handler off. The hub also now
+  says when a machine reports that its event log is full, and reads the
+  log back when it clears.
+- **An event first seen in the machine's log is still handled when the
+  machine sends it.** It was taken for a repeat: a bill stacked while
+  the hub was away could miss the count.
+- **A service-button press delivered late is not acted on.** A press
+  made while the hub was unreachable arrived when it came back and
+  opened or closed the player menu then.
+- **The hub refuses to restart a machine while it knows something is in
+  progress on it**: a handpay waiting, a transfer, an option or
+  denomination change. The command API can insist.
+- Commands go to the cabinet and handpay devices the machine marks as
+  active, and to the event and meter devices numbered as the hub is,
+  not always to number 1.
+- A lock text is cut to the 256 characters a machine accepts.
+- A door found open when the power came back is filed as a door
+  opening, not as a power loss.
+- A partial lock the machine did not apply is no longer shown as
+  confirmed, and one that was lifted no longer goes on showing.
+
 ## v0.3.23
 Ticket expiry, kept by the hub.
 - **A ticket is good through the date on it and no longer.** The date is
