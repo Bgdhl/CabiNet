@@ -855,6 +855,9 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   // at all (the proven AVP path stays byte-identical). ES5 only.
   var LANE_W = 840, LANE_H = 292;
   var layoutMode = '', layoutW = 256, layoutH = 1024, layoutFromHub = false;
+  // fitFigure's off-screen ruler and what it last measured per element
+  // (declared here, ahead of everything that paints)
+  var ruler = null, fitSeen = {};
   function applyLayout(w, h, fromHub) {
     w = Number(w) || 0; h = Number(h) || 0;
     if (!(w > 0 && h > 0)) { return; }
@@ -1198,6 +1201,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
       setText('wl-chip' + i, CUR + String(CHIPS[i] / 100));
     }
     setText('wl-custom', fmtCents(selCents));
+    fitAmountButton();
   }
   // paint a money string; a below-zero amount goes RED (house rule: negative
   // balances read red on every surface). '' hands the color back to the
@@ -1268,8 +1272,11 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     // string; a leading '-$' is the whole signal)
     setMoney('ph-credits', credits ? ('CREDITS  ' + credits) : '');
     setStyle($('ph-credits'), 'display', credits ? 'block' : 'none');
-    setStyle($('ph-credits'), 'fontSize',
-      (credits && credits.length > 14) ? '13px' : '17px');
+    // "CREDITS  $x" in the 232px tall lane (380px wide lane)
+    if (!fitFigure('ph-credits', layoutMode === 'wide' ? 376 : 228, 17, 10)) {
+      setStyle($('ph-credits'), 'fontSize',
+        (credits && credits.length > 14) ? '13px' : '17px');
+    }
     setMoney('wl-bal', credits || '\u2014');
     paintWalletKind();      // Free Slot Play line + rows, and the figure fit
     // footer = just the gameroom name (the raw UTC "in since HH:MM" was
@@ -1507,10 +1514,49 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     setText('wl-add', coUseRestr ? 'ADD FREE PLAY' : 'ADD CREDITS');
     fitWalletFigures();
   }
+  // ---- figures that stay on the glass ------------------------------------
+  // A figure is one line in a fixed lane. Its width is MEASURED, in an
+  // off-screen ruler at the figure's full size, and the font is scaled
+  // down until it fits. Digit widths differ between renderers, so a size
+  // picked by counting characters fits one and clips on another: on the
+  // AVP $100,000.00 ran off both edges of the keypad and the wallet
+  // balance lost its last digit (2026-11-17). Measured again only when
+  // the text, the lane or the full size changes (no style churn on the
+  // polls). Returns false when the ruler cannot measure; the caller then
+  // keeps its own size.
+  function fitFigure(id, lane, maxPx, minPx, track) {
+    var el = $(id), f = el.firstChild;
+    var s = f ? String(f.nodeValue) : '';
+    var key = s + '|' + lane + '|' + maxPx;
+    if (fitSeen[id] === key) { return true; }
+    if (!ruler) {
+      ruler = document.createElement('span');
+      ruler.style.cssText = 'position:absolute;left:-9999px;top:-9999px;' +
+        'visibility:hidden;white-space:nowrap;font-weight:bold;';
+      ruler.appendChild(document.createTextNode(''));
+      document.body.appendChild(ruler);
+    }
+    track = track || 0;
+    ruler.style.fontSize = maxPx + 'px';
+    ruler.style.letterSpacing = track + 'px';
+    ruler.firstChild.nodeValue = s;
+    var w = ruler.offsetWidth;
+    if (!(w > 0)) { return false; }
+    var px = maxPx, gaps = s.length * track;
+    if (w > lane && w > gaps) {
+      // the spacing between characters does not shrink with the font
+      px = Math.floor(maxPx * (lane - gaps) / (w - gaps));
+      if (px < minPx) { px = minPx; }
+    }
+    setStyle(el, 'fontSize', px + 'px');
+    fitSeen[id] = key;
+    return true;
+  }
   // the balance column clips silently on long figures, so step the font
   // DOWN: every digit stays on the glass. One balance keeps the sizes it
   // always had; the radio rows are narrower (180px tall lane, 142px wide
-  // lane) and start smaller.
+  // lane) and start smaller. These tables are what is used when the
+  // ruler above cannot measure.
   function figLen(id) {
     var f = $(id).firstChild;
     return f ? String(f.nodeValue).length : 0;
@@ -1523,13 +1569,23 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   }
   function fitWalletFigures() {
     var n = figLen('wl-bal');
-    setStyle($('wl-bal'), 'fontSize', coRestrMc > 0 ? rowFigSize(n)
-      : (n <= 11 ? '40px' : n <= 13 ? '32px' : n <= 16 ? '26px' : '20px'));
-    setStyle($('wl-fsp'), 'fontSize', rowFigSize(figLen('wl-fsp')));
+    var wide = (layoutMode === 'wide'), rows = coRestrMc > 0;
+    // lanes: the CSS widths (232 / 180 tall, 380 / 142 wide) less 4px
+    var rowLane = wide ? 138 : 176, rowMax = wide ? 20 : 24;
+    if (!fitFigure('wl-bal', rows ? rowLane : (wide ? 376 : 228),
+                   rows ? rowMax : (wide ? 38 : 40), 11)) {
+      setStyle($('wl-bal'), 'fontSize', rows ? rowFigSize(n)
+        : (n <= 11 ? '40px' : n <= 13 ? '32px' : n <= 16 ? '26px' : '20px'));
+    }
+    if (!fitFigure('wl-fsp', rowLane, rowMax, 11)) {
+      setStyle($('wl-fsp'), 'fontSize', rowFigSize(figLen('wl-fsp')));
+    }
     // home line: "FREE SLOT PLAY  $x" in the 232px tall lane
     var h = figLen('ph-fsp');
-    setStyle($('ph-fsp'), 'fontSize', (layoutMode === 'wide') ? ''
-      : (h <= 26 ? '' : h <= 30 ? '13px' : '11px'));
+    if (!fitFigure('ph-fsp', wide ? 376 : 228, wide ? 16 : 15, 10)) {
+      setStyle($('ph-fsp'), 'fontSize', wide ? ''
+        : (h <= 26 ? '' : h <= 30 ? '13px' : '11px'));
+    }
   }
   function pickWalletKind(restr) {
     if (!coRestrMc) { return; }
@@ -1547,7 +1603,13 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     // the amount button carries the live selection (tap it to type a custom
     // one); dims with the chips when funding is unavailable.
     setText('wl-custom', fmtCents(selCents));
+    fitAmountButton();
     $('wl-custom').className = coCanFund ? '' : 'chip-off';
+  }
+  // the amount button: 232px tall lane, 136px wide lane, 1px tracking
+  function fitAmountButton() {
+    var wide = (layoutMode === 'wide');
+    fitFigure('wl-custom', wide ? 124 : 220, wide ? 24 : 28, 11, 1);
   }
   function setWalletToggleFace() {
     setText('wl-toggle', 'TO WALLET  ' + (coCashToWat ? 'ON' : 'OFF'));
@@ -1571,14 +1633,21 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
       var dots = '', di;
       for (di = 0; di < kpPin.length; di++) { dots += '\u2022'; }
       setText('kp-amt', dots || '\u00a0');   // never the digits
+      fitKeypadFigure();
       return;
     }
     setText('kp-amt', fmtCents(kpCents));
+    fitKeypadFigure();
     var msg = '';
     if (coWalletMc !== null && kpCents * 1000 > coWalletMc) {
       msg = 'More than your wallet (' + fmtMc(coWalletMc) + ')';
     }
     setText('kp-msg', msg);
+  }
+  // the keypad's figure: 232px tall lane at 44px, 840px wide lane at 34px
+  function fitKeypadFigure() {
+    var wide = (layoutMode === 'wide');
+    fitFigure('kp-amt', wide ? 820 : 226, wide ? 34 : 44, 14);
   }
   function kpDigit(d) {
     if (kpMode === 'pin') {
