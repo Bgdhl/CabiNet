@@ -45,6 +45,7 @@ import sys
 import tempfile
 import threading
 import time
+from datetime import datetime, timedelta
 import xml.etree.ElementTree as ET
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -3473,6 +3474,126 @@ def the_expiry_follows_the_machine():
           changed_options(sent_since(host, mark)))
 
 
+# ---------------------------------------------------------------------------
+# Ticket expiry by the hub (v0.3.23; asked for by the owner, not an audit
+# item)
+
+def ticket_expiry_by_the_hub():
+    print("— a ticket is good through the date on it, by the hub's own "
+          "number of days, and no longer (the owner: \"No grace\")")
+    days = {"propName": None, "line1": None, "line2": None,
+            "titleCash": None, "expireDays": 30, "rev": 1}
+    host = make_host()
+    host.ticket_header = lambda: dict(days)
+    egm = joined(host, "BTB_good_through")
+    store = host.voucher_store
+    ids = store.state["issuedIds"]
+    egm.get_validation_data(8)
+
+    def printed(days_ago):
+        vid, _t, _a = egm.issue_voucher(400_000)
+        when = datetime.now().astimezone() - timedelta(days=days_ago)
+        with store.lock:
+            ids[vid]["issuedAt"] = when.isoformat(timespec="milliseconds")
+        return vid
+
+    def presented(vid):
+        _t, auth = egm.redeem_voucher(vid)
+        return auth or {}
+    last_day = printed(30)
+    day_after = printed(31)
+    check("a ticket a G2S machine prints is stamped with the hub's days "
+          "(it had no expiry at all: the paper said 30 days and the hub "
+          "redeemed it for ever)", ids[last_day].get("expireDays") == 30,
+          ids[last_day])
+    shown = gh.VoucherStore._api_record(day_after, ids[day_after])
+    check("the Tickets page is told it has expired, and the date it was "
+          "good through", shown["state"] == "expired"
+          and shown["goodThrough"] == (
+              datetime.now().date() - timedelta(days=1)).isoformat()
+          and gh.VoucherStore._api_record(last_day, ids[last_day])["state"]
+          == "issued", shown)
+    spent = printed(60)
+    with store.lock:
+        ids[spent]["state"] = "redeemed"        # long redeemed: not counted
+    job = host.run_ticket_expiry_job()
+    check("the nightly job counts it: one ticket went past its date at "
+          "midnight", job["expiredAtMidnight"] == 1 and job["expired"] == 1
+          and job["removed"] == 0, job)
+    learned = egm.val_ids[0]
+    read_voucher_log(host, egm, voucher_log(
+        (1, "G2S_issue", "G2S_issueAcked", 95, learned, 300_000,
+         "G2S_issued")))
+    check("a ticket learned of from the machine's log is stamped too",
+          ids[learned].get("state") == "issued"
+          and ids[learned].get("expireDays") == 30, ids[learned])
+    auth = presented(last_day)
+    check("on its last day it is redeemed", auth.get("voucherAmt")
+          == "400000" and "hostException" not in auth, auth)
+    auth = presented(day_after)
+    check("the day after, it is refused as expired (hostException 3)",
+          auth.get("hostException") == "3" and auth.get("voucherAmt") == "0",
+          auth)
+    check("an expired ticket the operator reissues is good again",
+          store.reissue_id(day_after).get("ok") is True
+          and "hostException" not in presented(day_after))
+    old = printed(400)
+    store.set_reusable(old, True)
+    check("and so is one made reusable",
+          "hostException" not in presented(old))
+
+    host = make_host()
+    host.ticket_header = lambda: dict(days, expireDays=0)
+    egm = joined(host, "BTB_never_expires")
+    store = host.voucher_store
+    ids = store.state["issuedIds"]
+    egm.get_validation_data(4)
+    old = printed(400)
+    check("printed while the hub was set to \"never\": no stamp, redeemed "
+          "at any age", "expireDays" not in ids[old]
+          and "hostException" not in presented(old), ids[old])
+
+    print("— a ticket from the hub's own ledger (one a SAS machine "
+          "printed), presented at a G2S machine")
+    host = make_host()
+    egm = joined(host, "BTB_ledger_expired")
+    hs = host.hub_store
+    m = hs.tito_mint("sas:smib-x", 1, 10_000)
+    hs.tito_record_issued(m["validationNumber"], 10_000, "sas:smib-x", 1)
+    back = time.strftime("%Y-%m-%dT%H:%M:%S",
+                         time.localtime(time.time() - 40 * 86400))
+    with hs.lock:
+        hs._conn.execute("UPDATE tito_tickets SET issued_at=?, "
+                         "expire_days=30 WHERE canonical=?",
+                         (back, m["canonical"]))
+        hs._conn.commit()
+    _t, auth = egm.redeem_voucher(m["canonical"])
+    check("past its date: refused, and the machine is told \"expired\" "
+          "(3), not \"denied\"", auth is not None
+          and auth.get("hostException") == "3", auth)
+
+    print("— when the nightly job runs")
+    host = make_host()
+    ran = []
+    host.run_ticket_expiry_job = lambda: ran.append(1) or {"ok": True}
+    at = lambda d, h, mi, s=0: datetime(2026, 11, d, h, mi, s)
+    seq = [host.maybe_run_ticket_expiry_job(at(18, 0, 0, 59)),
+           host.maybe_run_ticket_expiry_job(at(18, 0, 1)),
+           host.maybe_run_ticket_expiry_job(at(18, 0, 2)),
+           host.maybe_run_ticket_expiry_job(at(18, 23, 59)),
+           host.maybe_run_ticket_expiry_job(at(19, 0, 0, 30)),
+           host.maybe_run_ticket_expiry_job(at(19, 0, 1, 5))]
+    check("at 12:01 am, once a day: not before, not twice",
+          [bool(x) for x in seq] == [False, True, False, False, False, True]
+          and len(ran) == 2, [bool(x) for x in seq])
+    host = make_host()
+    ran = []
+    host.run_ticket_expiry_job = lambda: ran.append(1) or {"ok": True}
+    check("a hub that was off at midnight runs it when it comes up",
+          bool(host.maybe_run_ticket_expiry_job(at(18, 14, 30)))
+          and len(ran) == 1)
+
+
 def main():
     logging.basicConfig(level=logging.CRITICAL + 1)
     logging.getLogger("g2s_host").setLevel(logging.CRITICAL + 1)
@@ -3514,6 +3635,7 @@ def main():
     item_23_a_header_longer_than_a_ticket_takes()
     item_54_never_expires()
     the_expiry_follows_the_machine()
+    ticket_expiry_by_the_hub()
     print("=" * 50)
     print(f"RESULT: {_p} passed, {_f} failed")
     return 1 if _f else 0

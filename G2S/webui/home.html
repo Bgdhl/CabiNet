@@ -4624,7 +4624,11 @@ function renderTicketModal(vid){
     ["credit type",String(v.creditType||"cashable").replace(/^G2S_/,"")],
     ["machine",machineName(snap(v.egmId),v.egmId)+" · "+(v.egmId||"")],
     ["issued",v.issuedAt?clock(v.issuedAt)+" · "+ago(v.issuedAt):"—"],
-    ["expires",v.expireAt?clock(v.expireAt):"—"],
+    /* the last date the ticket is good on, by the hub's days when it was
+       printed (absent on an older hub: the old row) */
+    (v.goodThrough!==undefined
+      ? ["good through",v.goodThrough||(v.expireAt?clock(v.expireAt):"never expires")]
+      : ["expires",v.expireAt?clock(v.expireAt):"—"]),
     ["redeemed",v.redeemedAt?clock(v.redeemedAt)+" · "+ago(v.redeemedAt):"—"],
     ["voided",v.voidedAt?clock(v.voidedAt):"—"],
     ["transaction",v.transactionId||"—"]];
@@ -4691,6 +4695,8 @@ function renderHubTicketModal(cid){
     ["issued",t.issuedAt?clock(t.issuedAt)+" · "+ago(t.issuedAt):"—"],
     ["redeemed",t.redeemedAt?clock(t.redeemedAt)+" · "+ago(t.redeemedAt):"—"],
     ["redeemed by",t.redeemedBy?titoName(t.redeemedBy)+" · "+t.redeemedBy:"—"]];
+  if(t.goodThrough!==undefined)
+    rows.splice(2,0,["good through",t.goodThrough||"never expires"]);
   if(t.pending&&t.pending.machine)
     rows.push(["redeem pending",titoName(t.pending.machine)
       +(t.pending.at?" · "+clock(t.pending.at):"")]);
