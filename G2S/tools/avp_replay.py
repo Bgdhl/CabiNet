@@ -9663,8 +9663,10 @@ def main():
 
     print("— Step 6.99997: glass destub v1 — /api/glass/data feature views + "
           "the POST /api/glass/action destub (cashout/walletFund reuse the "
-          "proven WAT push; the admin views + clearHandpay/refreshGames gate "
-          "on the account admin flag; egmId is ALWAYS from the token)")
+          "proven WAT push; the handpay view + clearHandpay gate on the "
+          "account admin flag; the tickets/games/settings views and "
+          "refreshGames left the screens with the admin menus; egmId is "
+          "ALWAYS from the token)")
 
     def glass_data(tok, v):
         st, _, body = raw_get("/api/glass/data?sess=" + tok + "&view=" + v)
@@ -9722,22 +9724,34 @@ def main():
           and co.get("walletCredits") == "$30.00"
           and co.get("canFund") is True and co.get("egmId") == EGM_ID,
           f"got {st_co}/{json.dumps(co)[:220]}")
-    # every admin data view refuses a plain player (403), never a 500.
-    for v in ("tickets", "handpay", "games", "settings"):
+    # the admin data views refuse a plain player (403), never a 500.
+    for v in ("handpay", "players"):
         st_v, dv = glass_data(gp_tok, v)
         check(f"data view={v} (plain player): 403 not authorized (the admin "
               "views gate on the account admin flag, never a 500)",
               st_v == 403 and dv.get("ok") is False
               and dv.get("error") == "not authorized",
               f"got {st_v}/{json.dumps(dv)[:160]}")
-    # the two admin ACTIONS also refuse a plain player.
-    for verb in ("clearHandpay", "refreshGames"):
-        st_v, dv = glass_act(gp_tok, {"action": verb})
-        check(f"action {verb} (plain player): 403 not authorized "
-              "(_session_is_admin gate)",
-              st_v == 403 and dv.get("ok") is False
-              and dv.get("error") == "not authorized",
+    # the three views that left the screens with the admin menus are
+    # unknown names now, for anyone.
+    for v in ("tickets", "games", "settings"):
+        st_v, dv = glass_data(gp_tok, v)
+        check(f"data view={v} (plain player): 400 unknown view (removed "
+              "from the screens; it stays on the operator web pages)",
+              st_v == 400 and dv.get("ok") is False
+              and dv.get("error") == "unknown view",
               f"got {st_v}/{json.dumps(dv)[:160]}")
+    # the admin ACTION also refuses a plain player; refreshGames is gone.
+    st_v, dv = glass_act(gp_tok, {"action": "clearHandpay"})
+    check("action clearHandpay (plain player): 403 not authorized",
+          st_v == 403 and dv.get("ok") is False
+          and dv.get("error") == "not authorized",
+          f"got {st_v}/{json.dumps(dv)[:160]}")
+    st_v, dv = glass_act(gp_tok, {"action": "refreshGames"})
+    check("action refreshGames (plain player): 403 not yet (removed)",
+          st_v == 403 and dv.get("ok") is False
+          and dv.get("error") == "not yet",
+          f"got {st_v}/{json.dumps(dv)[:160]}")
     # walletFund bounds: a positive integer at/under the SAS wire ceiling
     # ($99,999,999.99 = the 5-byte BCD max, raised from the old $10k in
     # aea6cb3), never an overdraw of the player's OWN wallet. The ceiling
@@ -10032,9 +10046,11 @@ def main():
     expect_host_post("follow-card hideMediaDisplay (unlinked card-OUT)")
 
     # (c) an ADMIN session (manager-tier fob, no linked account -> the legacy
-    # bridge grants admin): every admin data view answers 200, and both admin
-    # actions are ALLOWED (never 403). clearHandpay carries a bogus body egmId
-    # to prove the reset keys off the TOKEN's machine (a body egm would 404).
+    # bridge grants admin): the handpay and players views answer 200, and
+    # clearHandpay is ALLOWED (never 403). clearHandpay carries a bogus body
+    # egmId to prove the reset keys off the TOKEN's machine (a body egm would
+    # 404). The tickets/games/settings views and refreshGames left the
+    # screens with the admin menus: 400 and 403 for an admin too.
     raw_post("/api/fobs", json.dumps(
         {"action": "set", "uid": "0FF1CE0B01", "tier": "manager",
          "label": "Glass Manager Fob"}))
@@ -10050,40 +10066,21 @@ def main():
           "state carries admin=true",
           bool(ad_tok) and json.loads(body_gs).get("admin") is True,
           f"got {body_gs[:200]}")
-    for v, key in (("tickets", "tickets"), ("handpay", "pending"),
-                   ("settings", "rows")):
+    for v, key in (("handpay", "pending"), ("players", "players")):
         st_v, dv = glass_data(ad_tok, v)
-        check(f"data view={v} (admin): 200 with its list/rows payload + "
+        check(f"data view={v} (admin): 200 with its list payload + "
               "egmId from the token",
               st_v == 200 and dv.get("ok") is True
               and isinstance(dv.get(key), list) and dv.get("egmId") == EGM_ID,
               f"got {st_v}/{json.dumps(dv)[:200]}")
-    # games: grouped ONE ENTRY PER GAME, machine-enabled titles ONLY.
-    # Harness state here: dev 1 = doubleDiamond with egmEnabled=FALSE (folded
-    # in step 6.2, untouched since), dev 2 = bonusPoker egmEnabled=true +
-    # hostEnabled=true (restored after the reject test). egmEnabled is the
-    # MACHINE's own state — setGamePlayState only drives hostEnabled — so an
-    # egm-disabled title must be ABSENT (a button the menu can't ever light),
-    # not rendered as OFF.
-    st_v, dv = glass_data(ad_tok, "games")
-    gm_names = [str(g.get("name")) for g in (dv.get("games") or [])]
-    check("data view=games (admin): grouped by game, machine-enabled only — "
-          "bonusPoker present, egm-disabled doubleDiamond ABSENT",
-          st_v == 200 and dv.get("ok") is True and dv.get("egmId") == EGM_ID
-          and any("bonusPoker" in n for n in gm_names)
-          and not any("doubleDiamond" in n for n in gm_names),
-          f"got {st_v}/{json.dumps(dv)[:300]}")
-    gm_bp = next((g for g in (dv.get("games") or [])
-                  if "bonusPoker" in str(g.get("name"))), {})
-    check("games entry: count + nested paytables [{id,label,on}] with the "
-          "vendor prefix stripped from the paytable label",
-          gm_bp.get("count") == 1
-          and isinstance(gm_bp.get("paytables"), list)
-          and len(gm_bp.get("paytables") or []) == 1
-          and (gm_bp.get("paytables") or [{}])[0].get("id") == "2"
-          and (gm_bp.get("paytables") or [{}])[0].get("label") == "bp0090"
-          and (gm_bp.get("paytables") or [{}])[0].get("on") is True,
-          f"got {json.dumps(gm_bp)[:300]}")
+    for v in ("tickets", "games", "settings"):
+        st_v, dv = glass_data(ad_tok, v)
+        check(f"data view={v} (admin): 400 unknown view (removed from the "
+              "screens), egmId from the token",
+              st_v == 400 and dv.get("ok") is False
+              and dv.get("error") == "unknown view"
+              and dv.get("egmId") == EGM_ID,
+              f"got {st_v}/{json.dumps(dv)[:200]}")
     st_v, dv = glass_act(ad_tok, {"action": "clearHandpay",
                                   "egmId": "IGT_00NOSUCHEGM"})
     check("clearHandpay (admin, body egmId=another machine): 200 keyed off "
@@ -10092,10 +10089,20 @@ def main():
           st_v == 200 and dv.get("ok") is False and dv.get("egmId") == EGM_ID,
           f"got {st_v}/{json.dumps(dv)[:200]}")
     st_v, dv = glass_act(ad_tok, {"action": "refreshGames"})
-    check("refreshGames (admin): 200 ok (the GR-30 deep rescan fires, "
-          "egmId from the token)",
-          st_v == 200 and dv.get("ok") is True and dv.get("egmId") == EGM_ID,
+    check("refreshGames (admin): 403 not yet (removed from the screens), "
+          "egmId from the token",
+          st_v == 403 and dv.get("ok") is False
+          and dv.get("error") == "not yet" and dv.get("egmId") == EGM_ID,
           f"got {st_v}/{json.dumps(dv)[:200]}")
+    expect_no_host_post("refreshGames from a screen starts no rescan of "
+                        "the machine's games")
+    # The rescan itself is still the operator web page's button
+    # (/api/command refreshGameStatus, the same refresh_game_play_status).
+    # It is started from there so the checks of the rescan below, and the
+    # game state every later step was written against, are as before.
+    cs_rg, cb_rg = post_command({"action": "refreshGameStatus"})
+    check("refreshGameStatus (the web page's button): 200 ok",
+          cs_rg == 200 and bool(cb_rg.get("ok")), f"got {cs_rg}/{cb_rg}")
     # The refresh is a DEEP rescan now (GR-30 v2 + denom freshness
     # 2026-07-22): getDescriptor first, and the sweep waits for the fresh
     # descriptorList — or fires anyway after GP_RESCAN_DESC_WAIT_SEC (15s).

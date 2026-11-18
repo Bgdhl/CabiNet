@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.3.30
+New admin menus on the machines' screens. The old admin buttons were
+mostly read-only information nobody uses on the floor.
+- **Removed from both screens:** MACHINE, TICKETS, GAMES and SETTINGS.
+  They are still on the web pages.
+- **An admin's fob tapped over a carded friend opens SERVICE for that
+  friend**: their wallet, Free Slot Play and the credits on the machine,
+  with CLEAR HANDPAY (when one is pending, with its amount), ADD TO
+  WALLET, ADD FREE SLOT PLAY, SET PIN and DONE. The hub takes the friend
+  from the machine's card session, so a tap-over cannot reach anyone
+  else, and it cannot add to the admin's own wallet.
+- **An admin carded in on a companion screen gets an ADMIN button**:
+  HANDPAY, PLAYERS and NEW PLAYER. A player's page has ADD FUNDS, TAKE
+  BACK, ADD FREE SLOT PLAY, SET PIN, CLEAR PIN, ADD FOB, REMOVE FOB and
+  RENAME. Names are typed on an on-screen keyboard.
+- **ADD FOB**: the screen waits 20 seconds for the new fob to be tapped
+  on that machine's reader and links it to the player. That tap cards
+  nobody in. A fob that belongs to another player is refused.
+- **The digital glass stays basic**: an admin there has their own wallet
+  buttons, HANDPAY, HIDE WINDOW and LOG OUT, and the SERVICE screen on a
+  tap-over. It has no keyboard and no player management.
+- Money added from a screen comes from the House, as on the Players web
+  page, and the ledger note names the admin and the machine. There is no
+  house limit on an amount: the keypad takes anything up to
+  $99,999,999.99. A repeated tap cannot pay twice.
+- **The three quick amounts on the admin's add pad are yours to set**:
+  Settings, Host options, under the PIN switches. They start as $20, $50
+  and $100. Large ones show short on the chip (25K, 2.5M).
+- Making someone an admin and deleting a player stay on the web page.
+- **A PIN typed at a keypad, or set on the Players web page, is no longer
+  written to the hub's wire log**, which support bundles copy. Logs and
+  bundles made before this version may still hold PINs.
+
 ## v0.3.29
 CASH OUT TO WALLET on a machine's screen waits for a machine that is
 busy. A machine in the middle of a game, or just coming out of a handpay,

@@ -213,8 +213,9 @@ Companion is a dumb tap→POST satellite by design.
 
 For a SMIB whose cabinet **can't be host-skinned on its own glass** — the WMS BB2E
 (Flash-7/CGC, CLOSED 07-10) is the reference case — the full player-glass UI
-(attract "TAP YOUR FOB" → carded player screen: wallet, CASH OUT, LOG OUT; admin
-adds MACHINE / TICKETS / HANDPAY / GAMES / SETTINGS) runs on the SMIB's **own**
+(attract "TAP YOUR FOB" → carded player screen: wallet, CASH OUT, LOG OUT; an
+admin also gets ADMIN: handpay, players, new player; an admin's fob tapped over a
+carded friend opens a quick SERVICE screen for that friend) runs on the SMIB's **own**
 1024×600 landscape HDMI panel. The page (`G2S/webui/smib.html`) is a thin client
 of the same `/api/glass/*` hub endpoints the IGT glass uses (it polls `src=smib`,
 so it never touches the AVP-only mediaDisplay sequencer) — no new hub logic. This

@@ -144,6 +144,12 @@ HOST_SETTING_KEYS = ("sysval_fallback", "house_allow_negative",
                      # typed on a public keypad is easy to shoulder-surf, so
                      # admin stays card-only unless the collector opts in).
                      "pin_min_digits", "pin_admin_allowed",
+                     # The three quick amounts on the admin's add pad on a
+                     # machine's screen, "a,b,c" in cents; absent = 20, 50
+                     # and 100. The hub checks each amount before it is
+                     # written (g2s_host.quick_add_error), and reads
+                     # anything it cannot use as absent (2026-11-18).
+                     "quick_add_cents",
                      # The money symbol every amount leads with, on every
                      # surface; "" = follow the machines' own currencyId
                      # (a European floor showed "$" next to a machine paying

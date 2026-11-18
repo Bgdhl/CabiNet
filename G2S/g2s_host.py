@@ -125,7 +125,7 @@ if "tournament_names" not in _hub_store_mod.HOST_SETTING_KEYS:
 # the MINOR bump per the repo's version rule). Surfaced in engine_meta() ->
 # /api/status ["_engine"]["version"]; bump this and add a CHANGELOG.md
 # section on every commit with a user-visible change.
-CABINET_VERSION = "0.3.29"
+CABINET_VERSION = "0.3.30"
 
 WSDL_NS = "http://www.gamingstandards.com/wsdl/g2s/v1.0"
 SCHEMA_NS = "http://www.gamingstandards.com/g2s/schemas/v1.0.3"
@@ -310,17 +310,30 @@ TOURNAMENT_G2S_WON_METERS = ("G2S_egmPaidGameWonAmt",
                              "G2S_egmPaidProgWonAmt",
                              "G2S_handPaidGameWonAmt",
                              "G2S_handPaidProgWonAmt")
-# The action gate for POST /api/glass/action (glass destub v1). The v1
-# NAVIGATION-only tier allowlist is retired: buttons are now REAL, gated by
-# the LIVE-resolved backend access (_session_is_admin), never a client-
-# claimed tier. Three bands (see _handle_glass_action):
-#   * GLASS_BASE_ACTIONS  — any carded session (logout).
-#   * GLASS_WALLET_ACTIONS — any carded session WITH a linked player wallet
-#     (walletFund/cashOutToWallet: the player moves only their OWN money).
-#   * GLASS_ADMIN_ACTIONS — _session_is_admin only (clearHandpay/refreshGames).
-# Anything outside these answers an honest 403 — never a 500. The hub ALWAYS
-# forces the egmId from the token (a page can only ever act on its own
-# cabinet) and re-resolves access server-side (a stale glass never decides).
+# What a player's screen (glass.html, smib.html) may ask the hub to do.
+# Access is worked out on the hub for every request, from the session token
+# and what the hub knows now, never from anything the page claims. The hub
+# always takes the machine from the token: a page can only act on its own
+# cabinet. A request outside the caller's band is answered 403, never 500.
+#
+# POST /api/glass/action (_handle_glass_action):
+#   * GLASS_BASE_ACTIONS: any carded session (logout, hideGlass).
+#   * GLASS_WALLET_ACTIONS: any carded session with a linked player wallet;
+#     the player moves only their OWN money. Refused for a tap-over token.
+#   * GLASS_ADMIN_ACTIONS: clearHandpay, for an admin carded in normally
+#     and for a tap-over.
+# POST /api/glass/admin (glass_admin_action), added with the admin menus:
+#   * GLASS_SERVICE_ACTIONS: only for a TAP-OVER (an admin's fob tapped
+#     while a friend is carded in). They act on that friend and nobody
+#     else: the hub reads who the friend is from the machine's card
+#     session, never from the request.
+#   * GLASS_PLAYERS_ACTIONS: only for an admin carded in NORMALLY (the
+#     token belongs to the machine's own card session). They act on the
+#     player the request names. plAddFob arms this machine's reader for
+#     one new fob (G2SHost._fob_wait_arm: the next tap there is the fob,
+#     not a card-in) and plAddFobCancel calls that off.
+# Which of the three callers a token is (player, admin, service) is decided
+# in one place: G2SHost._glass_caller.
 GLASS_BASE_ACTIONS = ("logout", "hideGlass")
 
 # PIN login on the glass (2026-09-14): a player types a PIN on the window's
@@ -361,7 +374,83 @@ def pin_min_digits(hub_store):
         v = 0
     return v if v in (4, 6) else PIN_MIN_DIGITS_DEFAULT
 GLASS_WALLET_ACTIONS = ("walletFund", "cashOutToWallet", "cashOutNow")
-GLASS_ADMIN_ACTIONS = ("clearHandpay", "refreshGames")
+GLASS_ADMIN_ACTIONS = ("clearHandpay",)
+GLASS_SERVICE_ACTIONS = ("svcFund", "svcSetPin")
+GLASS_PLAYERS_ACTIONS = ("plFund", "plTake", "plSetPin", "plClearPin",
+                         "plRename", "plCreate", "plAddFob",
+                         "plAddFobCancel", "plRemoveFob")
+# The screen actions that carry a request id (a second CONFIRM of the same
+# dialog must not pay, or make a player, twice: glass_admin_action).
+GLASS_RID_ACTIONS = ("svcFund", "plFund", "plTake", "plCreate")
+# How long the hub remembers a request id, and how many per machine.
+GLASS_RID_KEEP_SEC = 600
+GLASS_RID_MAX = 64
+# The most a screen can add to a wallet, or take back, in one go (whole
+# cents: $99,999,999.99). This is not a house rule: it is the largest
+# figure the keypads are built to show. It was $100,000.00 until the
+# owner said (2026-11-18): "It's a home game room. If someone wants to be
+# a fake millionaire and hand out fat wallets let them."
+GLASS_ADMIN_MAX_CENTS = 9_999_999_999
+# The three quick amounts on the admin's amount pad (ADD TO WALLET, ADD
+# FREE SLOT PLAY, ADD FUNDS, TAKE BACK), in cents. These are what a hub
+# starts with; the owner sets their own in Settings ("the game room owner
+# can choose what they want for quick adds").
+QUICK_ADD_DEFAULT_CENTS = (2000, 5000, 10000)
+
+
+def quick_add_error(cents):
+    """Why `cents` cannot be a quick amount, in words for the Settings
+    page; None when it can.
+
+    A quick amount is a chip on a small screen (72 px wide on the digital
+    glass), so it has to have a short label: whole dollars, written out up
+    to 9,999, as thousands above that (10K, 250K) and as millions from a
+    million (1M, 2.5M). An amount that cannot be written that way exactly
+    is refused here, so a chip never shows a rounded figure."""
+    if not isinstance(cents, int) or cents < 100 or cents % 100:
+        # (True and False are 1 and 0 here, and refused as too small)
+        return ("Each quick amount is a whole number of 1 or more, with "
+                "no cents.")
+    dollars = cents // 100
+    if cents > GLASS_ADMIN_MAX_CENTS:
+        # the largest round figure under the keypad's own most
+        return "A quick amount can be 99,900,000 at most."
+    if dollars >= 1_000_000 and dollars % 100_000:
+        return ("From 1,000,000 up, a quick amount has to be a round "
+                "hundred thousand (2,500,000 shows as 2.5M).")
+    if dollars >= 10_000 and dollars % 1_000:
+        return ("From 10,000 up, a quick amount has to be a round "
+                "thousand (25,000 shows as 25K).")
+    return None
+
+
+def quick_add_cents(hub_store):
+    """The three quick amounts in force, in cents (host setting
+    quick_add_cents, stored as "a,b,c"). What a hub starts with when the
+    setting is unset or cannot be read as three good amounts."""
+    try:
+        vals = [int(x) for x in str(
+            hub_store.host_setting("quick_add_cents", "") or "").split(",")]
+    except Exception:  # noqa: BLE001 — a store fault reads as the default
+        vals = []
+    if len(vals) == 3 and all(quick_add_error(v) is None for v in vals):
+        return vals
+    return list(QUICK_ADD_DEFAULT_CENTS)
+# The longest name the on-screen keyboard can give a player.
+GLASS_NAME_MAX = 16
+# ADD FOB: how long the screen counts down for a tap on the reader.
+ADD_FOB_WAIT_SEC = 20
+# ...and how much longer the hub still takes a tap as the new fob. A tap
+# reaches the hub a moment after it is made, so one made as the count
+# reaches 0 must not be taken as a card-in.
+ADD_FOB_GRACE_SEC = 2
+# After a fob is added, a second tap of it on that reader does nothing for
+# this long. The fob is an ordinary player fob from the moment it is
+# added, so without this a "did it take?" tap would be a card switch: the
+# admin logged out and the new player carded in on the admin's screen.
+ADD_FOB_SETTLE_SEC = 5
+# How long the screen that armed a wait can still read how it ended.
+ADD_FOB_KEEP_SEC = 60
 # 0x74 "available transfers" bit 1 (SAS 6.02 Table 8.2b): a transfer FROM
 # the gaming machine might be accepted right now. It gates the host-initiated
 # PULL (cashOutNow). It says nothing about the machine's CASH OUT button:
@@ -8089,6 +8178,8 @@ class G2SHost:
     # on the bound EGM, reset queues a SAS handpay_reset on the bound SMIB.
     # Unknown fobs are RECORDED ONLY (the UI offers registration) — a
     # credential is never auto-created from this unauthenticated wire.
+    # (One exception, and only while an admin carded in at that machine has
+    # asked for it from its screen: ADD FOB, see _process_companion_tap.)
 
     #: registry bound (hobby floor — a couple of Zeros, never hundreds)
     COMPANION_MAX = 16
@@ -8361,7 +8452,7 @@ class G2SHost:
                            sat_id=comp_id)
         return {"ok": True, "ackTapId": ack}
 
-    def _process_companion_tap(self, comp, tap):
+    def _process_companion_tap(self, comp, tap, now=None):
         """One deduped tap -> the fob action. Unknown fobs are recorded in
         lastTap (known=False) and NOTHING else — never auto-created, and
         register-from-tap is HUB-READER-ONLY (AJ house rule: a floor tap is
@@ -8369,7 +8460,17 @@ class G2SHost:
         "claim this card" meaning — the UI only mines the loopback-peer
         hub reader for enrollment). Known fobs dispatch by tier:
         player/attendant/manager = carded session, reset = SAS handpay
-        key-off (the physical attendant-key moment)."""
+        key-off (the physical attendant-key moment).
+
+        The ONE exception to both rules is ADD FOB: an admin carded in at
+        this machine has armed its reader for one new fob from the players
+        menu on its screen (_fob_wait_arm). While that wait stands, a tap
+        on a reader bound to THAT machine is the fob being added and
+        nothing else (_fob_wait_tap): nobody is carded in or out, no
+        tap-over is raised, no handpay reset is sent, and an unknown fob
+        is registered as a player fob and linked. A tap on any other
+        machine's reader, and every tap once the wait is over, is handled
+        as described above. `now` is the wait's clock, for the checks."""
         raw_uid = tap.get("uid") or ""
         uid = _norm_fob_uid(raw_uid)
         if uid is None:
@@ -8383,6 +8484,10 @@ class G2SHost:
                                "known": fob is not None,
                                "tier": (fob or {}).get("tier"),
                                "label": (fob or {}).get("label")}
+        # ADD FOB: BEFORE the unknown-fob return and the tier dispatch (the
+        # fob being added is usually one the hub has never seen)
+        if self._fob_wait_tap(comp, uid, fob, now):
+            return
         if fob is None:
             log.info("💳 [companion:%s] unknown fob %s — record-only; cards "
                      "register at the hub's reader (💳 The Players ▸ "
@@ -8803,6 +8908,17 @@ class G2SHost:
             # admin token, if still live, is revoked by the token revoke below
             # (expect_tok path) or revoke_egm (the None path).
             self.admin_overlays.pop(egm_id, None)
+            # ADD FOB: a wait armed from this machine's screen ends with
+            # the card session, in the SAME lock hold: the reader must not
+            # stay armed for an admin who has left. (A fob added a moment
+            # ago loses its settle time with it: the machine is free, and
+            # that fob cards in like any other.)
+            fob_wait = self._fob_waits.pop(egm_id, None) \
+                if self._fob_waits else None
+        if fob_wait is not None and fob_wait.get("state") == "waiting":
+            log.info("💳 [%s] ADD FOB for %s (%s) ended: the card session "
+                     "is over", egm_id, fob_wait.get("name"),
+                     fob_wait.get("accountId"))
         if expect_tok is None:
             self.glass_sessions.revoke_egm(egm_id)
         # Glass cashOutToWallet pin dies with the session (glass destub v1):
@@ -8871,10 +8987,12 @@ class G2SHost:
         stay carded in. All we do is mint an admin glass token (which
         supersedes the player's on the one-token-per-EGM store, so the next
         ~1.5s /api/glass/state poll flips BOTH surfaces — the AVP glass and
-        the BB2 kiosk — to the admin stack) and record the overlay beside the
-        player. glass_state renders the admin stack from THIS record (not the
-        friend's body) and suppresses the friend's wallet/credits while it
-        stands; _handle_glass_action 403s wallet verbs on the admin token.
+        the BB2 kiosk — to the quick service screen) and record the overlay
+        beside the player. While it stands glass_state takes the identity
+        from THIS record (not the friend's body), keeps the friend's money
+        out of the top-level credits fields and sends it in `service`;
+        _handle_glass_action 403s wallet verbs on the admin token, and the
+        service actions of glass_admin_action act on the friend only.
 
         Mint FIRST, OUTSIDE companion_lock (the store has its own lock — the
         no-nesting rule), then record under companion_lock. No wire traffic:
@@ -9701,7 +9819,7 @@ class G2SHost:
 
     _FUND_REF_SEQ = itertools.count(1)
 
-    def player_action(self, req):
+    def player_action(self, req, by=None):
         """POST /api/players — Player Maintenance actions, each a THIN
         composite over the EXISTING primitives (AccountStore +
         hub_store.fob_set): create/remove/linkFob/unlinkFob/fund/rename.
@@ -9713,9 +9831,16 @@ class G2SHost:
         the store's OWN atomic nonzero-balance refusal (a credit landing
         mid-remove bounces back into the fold loop, never vanishes).
         Returns the JSON reply dict; every refusal is an honest
-        ok:false."""
+        ok:false.
+
+        `by` is who asked and where, when the action came from a machine's
+        screen ("AJ at Bluebird 2 (service)"): it is added to the log line
+        and, for money, to both ledger notes. It is an argument of this
+        function and is never read from `req`, so a web caller cannot set
+        it; the Players web page passes nothing."""
         action = req.get("action")
         store, hs = self.account_store, self.hub_store
+        who = f" — by {by}" if by else ""
         if action == "create":
             account, err = store.create(req.get("name"))
             if err:
@@ -9742,10 +9867,10 @@ class G2SHost:
                         reply["linkError"] = ferr
                     else:
                         reply["fob"] = fob
-            log.info("🧑 player create %s (%s)%s", account["id"],
+            log.info("🧑 player create %s (%s)%s%s", account["id"],
                      account["name"],
                      " + fob " + reply["fob"]["uid"]
-                     if reply.get("fob") else "")
+                     if reply.get("fob") else "", who)
             return reply
         if action == "remove":
             aid = str(req.get("accountId") or "").strip()
@@ -9876,8 +10001,8 @@ class G2SHost:
             fob, err = hs.fob_set(uid, account_id=aid)
             if err or fob is None:
                 return {"ok": False, "error": err or "fob write failed"}
-            log.info("🧑 fob %s linked to %s (%s)", fob["uid"], aid,
-                     acct.get("name"))
+            log.info("🧑 fob %s linked to %s (%s)%s", fob["uid"], aid,
+                     acct.get("name"), who)
             return {"ok": True, "fob": fob}
         if action == "unlinkFob":
             uid = req.get("uid")
@@ -9910,7 +10035,7 @@ class G2SHost:
                                 "which STAYS admin — unlink does NOT revoke "
                                 "backend access; clear it in Players ▸ ADMIN",
                                 fob["uid"], prior_aid, pacct.get("name"))
-            log.info("🧑 fob %s unlinked", fob["uid"])
+            log.info("🧑 fob %s unlinked%s", fob["uid"], who)
             return {"ok": True, "fob": fob}
         if action == "fund":
             aid = str(req.get("accountId") or "").strip()
@@ -9974,23 +10099,27 @@ class G2SHost:
                 else (lambda v: {"d_cash": v})
             account, err = store.adjust(
                 aid,
-                note=("house fund" if mc > 0 else "pull back to house") + kind,
+                note=("house fund" if mc > 0 else "pull back to house")
+                + kind + who,
                 ref=ref, **leg(mc))
             if err:
                 return {"ok": False, "error": err}
             _, err = store.adjust(
                 "house",
-                note=f"{'fund' if mc > 0 else 'pull back'} {aid}{kind}",
+                note=f"{'fund' if mc > 0 else 'pull back'} {aid}{kind}{who}",
                 ref=ref, **leg(-mc))
             if err:
                 log.error("🧑 player fund %s: house leg FAILED (%s) — see "
                           "ledger ref %s", aid, err, ref)
-                return {"ok": False, "error":
+                # partial: the ONE refusal that comes after money moved
+                # (the player leg is written). A caller that lets a
+                # refused request be tried again must not do so for this.
+                return {"ok": False, "partial": True, "error":
                         f"house leg failed after the player credit: {err}"
                         f" — see ledger ref {ref}"}
             log.info("🏦 player fund %s (%s): %+d cents (ref %s) — "
-                     "cashable now %s mc", aid, account.get("name"), cents,
-                     ref, account.get("cashableMillicents"))
+                     "cashable now %s mc%s", aid, account.get("name"), cents,
+                     ref, account.get("cashableMillicents"), who)
             return {"ok": True, "player": account, "ref": ref,
                     "movedMillicents": mc, "restricted": restricted}
         if action == "rename":
@@ -9998,8 +10127,8 @@ class G2SHost:
                                         req.get("name"))
             if err:
                 return {"ok": False, "error": err}
-            log.info("🧑 player rename %s -> %s", account.get("id"),
-                     account.get("name"))
+            log.info("🧑 player rename %s -> %s%s", account.get("id"),
+                     account.get("name"), who)
             return {"ok": True, "player": account}
         if action == "setAdmin":
             # Backend-access toggle (§6): AccountStore.set_admin owns the
@@ -10025,15 +10154,15 @@ class G2SHost:
                                          pin_min_digits(hs))
             if err:
                 return {"ok": False, "error": err}
-            log.info("🔢 player setPin %s (%s)", account.get("id"),
-                     account.get("name"))
+            log.info("🔢 player setPin %s (%s)%s", account.get("id"),
+                     account.get("name"), who)
             return {"ok": True, "player": account}
         if action == "clearPin":
             account, err = store.clear_pin(req.get("accountId"))
             if err:
                 return {"ok": False, "error": err}
-            log.info("🔢 player clearPin %s (%s)", account.get("id"),
-                     account.get("name"))
+            log.info("🔢 player clearPin %s (%s)%s", account.get("id"),
+                     account.get("name"), who)
             return {"ok": True, "player": account}
         return {"ok": False, "error": f"unknown action {action!r} — "
                 "create/remove/linkFob/unlinkFob/fund/rename/setAdmin/"
@@ -10258,17 +10387,18 @@ class G2SHost:
                 self._admin_overlay_pop(egm_id, restore=False)
             return out
         tok, rec = self.glass_sessions.peek_egm(egm_id)
-        # ADMIN OVERLAY branch: a supervisor is layered over the carded
-        # friend. The EGM's live token should be the admin's. While it holds
-        # (present, matches, still admin) render the admin stack FROM THE
-        # OVERLAY record — identity is the admin's, credits are SUPPRESSED
-        # (the friend's wallet must never paint under the admin's token — the
-        # money-leak fix), and overlay:true tells both surfaces to hide the
-        # wallet/cash-out controls and show admin + Done only. If the admin
-        # token idled out, was superseded, OR the admin lost their rights
-        # mid-overlay, that is NEVER a friend logout: pop+restore the player
-        # and fall through to render THEM (this reroutes the dangerous
-        # idle-expiry card-out below away from the innocent friend).
+        # ADMIN OVERLAY branch (a tap-over): an admin is layered over the
+        # carded friend. The EGM's live token should be the admin's. While
+        # it holds (present, matches, still admin) the identity is the
+        # admin's, FROM THE OVERLAY record, and overlay:true tells both
+        # pages to show the quick service screen. The top-level credits
+        # fields stay ABSENT (an old page still open must not paint the
+        # friend's money as the admin's own); the friend's figures ride in
+        # the `service` object instead. If the admin token idled out, was
+        # superseded, OR the admin lost their rights mid-overlay, that is
+        # NEVER a friend logout: pop+restore the player and fall through to
+        # render THEM (this reroutes the dangerous idle-expiry card-out
+        # below away from the innocent friend).
         if overlay is not None:
             still_admin = (rec is not None and tok == overlay.get("tok")
                            and bool(self._session_is_admin(
@@ -10283,6 +10413,17 @@ class G2SHost:
                            # body is the friend's; overlay is the admin's.
                            supervising=card.get("name") or "Player",
                            sinceIso=overlay.get("sinceIso"))
+                # The friend's figures for the service screen. Read here,
+                # on the poll (peek_egm above never moves the tap-over's
+                # idle clock), from the card session copy made in the one
+                # lock hold. A fault leaves `service` out; the poll still
+                # answers.
+                try:
+                    out["service"] = self._glass_service_block(
+                        egm_id, assoc, card)
+                except Exception as e:  # noqa: BLE001 — poll keeps answering
+                    log.error("glass service block failed: %s",
+                              type(e).__name__)
                 return out
             self._admin_overlay_pop(egm_id, restore=True)
             log.info("🧑‍💼 [%s] admin overlay ended (token gone/rights "
@@ -10354,37 +10495,105 @@ class G2SHost:
     # reuse the EXACT engine methods sendCredits/clearHandpay drive — this
     # build adds NO new debit/credit primitive.
 
-    def glass_data(self, tok, view):
-        """GET /api/glass/data backend — the panel's compact, token-resolved
-        reads. Returns (httpStatus, dict); the HTTP edge wraps this for the
-        never-500 rule. 401 for an unknown/expired token; the admin views
-        (tickets/handpay/games/settings) require _session_is_admin (403 for
-        a plain player); `cashout` is open to any carded session but its
-        wallet fields need a linked player account. egmId is ALWAYS the
-        token's — a query/body egm is never trusted."""
+    def _glass_caller(self, tok):
+        """Which kind of caller a screen token is, for every request that
+        needs more than "a carded session" (the admin actions, the data
+        views, clearHandpay). None when the token is unknown, expired, or
+        no longer its machine's live token: the caller answers 401.
+        Otherwise {"tok", "rec", "egmId", "kind", "own", "card"}.
+
+        kind:
+          service  a TAP-OVER. The admin right holds, the machine has a
+                   tap-over on record, this token is that tap-over's, and
+                   a friend is carded in underneath.
+          admin    an admin carded in NORMALLY. The admin right holds, the
+                   machine has NO tap-over on record, and the token belongs
+                   to the machine's own card session (same uid).
+          player   everything else, including a tap-over token whose admin
+                   has lost the right.
+
+        "admin" is not simply "an admin whose token is not the tap-over's":
+        a tap-over's token is minted BEFORE the tap-over is recorded
+        (_admin_overlay_push) and the record is dropped BEFORE the friend's
+        token is minted again (_admin_overlay_pop). In both gaps that token
+        is live with no record beside it, and would pass as a normal admin
+        and reach every player. The uid test closes both: under a tap-over
+        the card session is the friend's, never the admin's.
+
+        The card session, the tap-over record and "is this still the
+        machine's live token" are read in ONE companion_lock hold (taking
+        the session store's lock inside it is the one allowed nesting;
+        _glass_card_out does the same). `card` is that copy: for a service
+        caller it IS the friend, and nothing downstream looks at
+        card_sessions again, so a card switch a moment later cannot hand a
+        service action the next player. `own` says the token belongs to
+        the machine's card session. Resolving the token counts as an
+        action: it moves the idle clock, as every screen action does."""
         rec = self.glass_sessions.resolve(tok) \
             if isinstance(tok, str) and tok else None
         if rec is None:
-            return 401, {"ok": False, "error": "unknown session"}
+            return None
         egm_id = rec.get("egmId")
-        admin = self._session_is_admin(rec.get("uid"), rec.get("tier"))
+        with self.companion_lock:
+            card = self.card_sessions.get(egm_id)
+            card = dict(card) if card else None
+            overlay = self.admin_overlays.get(egm_id)
+            overlay = dict(overlay) if overlay else None
+            live = self.glass_sessions.still_live(egm_id, tok)
+        if not live:
+            return None
+        own = card is not None and card.get("uid") == rec.get("uid")
+        kind = "player"
+        if card is not None and self._session_is_admin(rec.get("uid"),
+                                                       rec.get("tier")):
+            if overlay is not None:
+                if overlay.get("tok") == tok:
+                    kind = "service"
+            elif own:
+                kind = "admin"
+        return {"tok": tok, "rec": rec, "egmId": egm_id, "kind": kind,
+                "own": own, "card": card}
+
+    def glass_data(self, tok, view, now=None):
+        """GET /api/glass/data backend: the screen's token-resolved reads.
+        Returns (httpStatus, dict); the HTTP edge wraps this for the
+        never-500 rule. 401 for a token that is unknown, expired or no
+        longer the machine's live one. The machine is ALWAYS the token's;
+        a query or body egm is never trusted. Who may read what (the
+        caller kinds are _glass_caller's):
+          cashout  the session the machine's card session belongs to, its
+                   own wallet. Refused (403) for a tap-over token: it
+                   would answer the ADMIN's wallet on the friend's screen.
+          handpay  an admin carded in normally, and a tap-over.
+          players  an admin carded in normally only. It also carries
+                   `fobWait`: how the ADD FOB wait this token armed is
+                   going (_fob_wait_view; `now` is that wait's clock).
+        Any other name is 400 "unknown view"."""
+        who = self._glass_caller(tok)
+        if who is None:
+            return 401, {"ok": False, "error": "unknown session"}
+        egm_id, kind = who["egmId"], who["kind"]
         view = str(view or "")
-        if view in ("tickets", "handpay", "games", "settings") and not admin:
+        if view == "cashout":
+            allowed = who["own"] and kind != "service"
+        elif view == "handpay":
+            allowed = kind in ("admin", "service")
+        elif view == "players":
+            allowed = kind == "admin"
+        else:
+            return 400, {"ok": False, "error": "unknown view",
+                         "egmId": egm_id}
+        if not allowed:
             return 403, {"ok": False, "error": "not authorized", "view": view,
                          "egmId": egm_id}
+        if view == "players":
+            return 200, self._glass_data_players(egm_id, who["tok"], now)
         with self.assoc_lock:
             assoc = self.associations.get(egm_id)
         if view == "cashout":
-            return 200, self._glass_data_cashout(egm_id, assoc, rec.get("uid"))
-        if view == "tickets":
-            return 200, self._glass_data_tickets(egm_id)
-        if view == "handpay":
-            return 200, self._glass_data_handpay(egm_id, assoc)
-        if view == "games":
-            return 200, self._glass_data_games(egm_id, assoc)
-        if view == "settings":
-            return 200, self._glass_data_settings(egm_id, assoc, rec)
-        return 400, {"ok": False, "error": "unknown view", "egmId": egm_id}
+            return 200, self._glass_data_cashout(egm_id, assoc,
+                                                 who["rec"].get("uid"))
+        return 200, self._glass_data_handpay(egm_id, assoc)
 
     @staticmethod
     def sas_handpay_record(rec):
@@ -10745,49 +10954,6 @@ class G2SHost:
             pass
         return out
 
-    def _glass_data_tickets(self, egm_id):
-        """tickets view: this machine's recent vouchers (the durable
-        VoucherStore, egmId-filtered) + — when the cabinet has a linked SAS
-        money leg — that leg's tito tickets, newest first, capped ~12.
-        Read-only; every source degrades to nothing on a fault."""
-        tickets = []
-        try:
-            vs = self.voucher_store.api_vouchers(limit=12, egm_id=egm_id)
-            for v in vs.get("vouchers", []):
-                amt = v.get("amountMillicents")
-                tickets.append({
-                    "id": v.get("validationId"),
-                    "amount": f"{money_symbol()}{(amt or 0) / 100000:,.2f}"
-                    if amt is not None else "",
-                    "state": v.get("state"),
-                    "when": (v.get("redeemedAt") or v.get("issuedAt")
-                             or v.get("voidedAt"))})
-        except Exception:  # noqa: BLE001 — never-500 read
-            pass
-        try:
-            leg = self.sas_links.get(egm_id)
-            if leg:
-                smib, _, addr = str(leg).partition("/")
-                origin = f"sas:{smib}"
-                # scoped in SQL — a floor-wide page of 40 could crowd
-                # this machine's own rows out entirely on a busy floor
-                for t in self.hub_store.tito_list(
-                        limit=40, origin=origin,
-                        address=addr or None).get("tickets", []):
-                    mc = t.get("amountMc")
-                    tickets.append({
-                        "id": t.get("canonical") or t.get("vn16"),
-                        "amount": f"{money_symbol()}{(mc or 0) / 100000:,.2f}"
-                        if mc is not None else "",
-                        "state": t.get("state"),
-                        "when": (t.get("redeemedAt") or t.get("issuedAt")
-                                 or t.get("mintedAt"))})
-        except Exception:  # noqa: BLE001 — the linked-leg tickets are a bonus
-            pass
-        tickets.sort(key=lambda x: x.get("when") or "", reverse=True)
-        return {"ok": True, "view": "tickets", "egmId": egm_id,
-                "tickets": tickets[:12]}
-
     #: what a SAS handpay record's kind reads as in the admin view
     SAS_HANDPAY_KIND = {"win": "Game win", "topWin": "Top win",
                         "progressive": "Progressive win",
@@ -10848,120 +11014,895 @@ class G2SHost:
                             for v in assoc.handpays_pending.values()]
                     online = assoc.comms_state == "onLine"
                 for r in recs:
-                    amt = (int(r.get("pendingCashableAmt") or 0)
-                           + int(r.get("pendingPromoAmt") or 0)
-                           + int(r.get("pendingNonCashAmt") or 0))
-                    pending.append({
-                        "amount": f"{money_symbol()}{amt / 100000:,.2f}",
-                        "type": r.get("handpayType"),
-                        "when": r.get("handpayDateTime") or r.get("seenAt")})
+                    pending.append(self._g2s_handpay_row(r))
                 can_clear = bool(recs) and online
             except Exception:  # noqa: BLE001 — never-500 read
                 pass
         return {"ok": True, "view": "handpay", "egmId": egm_id,
                 "pending": pending, "canClear": can_clear}
 
-    def _glass_data_games(self, egm_id, assoc):
-        """games view: MACHINE-ENABLED titles only, grouped one entry per
-        GAME (the AVP exposes one gamePlay device per theme+paytable — 119
-        devices is ~10 games on AJ's cabinet), each carrying its paytable
-        variants nested. The glass renders a button per game and drills into
-        the paytables. egmEnabled=false devices are filtered OUT entirely:
-        egmEnabled is the machine's own state (§6.2.2) and setGamePlayState
-        only drives hostEnabled, so the menu could never turn such a title
-        on — listing it would be a dead button. Name resolution = the same
-        igt_games catalog + hub.db overrides the Home games modal uses."""
-        games, as_of = [], None
-        if assoc is not None:
-            try:
-                with assoc.lock:
-                    gp = {k: dict(v) for k, v in assoc.game_play.items()}
-                    as_of = assoc.game_play_as_of
-                catalog = self._igt_games_catalog()
-                try:
-                    overrides = self.hub_store.game_names() or {}
-                except Exception:  # noqa: BLE001 — catalog titles still show
-                    overrides = {}
-                groups = {}
-                for dev in sorted(gp, key=lambda d: (
-                        not str(d).isdigit(),
-                        int(d) if str(d).isdigit() else str(d))):
-                    g = gp[dev]
-                    if not g.get("themeId"):
-                        continue  # stateChange-only stub, no title yet
-                    if g.get("egmEnabled", "true") != "true":
-                        continue  # machine-disabled: not ours to enable
-                    name = self._game_pretty(
-                        g.get("themeId"), overrides, catalog) or "(unnamed)"
-                    groups.setdefault(name, []).append({
-                        "id": dev,
-                        "label": re.sub(r"^[A-Z]{2,6}_", "",
-                                        str(g.get("paytableId") or "")) or "?",
-                        "on": g.get("hostEnabled", "true") == "true"})
-                games = [{"name": n, "count": len(p), "paytables": p}
-                         for n, p in sorted(groups.items(),
-                                            key=lambda kv: kv[0].lower())]
-            except Exception:  # noqa: BLE001 — never-500 read
-                pass
-        return {"ok": True, "view": "games", "egmId": egm_id,
-                "games": games, "asOf": as_of}
+    @staticmethod
+    def _g2s_handpay_row(r):
+        """One G2S handpay record as the handpay view lists it."""
+        amt = (int(r.get("pendingCashableAmt") or 0)
+               + int(r.get("pendingPromoAmt") or 0)
+               + int(r.get("pendingNonCashAmt") or 0))
+        return {"amount": f"{money_symbol()}{amt / 100000:,.2f}",
+                "type": r.get("handpayType"),
+                "when": r.get("handpayDateTime") or r.get("seenAt")}
 
-    def _glass_data_settings(self, egm_id, assoc, rec):
-        """settings view: a compact READ-ONLY machine summary (no writes in
-        v1). Nick from hub.db, protocol/comms from the association, the
-        linked SAS leg, and who is carded in."""
+    # ------------------------------------------------- the admin menus
+    # What the two player screens need for the tap-over service screen and,
+    # on a companion screen, the players menu. Reads only; the writes are
+    # glass_admin_action's, and every one of them ends in player_action.
+
+    def _glass_service_handpay(self, egm_id, assoc):
+        """The handpay CLEAR HANDPAY on the service screen will reset next,
+        so the amount shown is the amount that gets cleared.
+
+        A machine with a SAS side lists at most one: that one. A plain G2S
+        machine can hold several records at once (one handpay can arrive
+        as one record per credit type), the handpay view lists them oldest
+        first, and clearHandpay resets the one pick_handpay_to_reset names
+        with newest=True: THAT record is shown, and `more` says how many
+        others are waiting. {"pending": False} when there is none."""
+        view = self._glass_data_handpay(egm_id, assoc)
+        rows = view.get("pending") or []
+        if not rows:
+            return {"pending": False}
+        row, more = rows[0], 0
+        if view.get("via") != "sas":
+            with assoc.lock:
+                recs = {k: dict(v)
+                        for k, v in assoc.handpays_pending.items()}
+            txn = pick_handpay_to_reset(recs, newest=True)
+            if txn is None:
+                return {"pending": False}
+            row, more = self._g2s_handpay_row(recs[txn]), len(recs) - 1
+        return {"pending": True, "amount": row.get("amount") or "Handpay",
+                "type": str(row.get("type") or ""),
+                "canClear": bool(view.get("canClear")), "more": more}
+
+    def _glass_service_block(self, egm_id, assoc, card):
+        """The `service` object: the friend under a tap-over, as the quick
+        service screen shows them. `card` is the copy of the machine's card
+        session made in the lock hold that proved the tap-over; nothing
+        here looks at card_sessions again. The wallet is the one the
+        friend's fob is linked to NOW (_session_account), which is the one
+        svcFund then credits and the one their own home screen shows."""
+        _aid, acct = self._session_account(card.get("uid"))
+        sym = money_symbol()
+        out = {"name": (str((acct or {}).get("name") or "").strip()
+                        or str(card.get("name") or "").strip() or "Player"),
+               "hasWallet": acct is not None}
+        if acct is not None:
+            mc = int(acct.get("cashableMillicents") or 0)
+            non = int(acct.get("nonCashMillicents") or 0)
+            out.update(walletMc=mc, wallet=f"{sym}{mc / 100000:,.2f}",
+                       freePlayMc=non, freePlay=f"{sym}{non / 100000:,.2f}",
+                       hasPin=bool(acct.get("hasPin")))
+        machine = int(self._machine_credits_mc(assoc) or 0)
+        out.update(machineMc=machine,
+                   machine=f"{sym}{machine / 100000:,.2f}",
+                   handpay=self._glass_service_handpay(egm_id, assoc),
+                   maxCents=GLASS_ADMIN_MAX_CENTS,
+                   quickCents=quick_add_cents(self.hub_store))
+        return out
+
+    def _glass_player_rows(self, only=None):
+        """The players as a companion screen lists them, sorted by name
+        without regard to case: (rows, readable). No House row, and a fob
+        is shown by its last 6 characters only, never its whole uid.
+        `only` keeps the one player with that id (the row an action reply
+        carries). readable is False when the account store could not be
+        read: the caller must not show that as an empty list."""
+        src = self.build_players()
+        if not src.get("ok"):
+            return [], False
+        sym = money_symbol()
+        rows = []
+        for p in src.get("players") or []:
+            if only is not None and p.get("id") != only:
+                continue
+            cash = int(p.get("cashableMillicents") or 0)
+            non = int(p.get("nonCashMillicents") or 0)
+            fobs = sorted((f for f in p.get("fobs") or []),
+                          key=lambda f: str(f.get("uid") or ""))
+            rows.append({
+                "id": p.get("id"), "name": p.get("name"),
+                "admin": bool(p.get("admin")),
+                "hasPin": bool(p.get("hasPin")),
+                "walletMc": cash, "wallet": f"{sym}{cash / 100000:,.2f}",
+                "freePlayMc": non, "freePlay": f"{sym}{non / 100000:,.2f}",
+                "fobs": [{"tail": str(f.get("uid") or "")[-6:],
+                          "label": f.get("label") or "",
+                          "lastSeen": f.get("lastSeen")} for f in fobs]})
+        rows.sort(key=lambda r: (str(r.get("name") or "").lower(),
+                                 str(r.get("id") or "")))
+        return rows, True
+
+    def _glass_data_players(self, egm_id, tok=None, now=None):
+        """players view: every player with their balances and fobs, for the
+        companion screen's players menu. A failed read answers ok:false
+        with no `players` key, so the page can tell it from an empty
+        list. `fobWait` is the ADD FOB wait that `tok` armed on this
+        machine, None when it armed none (the page polls this view once a
+        second while it shows a wait)."""
+        rows, readable = self._glass_player_rows()
+        if not readable:
+            return {"ok": False, "view": "players", "egmId": egm_id,
+                    "error": "players not readable"}
+        return {"ok": True, "view": "players", "egmId": egm_id,
+                "players": rows,
+                "limits": {"maxCents": GLASS_ADMIN_MAX_CENTS,
+                           "quickCents": quick_add_cents(self.hub_store),
+                           "nameMax": GLASS_NAME_MAX,
+                           "fobWaitSec": ADD_FOB_WAIT_SEC},
+                "fobWait": self._fob_wait_view(egm_id, tok, now)}
+
+    # Sentences a screen shows as they come. The hub writes every one, so
+    # the two pages never word a refusal themselves.
+    GLASS_SAY_GONE = "That player is not there any more."
+    GLASS_SAY_NO_PLAYER = "This fob is not linked to a player."
+    GLASS_SAY_OWN_WALLET = ("This is your own wallet. It can't be added to "
+                            "from this screen.")
+    GLASS_SAY_AGAIN = "That did not work. Try again."
+    GLASS_SAY_UNSURE = ("That may not have gone through. Check the balance "
+                        "before trying again.")
+    GLASS_SAY_BUSY = "Still working on that. Wait a moment."
+
+    _glass_rids = None      # {egmId: {(token, action, rid): entry}}; made
+    #                         on first use (a test engine has no __init__)
+
+    def _glass_machine_name(self, egm_id):
+        """What a screen sentence and a ledger note call a machine: its
+        nickname on the hub, else its id."""
         try:
-            nick = self.hub_store.names().get(egm_id) or ""
-        except Exception:  # noqa: BLE001 — never-500 read
+            nick = str(self.hub_store.names().get(egm_id) or "").strip()
+        except Exception:  # noqa: BLE001 — a db fault reads as no nickname
             nick = ""
-        protocol = "G2S" if assoc is not None else "—"
-        comms = assoc.comms_state if assoc is not None else "disconnected"
-        sas_link = self.sas_links.get(egm_id)
-        rows = [{"label": "Nickname", "value": nick or "(unnamed)"},
-                {"label": "EGM ID", "value": egm_id},
-                {"label": "Protocol", "value": protocol},
-                {"label": "Comms", "value": comms},
-                {"label": "SAS leg", "value": sas_link or "none"},
-                {"label": "Carded", "value": rec.get("name") or "—"}]
-        return {"ok": True, "view": "settings", "egmId": egm_id, "nick": nick,
-                "protocol": protocol, "sasLink": sas_link, "comms": comms,
-                "rows": rows}
+        return nick or str(egm_id or "")
 
-    def _igt_games_catalog(self):
-        """The shipped igt_games.json catalog (family6+code3 -> title),
-        loaded once and cached. {} on any read/parse fault — the games view
-        then falls back to the raw themeId, never a 500."""
-        cat = getattr(self, "_igt_games_cache", None)
-        if cat is not None:
-            return cat
-        cat = {}
-        try:
-            path = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                "webui", "igt_games.json")
-            with open(path, encoding="utf-8") as fh:
-                data = json.load(fh)
-            if isinstance(data, dict):
-                cat = {str(k).upper(): v for k, v in data.items()}
-        except Exception:  # noqa: BLE001 — catalog optional
-            cat = {}
-        self._igt_games_cache = cat
-        return cat
+    def _glass_by(self, who):
+        """Who asked and where, for the log and the ledger note: the admin
+        (the name on the token), the machine, and which menu."""
+        name = str(who["rec"].get("name") or "").strip() or "Admin"
+        menu = "service" if who["kind"] == "service" else "admin menu"
+        return (f"{name[:24]} at "
+                f"{self._glass_machine_name(who['egmId'])[:24]} ({menu})")
 
     @staticmethod
-    def _game_pretty(theme_id, overrides, catalog):
-        """themeId -> collector title, byte-mirroring the Home UI's
-        prettyTheme: the 6-digit family + 3-char code is the stable catalog
-        key (overrides win); an unknown game shows the vendor-prefix-stripped
-        raw id (which the editor can then name)."""
-        t = str(theme_id or "")
-        if not t:
-            return ""
-        m = re.search(r"(\d{6})([0-9A-Za-z]{3})", t)
-        key = (m.group(1) + m.group(2).upper()) if m else ""
-        if key and (overrides.get(key) or catalog.get(key)):
-            return overrides.get(key) or catalog.get(key)
-        return re.sub(r"^[A-Z]{2,6}_", "", t)
+    def _glass_name_tidy(name):
+        """A name typed on a screen's keyboard: (tidied name, None), or
+        (None, the sentence that says why not). The ends are stripped and
+        a run of spaces becomes one. These rules are for the screen path
+        only; the Players web page keeps its own."""
+        name = re.sub(r" +", " ", name.strip()) \
+            if isinstance(name, str) else ""
+        if not name:
+            return None, "Type a name."
+        if len(name) > GLASS_NAME_MAX:
+            return None, (f"A name can have at most {GLASS_NAME_MAX} "
+                          "letters.")
+        # not str.isalnum(): that lets every other alphabet through
+        if not re.fullmatch(r"[A-Za-z0-9 '\-]+", name):
+            return None, "Use letters, numbers, spaces, - and ' only."
+        return name, None
+
+    def _glass_name_taken(self, name, skip_id=None):
+        """The sentence that says another player already has this name
+        (compared without regard to case), else None. skip_id is the
+        player being renamed, who may keep their own name in another
+        case."""
+        for a in self.account_store.snapshot().get("accounts", []):
+            if a.get("kind") == "player" and a.get("id") != skip_id and \
+                    str(a.get("name") or "").strip().lower() == name.lower():
+                return f"There is already a player called {a.get('name')}."
+        return None
+
+    def _glass_rid_begin(self, egm_id, key, now=None):
+        """Look a request id up and, when it is new, reserve it, in one
+        lock hold: ("new", None), ("busy", None) while the same request is
+        still being worked on, or ("seen", its stored reply). The one
+        place the request-id memory reads the clock."""
+        now = time.time() if now is None else now
+        with self.companion_lock:
+            if self._glass_rids is None:
+                self._glass_rids = {}
+            mem = self._glass_rids.setdefault(egm_id, {})
+            for k in [k for k, e in mem.items()
+                      if now - e["ts"] > GLASS_RID_KEEP_SEC]:
+                del mem[k]
+            ent = mem.get(key)
+            if ent is not None:
+                if ent["reply"] is None:
+                    return "busy", None
+                return "seen", dict(ent["reply"])
+            mem[key] = {"ts": now, "reply": None}
+            while len(mem) > GLASS_RID_MAX:
+                # the oldest goes, a finished one before one in flight
+                old = next((k for k, e in mem.items()
+                            if e["reply"] is not None), None)
+                del mem[old if old is not None else next(iter(mem))]
+            return "new", None
+
+    def _glass_rid_settle(self, egm_id, key, reply):
+        """Finish a reserved request id: remember its reply, or forget the
+        id (reply None) so the same dialog can be tried again."""
+        with self.companion_lock:
+            mem = (self._glass_rids or {}).get(egm_id)
+            if mem is None or key not in mem:
+                return
+            if reply is None:
+                del mem[key]
+            else:
+                mem[key]["reply"] = dict(reply)
+
+    def _glass_once(self, who, action, rid, work, now=None):
+        """Run `work` at most once per request id, so a second CONFIRM of
+        the same dialog cannot pay twice. work() returns (verdict, reply):
+          "store"   done: the reply is remembered and a repeat gets it
+                    again with repeat:true; nothing runs a second time.
+          "forget"  refused before anything moved: the id is forgotten, so
+                    the same dialog can be tried again once the cause is
+                    fixed.
+          "fault"   nobody knows how far it got (also what an exception
+                    means): the id is KEPT with the "may not have gone
+                    through" sentence as its reply, so that dialog can
+                    never pay again. A new dialog has a new id.
+        Every way out settles the reservation: one left in flight would
+        answer "busy" to that dialog until it aged out.
+
+        The memory is per machine, and an entry answers only the same
+        token asking for the same action: a stored reply carries a
+        player's figures and must not reach another session."""
+        egm_id = who["egmId"]
+        key = (who["tok"], action, rid)
+        state, stored = self._glass_rid_begin(egm_id, key, now)
+        if state == "busy":
+            return 409, {"ok": False, "busy": True,
+                         "error": self.GLASS_SAY_BUSY}
+        if state == "seen":
+            stored["repeat"] = True
+            return 200, stored
+        verdict, reply = "fault", None
+        try:
+            try:
+                verdict, reply = work()
+            except Exception as e:  # noqa: BLE001 — see "fault" above
+                # the class only: the text of a fault can quote what was
+                # typed
+                log.error("🪟 [glass:%s] %s failed on the hub side (%s)",
+                          egm_id, action, type(e).__name__)
+                verdict = "fault"
+            if verdict == "fault" or not isinstance(reply, dict):
+                verdict = "fault"
+                reply = {"ok": False, "error": self.GLASS_SAY_UNSURE}
+        finally:
+            self._glass_rid_settle(
+                egm_id, key, None if verdict == "forget"
+                else (reply or {"ok": False,
+                                "error": self.GLASS_SAY_UNSURE}))
+        return 200, reply
+
+    def glass_admin_action(self, req, now=None):
+        """POST /api/glass/admin backend: the admin menus' writes from a
+        machine's screen. Returns (httpStatus, dict), so it can be called
+        without a server.
+
+        Two groups of actions, each for one kind of caller only
+        (_glass_caller decides the kind; nothing in the request does):
+          GLASS_SERVICE_ACTIONS  a TAP-OVER. svcFund and svcSetPin act on
+              the friend who is carded in on this machine. Who that is
+              comes from the machine's card session, read in the lock hold
+              that proved the tap-over; an accountId in the request is
+              not looked at.
+          GLASS_PLAYERS_ACTIONS  an admin carded in NORMALLY. They act on
+              the player the request names (accountId), who must be an
+              existing player account: never the House.
+        Making someone an admin and deleting a player are not here; they
+        stay on the Players web page.
+
+        The checks run in this order: the token (401), the action name
+        (403 "not yet" for a name this endpoint does not know), the kind
+        of caller (403 "not authorized"), the fields, the request id, the
+        work. A refusal a person should read is 200 with ok:false and a
+        sentence in `error`; a success carries a sentence in `msg`. The
+        page shows both as they come.
+
+        Money (svcFund, plFund, plTake) has ONE path: player_action's
+        fund, the House on the other side, as on the Players web page.
+        The page always sends a positive amount of whole cents and the hub
+        sets the sign; one action moves at most GLASS_ADMIN_MAX_CENTS.
+        Those three and plCreate carry a request id (_glass_once).
+
+        ADD FOB (plAddFob) does not add a fob itself: it arms this
+        machine's reader, and the next tap there is the fob
+        (_fob_wait_arm, _fob_wait_tap). Its reply and the players view
+        carry `fobWait`, which says how that is going.
+
+        Every action is logged with who asked and at which machine
+        (_glass_by), and money carries it in both ledger notes. A new PIN
+        is never in a reply, a log line or a refusal, and a fault is
+        logged by its class only (its text can quote what was typed). An
+        action name that is not one of ours is not logged either."""
+        if not isinstance(req, dict):
+            return 400, {"ok": False, "error": "invalid JSON"}
+        who = self._glass_caller(req.get("sess"))
+        if who is None:
+            return 401, {"ok": False, "error": "unknown session"}
+        egm_id = who["egmId"]         # FROM THE TOKEN: a body egmId is ignored
+        action = req.get("action")
+        if not isinstance(action, str) or action not in (
+                GLASS_SERVICE_ACTIONS + GLASS_PLAYERS_ACTIONS):
+            action = ""
+
+        def done(status, payload):
+            payload.setdefault("ok", status == 200)
+            payload.setdefault("action", action)
+            payload.setdefault("egmId", egm_id)
+            if status != 200 or payload.get("ok") is False:
+                log.info("🪟 [glass:%s] %s refused (%s): %s", egm_id,
+                         action or "(unknown)", status,
+                         str(payload.get("error") or "")[:200])
+            return status, payload
+
+        if not action:
+            return done(403, {"ok": False, "error": "not yet"})
+        need = "service" if action in GLASS_SERVICE_ACTIONS else "admin"
+        if who["kind"] != need:
+            return done(403, {"ok": False, "error": "not authorized"})
+        try:
+            status, payload = self._glass_admin_work(who, action, req, now)
+        except Exception as e:  # noqa: BLE001 — never a 500 on a screen
+            log.error("🪟 [glass:%s] %s failed on the hub side (%s)",
+                      egm_id, action, type(e).__name__)
+            status, payload = 200, {"ok": False, "error": (
+                self.GLASS_SAY_UNSURE if action in GLASS_RID_ACTIONS
+                else self.GLASS_SAY_AGAIN)}
+        return done(status, payload)
+
+    def _glass_admin_work(self, who, action, req, now=None):
+        """glass_admin_action once the caller is allowed: the target, the
+        fields, the request id, the work. Returns (httpStatus, dict)."""
+        egm_id = who["egmId"]
+        by = self._glass_by(who)
+        sym = money_symbol()
+
+        def no(error, status=200):
+            return status, {"ok": False, "error": error}
+
+        def player_row(aid):
+            # the refreshed row an action reply carries; left out when it
+            # cannot be read (the page then goes back to its list)
+            try:
+                rows, _ok = self._glass_player_rows(only=aid)
+            except Exception:  # noqa: BLE001 — the action itself is done
+                rows = []
+            return rows[0] if rows else None
+
+        def with_target(payload, aid):
+            # what the screen repaints from: the friend's figures for a
+            # service action, the player's row for a players action
+            if who["kind"] == "service":
+                try:
+                    with self.assoc_lock:
+                        assoc = self.associations.get(egm_id)
+                    payload["service"] = self._glass_service_block(
+                        egm_id, assoc, who["card"])
+                except Exception:  # noqa: BLE001 — the action itself is done
+                    pass
+            else:
+                row = player_row(aid)
+                if row is not None:
+                    payload["player"] = row
+            return payload
+
+        def is_player(aid):
+            acct = self.account_store.get(aid) \
+                if isinstance(aid, str) and aid else None
+            return acct if acct is not None \
+                and acct.get("kind") == "player" else None
+
+        # ---- who the action is for
+        aid = acct = None
+        if action in GLASS_SERVICE_ACTIONS:
+            # the friend: from the card session copy _glass_caller made
+            # in its lock hold, by the fob's link as it is now
+            aid, acct = self._session_account(who["card"].get("uid"))
+            if acct is None:
+                return no(self.GLASS_SAY_NO_PLAYER)
+            # A tap-over never pays the admin who raised it. The friend can
+            # be that admin: an admin account logged in by PIN is a plain
+            # player (pin_admin_allowed off) and its own fob then taps
+            # over it; so does the fob of a player who was made an admin
+            # after carding in.
+            if action == "svcFund" and aid == self._session_account(
+                    who["rec"].get("uid"))[0]:
+                return no(self.GLASS_SAY_OWN_WALLET)
+        elif action not in ("plCreate", "plAddFobCancel"):
+            aid = req.get("accountId")
+            acct = is_player(aid)
+            if acct is None:
+                return no(self.GLASS_SAY_GONE)
+
+        rid = req.get("rid")
+        rid_ok = isinstance(rid, str) and \
+            re.fullmatch(r"[A-Za-z0-9]{8,32}", rid) is not None
+
+        if action in ("svcFund", "plFund", "plTake"):
+            take = action == "plTake"
+            if not take and "restricted" in req \
+                    and not isinstance(req["restricted"], bool):
+                return no("restricted must be true or false", 400)
+            # TAKE BACK is from the cash wallet only
+            restricted = not take and req.get("restricted") is True
+            cents = req.get("cents")
+            if isinstance(cents, bool) or not isinstance(cents, int) \
+                    or cents < 1:
+                return no("Enter an amount.")
+            if cents > GLASS_ADMIN_MAX_CENTS:
+                return no(f"The most you can "
+                          f"{'take back' if take else 'add'} at once is "
+                          f"{sym}{GLASS_ADMIN_MAX_CENTS / 100:,.2f}.")
+            if not rid_ok:
+                return no("request id missing", 400)
+            amt = f"{sym}{cents / 100:,.2f}"
+
+            def move():
+                # the hub sets the sign, never the page
+                r = self.player_action(
+                    {"action": "fund", "accountId": aid,
+                     "cents": -cents if take else cents,
+                     "restricted": restricted}, by=by)
+                if r.get("ok"):
+                    name = (r.get("player") or {}).get("name") \
+                        or acct.get("name")
+                    if take:
+                        msg = f"Took {amt} back from {name}'s wallet."
+                    elif restricted:
+                        msg = f"Added {amt} Free Slot Play for {name}."
+                    else:
+                        msg = f"Added {amt} to {name}'s wallet."
+                    return "store", with_target({"ok": True, "msg": msg},
+                                                aid)
+                if r.get("partial"):
+                    # the one refusal that comes AFTER money moved (the
+                    # player leg is written, the House leg failed)
+                    return "fault", None
+                if is_player(aid) is None:
+                    return "forget", {"ok": False,
+                                      "error": self.GLASS_SAY_GONE}
+                if not take and not restricted \
+                        and not self.house_allow_negative():
+                    house = self.account_store.get("house") or {}
+                    if int(house.get("cashableMillicents") or 0) \
+                            < cents * 1000:
+                        # the store's own sentence names a web menu with
+                        # a character the AVP's font may not have
+                        return "forget", {"ok": False, "error": (
+                            "The House is out of credits. Top up the "
+                            "House bankroll on the hub's Options page.")}
+                return "forget", {"ok": False, "error": str(
+                    r.get("error") or self.GLASS_SAY_AGAIN)}
+            return self._glass_once(who, action, rid, move, now)
+
+        if action in ("svcSetPin", "plSetPin"):
+            pin = req.get("pin")
+            # the ten characters 0-9 only. Not str.isdigit(): that passes
+            # digits of other scripts, and the store then faults on them.
+            if not isinstance(pin, str) \
+                    or re.fullmatch(r"[0-9]+", pin) is None:
+                return no("A PIN is digits only.")
+            least = pin_min_digits(self.hub_store)
+            if len(pin) < least:
+                return no(f"A PIN needs at least {least} digits.")
+            if len(pin) > PIN_MAX_DIGITS:
+                return no(f"A PIN can have at most {PIN_MAX_DIGITS} "
+                          "digits.")
+            r = self.player_action({"action": "setPin", "accountId": aid,
+                                    "pin": pin}, by=by)
+            if not r.get("ok"):
+                # the shape was checked above, so what is left is a PIN
+                # another player has, or a player who has just gone
+                return no("Pick a different PIN." if is_player(aid)
+                          else self.GLASS_SAY_GONE)
+            name = (r.get("player") or {}).get("name") or acct.get("name")
+            return 200, with_target(
+                {"ok": True, "msg": f"{name}'s PIN is set."}, aid)
+
+        if action == "plClearPin":
+            r = self.player_action({"action": "clearPin",
+                                    "accountId": aid}, by=by)
+            if not r.get("ok"):
+                return no(self.GLASS_SAY_AGAIN if is_player(aid)
+                          else self.GLASS_SAY_GONE)
+            name = (r.get("player") or {}).get("name") or acct.get("name")
+            return 200, with_target(
+                {"ok": True, "msg": f"{name}'s PIN is cleared."}, aid)
+
+        if action == "plRename":
+            name, err = self._glass_name_tidy(req.get("name"))
+            err = err or self._glass_name_taken(name, skip_id=aid)
+            if err:
+                return no(err)
+            r = self.player_action({"action": "rename", "accountId": aid,
+                                    "name": name}, by=by)
+            if not r.get("ok"):
+                return no(self.GLASS_SAY_AGAIN if is_player(aid)
+                          else self.GLASS_SAY_GONE)
+            return 200, with_target(
+                {"ok": True, "msg": f"Renamed to {name}."}, aid)
+
+        if action == "plCreate":
+            name, err = self._glass_name_tidy(req.get("name"))
+            if err:
+                return no(err)
+            if not rid_ok:
+                return no("request id missing", 400)
+
+            def create():
+                # "is the name taken" is asked here, after the request id
+                # was looked up: a second CONFIRM of the dialog that made
+                # this player must get its reply again, not be told the
+                # name is taken (by the player it just made)
+                taken = self._glass_name_taken(name)
+                if taken:
+                    return "forget", {"ok": False, "error": taken}
+                r = self.player_action({"action": "create", "name": name},
+                                       by=by)
+                new = r.get("player") or {}
+                if not r.get("ok") or not new.get("id"):
+                    return "forget", {"ok": False,
+                                      "error": self.GLASS_SAY_AGAIN}
+                return "store", with_target(
+                    {"ok": True, "msg": f"{new.get('name')} is set up."},
+                    new["id"])
+            return self._glass_once(who, action, rid, create, now)
+
+        if action == "plRemoveFob":
+            name = acct.get("name")
+            not_on = f"That fob is not on {name} any more."
+            tail = req.get("fob")
+            # 1 to 32 hex characters. An empty one must stop here: every
+            # uid "ends with" an empty string, and that would remove a
+            # fob nobody chose.
+            if not isinstance(tail, str) \
+                    or re.fullmatch(r"[0-9A-Fa-f]{1,32}", tail) is None:
+                return no(not_on)
+            tail = tail.upper()
+            hits = [str(f.get("uid") or "") for f in self.hub_store.fobs()
+                    if f.get("tier") == "player"
+                    and str(f.get("accountId") or "").strip() == aid
+                    and str(f.get("uid") or "").upper().endswith(tail)]
+            if not hits:
+                return no(not_on)
+            if len(hits) > 1:
+                return no("Remove that fob on the Players web page.")
+            uid = hits[0]
+            if uid.upper() == str(who["rec"].get("uid") or "").upper():
+                return no("That is the fob you carded in with.")
+            with self.companion_lock:
+                where = next(
+                    (egm for egm, s in self.card_sessions.items()
+                     if str(s.get("uid") or "").upper() == uid.upper()),
+                    None) or next(
+                    (egm for egm, o in self.admin_overlays.items()
+                     if str(o.get("uid") or "").upper() == uid.upper()),
+                    None)
+            if where:
+                return no(f"That fob is carded in at "
+                          f"{self._glass_machine_name(where)}. Card out "
+                          "there first.")
+            r = self.player_action({"action": "unlinkFob", "uid": uid},
+                                   by=by)
+            if not r.get("ok"):
+                return no("That fob could not be removed. Try again.")
+            return 200, with_target(
+                {"ok": True, "msg": f"Fob removed from {name}."}, aid)
+
+        if action == "plAddFob":
+            return self._fob_wait_arm(who, aid, acct, by, now)
+        # plAddFobCancel
+        return self._fob_wait_cancel(who)
+
+    # ------------------------------------------------------------- ADD FOB
+    # The players menu on a companion screen: an admin carded in NORMALLY
+    # picks a player and arms the reader of THAT machine for one new fob.
+    # The next tap there, inside the wait, is the fob: it is linked to the
+    # player instead of carding anyone in (_process_companion_tap asks
+    # _fob_wait_tap before it does anything else with a tap). One wait per
+    # machine, kept in memory only: a hub restart ends it, like the
+    # session that armed it.
+    #
+    # A wait is {tok, adminUid, adminTier, accountId, name, by, armedTs,
+    # state, note, msg} and, once it is over, endTs (and linkedUid when a
+    # fob was added). state is "waiting", then "linked" or "ended".
+    # It is over: when a fob is added; ADD_FOB_WAIT_SEC + ADD_FOB_GRACE_SEC
+    # after it was armed; on plAddFobCancel; when another is armed on the
+    # machine; when the machine's card session ends (_glass_card_out); and
+    # at the next tap, if the token that armed it is no longer the
+    # machine's live one or its admin has lost the right since.
+    # Everything here is read and written under companion_lock; the stores
+    # and player_action are never called while holding it.
+
+    _fob_waits = None       # {egmId: wait}; made on first use (a test
+    #                         engine has no __init__), None = none ever armed
+
+    @staticmethod
+    def _fob_wait_now(now=None):
+        """The one place the ADD FOB wait reads the clock."""
+        return time.time() if now is None else now
+
+    @staticmethod
+    def _fob_wait_over(wait, now):
+        """Close a wait whose time has run out. True when this call closed
+        it. Call it holding companion_lock."""
+        end = wait["armedTs"] + ADD_FOB_WAIT_SEC + ADD_FOB_GRACE_SEC
+        if wait["state"] != "waiting" or now < end:
+            return False
+        wait.update(state="ended", note="", msg="No fob was tapped.",
+                    endTs=end)
+        return True
+
+    def _fob_wait_view(self, egm_id, tok, now=None):
+        """`fobWait` as a screen reads it: None unless THIS token armed a
+        wait on this machine, else
+          {"state", "secondsLeft", "accountId", "name", "note", "msg"}
+        state "waiting": secondsLeft is what is left of the count the
+            screen shows (whole seconds, 0 during the grace), and note
+            says why the fob tapped last was not taken ("" when none was).
+        state "linked" / "ended": msg says how it ended; it stays readable
+            for ADD_FOB_KEEP_SEC, then this is None again.
+        A whole fob uid is never in it."""
+        now = self._fob_wait_now(now)
+        with self.companion_lock:
+            wait = (self._fob_waits or {}).get(egm_id)
+            if wait is None or not tok or wait["tok"] != tok:
+                return None
+            timed_out = self._fob_wait_over(wait, now)
+            w = dict(wait)
+            if w["state"] != "waiting" \
+                    and now - w["endTs"] >= ADD_FOB_KEEP_SEC:
+                del self._fob_waits[egm_id]
+        if timed_out:
+            log.info("💳 [%s] ADD FOB for %s (%s) ended: no fob was tapped "
+                     "in time", egm_id, w["name"], w["accountId"])
+        if w.get("hidden") or (w["state"] != "waiting"
+                               and now - w["endTs"] >= ADD_FOB_KEEP_SEC):
+            return None
+        left = 0
+        if w["state"] == "waiting":
+            # rounded UP: the count reads 20 when armed and 0 only once
+            # the 20 seconds are over
+            left = ADD_FOB_WAIT_SEC - (now - w["armedTs"])
+            left = min(ADD_FOB_WAIT_SEC, max(0, -int(-left // 1)))
+        return {"state": w["state"], "secondsLeft": left,
+                "accountId": w["accountId"], "name": w["name"],
+                "note": w["note"], "msg": w["msg"]}
+
+    def _fob_wait_arm(self, who, aid, acct, by, now=None):
+        """plAddFob: arm this machine's reader for one new fob for the
+        player `aid` (an existing player; the caller is an admin carded in
+        normally: glass_admin_action checked both). Returns (httpStatus,
+        dict). Refused in words for an admin's account (that would make a
+        new admin fob from a screen) and when no reader bound to this
+        machine is answering. A new wait replaces the machine's earlier
+        one."""
+        egm_id = who["egmId"]
+        name = str(acct.get("name") or "")
+        if acct.get("admin"):
+            return 200, {"ok": False, "error": (
+                f"{name} is an admin. Add an admin's fob on the Players "
+                "web page.")}
+        rec = who["rec"]
+        wait = {"tok": who["tok"], "adminUid": rec.get("uid"),
+                "adminTier": rec.get("tier"), "accountId": aid,
+                "name": name, "by": by,
+                "armedTs": self._fob_wait_now(now),
+                "state": "waiting", "note": "", "msg": ""}
+        # a reader's report is stamped on the wall clock (as /api/status
+        # judges it), whatever clock the wait is given
+        wall = time.time()
+        with self.companion_lock:
+            reader = any(
+                (c.get("bindings") or {}).get("g2sEgmId") == egm_id
+                and c.get("readerOk")
+                and wall - (c.get("lastSeen") or 0)
+                <= self.COMPANION_STALE_SEC
+                for c in self.companions.values())
+            if reader:
+                if self._fob_waits is None:
+                    self._fob_waits = {}
+                self._fob_waits[egm_id] = wait
+        if not reader:
+            return 200, {"ok": False, "error":
+                         "This machine's fob reader is not answering."}
+        log.info("💳 [%s] ADD FOB armed for %s (%s) — by %s; waiting %d s "
+                 "for a tap", egm_id, name, aid, by, ADD_FOB_WAIT_SEC)
+        return 200, {"ok": True, "fobWait": self._fob_wait_view(
+            egm_id, who["tok"], wait["armedTs"])}
+
+    def _fob_wait_cancel(self, who):
+        """plAddFobCancel: call off the wait this token armed on its
+        machine. Fine when there is none; always (200, fobWait None). A
+        wait that is already over is only taken off the screen: a fob
+        added a moment ago keeps its settle time."""
+        egm_id, dropped = who["egmId"], None
+        with self.companion_lock:
+            wait = (self._fob_waits or {}).get(egm_id)
+            if wait is not None and wait["tok"] == who["tok"]:
+                if wait["state"] == "waiting":
+                    dropped = self._fob_waits.pop(egm_id)
+                else:
+                    wait["hidden"] = True
+        if dropped is not None:
+            log.info("💳 [%s] ADD FOB for %s (%s) cancelled — by %s",
+                     egm_id, dropped["name"], dropped["accountId"],
+                     dropped["by"])
+        return 200, {"ok": True, "fobWait": None}
+
+    def _fob_wait_tap(self, comp, uid, fob, now=None):
+        """Is this tap the fob of an ADD FOB wait? True when it was used
+        up here and _process_companion_tap must do NOTHING more with it;
+        False when it is an ordinary tap. `uid` is the canonical uid and
+        `fob` its row in the fobs table (None for a fob the hub does not
+        know).
+
+        The tap is the wait's when the reader is bound to a machine whose
+        wait is still waiting, inside its time, armed by the token that
+        is still that machine's live one, for an admin who still has the
+        right. A wait that fails the last two is dropped here and the tap
+        is an ordinary one: an admin action must not outlive the admin.
+        From there on nothing falls through to the ordinary handling,
+        whatever _fob_wait_take does with the fob, even a fault.
+
+        For ADD_FOB_SETTLE_SEC after a fob was added, a tap of THAT fob
+        on a reader of THAT machine is also used up here, and does
+        nothing."""
+        egm_id = (comp.get("bindings") or {}).get("g2sEgmId")
+        if not egm_id or not self._fob_waits:
+            return False                # no wait was ever armed here
+        now = self._fob_wait_now(now)
+        live = again = False
+        w = carded = None
+        with self.companion_lock:
+            wait = self._fob_waits.get(egm_id)
+            if wait is None:
+                return False
+            timed_out = self._fob_wait_over(wait, now)
+            state = wait["state"]
+            if state == "waiting":
+                # the one allowed nesting (_glass_caller does the same)
+                live = self.glass_sessions.still_live(egm_id, wait["tok"])
+                if not live:
+                    del self._fob_waits[egm_id]
+                w = dict(wait)
+                # who is carded in where, read in this same hold: a fob in
+                # use at a machine is not handed to another player
+                carded = {}
+                for held in (self.card_sessions, self.admin_overlays):
+                    for egm, s in held.items():
+                        carded.setdefault(str(s.get("uid") or "").upper(),
+                                          egm)
+            elif state == "linked":
+                again = wait.get("linkedUid") == uid \
+                    and now - wait["endTs"] < ADD_FOB_SETTLE_SEC
+        if state != "waiting":
+            if timed_out:
+                log.info("💳 [%s] ADD FOB for %s (%s) ended: no fob was "
+                         "tapped in time", egm_id, wait["name"],
+                         wait["accountId"])
+            if again:
+                log.info("💳 [%s] fob %s tapped again just after it was "
+                         "added: ignored", egm_id, uid)
+            return again
+        if not live:
+            log.info("💳 [%s] ADD FOB for %s (%s) dropped: the session "
+                     "that armed it is over — fob %s is an ordinary tap",
+                     egm_id, w["name"], w["accountId"], uid)
+            return False
+        try:
+            if not self._session_is_admin(w["adminUid"], w["adminTier"]):
+                with self.companion_lock:
+                    if self._fob_waits.get(egm_id) is wait:
+                        del self._fob_waits[egm_id]
+                log.info("💳 [%s] ADD FOB for %s (%s) dropped: %s is not "
+                         "an admin any more — fob %s is an ordinary tap",
+                         egm_id, w["name"], w["accountId"], w["by"], uid)
+                return False
+            self._fob_wait_take(egm_id, wait, w, uid, fob, carded, now)
+        except Exception as e:  # noqa: BLE001 — a wait's tap never becomes
+            #                     a card-in, a card-out or a tap-over
+            log.error("💳 [%s] ADD FOB: the tap of fob %s failed on the "
+                      "hub side (%s)", egm_id, uid, type(e).__name__)
+        return True
+
+    def _fob_wait_take(self, egm_id, wait, w, uid, fob, carded, now):
+        """The tap that belongs to an ADD FOB wait: add the fob, or say
+        why not. `wait` is the machine's wait itself (touched only under
+        companion_lock), `w` the copy made in the hold that found it, and
+        `carded` {uid: egmId} of every card session and tap-over then.
+        First match wins:
+          1  the player is gone, or has become an admin   the wait ends
+          2  the fob the admin carded in with             refused
+          3  a reset fob (no handpay reset is sent)       refused
+          4  any other fob that is not a player fob       refused
+          5  already this player's                        refused
+          6  another player's (nothing is moved)          refused
+          7  carded in at a machine right now             refused
+          8  a fob the hub does not know, or a player fob with no player:
+             player_action linkFob (registers an unknown one as a player
+             fob and links it). The store refusing is a refusal too.
+        A refused fob does NOT end the wait: the screen shows the reason
+        (`note`) and keeps counting, so another fob can be tapped. Nobody
+        is carded in or out by any of these. The result is written only
+        if this is still the machine's wait and still waiting."""
+        aid, by = w["accountId"], w["by"]
+        acct = self.account_store.get(aid)
+        gone = acct is None or acct.get("kind") != "player" \
+            or bool(acct.get("admin"))
+        name = str((acct or {}).get("name") or w["name"])
+        tier = (fob or {}).get("tier")
+        note, linked = "", False
+        if gone:
+            pass
+        elif uid == str(w["adminUid"] or "").upper():
+            note = "That is the fob you carded in with."
+        elif fob is not None and tier == "reset":
+            note = "That is a reset fob. It can't be a player's fob."
+        elif fob is not None and tier != "player":
+            # attendant, manager, or a tier this build does not know
+            note = "That is a staff fob. It can't be a player's fob."
+        else:
+            owner_id = str((fob or {}).get("accountId") or "").strip()
+            owner = self.account_store.get(owner_id) if owner_id else None
+            if owner_id == aid:
+                note = f"That fob is already {name}'s."
+            elif owner is not None:
+                other = str(owner.get("name") or owner_id)
+                note = (f"That fob belongs to {other}. Remove it from "
+                        f"{other} first.")
+            elif uid in carded:
+                note = (f"That fob is carded in at "
+                        f"{self._glass_machine_name(carded[uid])}. Card "
+                        "out there first.")
+            else:
+                r = self.player_action({"action": "linkFob",
+                                        "accountId": aid, "uid": uid},
+                                       by=by)
+                if r.get("ok"):
+                    linked = True
+                    # this tap is the fob's first: a fob the hub did not
+                    # know had no row to stamp when the tap came in
+                    self.hub_store.fob_touch(uid, now_iso())
+                elif "registry full" in str(r.get("error") or ""):
+                    # fob_set's own words for a full fobs table
+                    note = ("The fob list is full. Remove a fob on the "
+                            "hub's web page first.")
+                else:
+                    note = "That fob could not be added. Try again."
+        with self.companion_lock:
+            mine = (self._fob_waits or {}).get(egm_id) is wait \
+                and wait["state"] == "waiting"
+            if mine and gone:
+                wait.update(state="ended", note="", endTs=now,
+                            msg=self.GLASS_SAY_GONE)
+            elif mine and linked:
+                wait.update(state="linked", note="", endTs=now,
+                            linkedUid=uid, msg=f"Fob added for {name}.")
+            elif mine:
+                wait["note"] = note
+        if gone:
+            log.info("💳 [%s] ADD FOB for %s (%s) ended at the tap of fob "
+                     "%s: the player is gone or is an admin now — by %s",
+                     egm_id, name, aid, uid, by)
+        elif linked:
+            log.info("💳 [%s] ADD FOB: fob %s added for %s (%s) — by %s",
+                     egm_id, uid, name, aid, by)
+        else:
+            log.info("💳 [%s] ADD FOB: fob %s not taken for %s (%s): %s "
+                     "— by %s", egm_id, uid, name, aid, note, by)
 
     @staticmethod
     def sas_from_egm_ready(entry):
@@ -26169,6 +27110,9 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                             "currency_symbol", "") or "",
                         # PIN login (2026-09-14): Settings ▸ Gameroom ▸ PIN
                         "pinMinDigits": pin_min_digits(engine.hub_store),
+                        # Settings ▸ Gameroom ▸ Quick amounts: the three
+                        # one-tap amounts on the admin's amount pad
+                        "quickAddCents": quick_add_cents(engine.hub_store),
                         "pinAdminAllowed": engine.hub_store.host_setting(
                             "pin_admin_allowed", "0") == "1",
                         # Collector economy (2026-07-13, de-caged 07-15): the bank's
@@ -26377,12 +27321,13 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                                    or "glass state failed"})
             self._send(200, body, "application/json", soap=False)
         elif path.startswith("/api/glass/data"):
-            # Glass destub v1: the panel's compact feature reads
-            # (?sess=&view=cashout|tickets|handpay|games|settings). Token-
-            # resolved (401 unknown), egmId forced from the token; the admin
-            # views 403 for a plain player. NEVER-500 (the /api/glass/state
-            # posture): the panel's poll loop must survive any hub fault, so
-            # a builder bug answers a degraded 200 rather than an HTTP error.
+            # The screen's token-resolved reads
+            # (?sess=&view=cashout|handpay|players). 401 for an unknown
+            # token, egmId forced from the token, 403 for a view the
+            # caller may not read (G2SHost.glass_data says who may).
+            # NEVER-500 (the /api/glass/state posture): the page's poll
+            # loop must survive any hub fault, so a builder bug answers a
+            # degraded 200 rather than an HTTP error.
             qs = urllib.parse.parse_qs(
                 urllib.parse.urlsplit(self.path).query)
             sess = (qs.get("sess") or [""])[0].strip()
@@ -27468,13 +28413,15 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                           soap=False)
 
     def _handle_glass_action(self, raw):
-        """POST /api/glass/action {sess, action, ...} — the glass SPA's ONLY
-        write path (glass destub v1). The hub is the authority: the token
-        resolves to the server-side record (401 for a missing/unknown/idle-
-        expired sess — the resolve refreshes the operator idle clock), the
-        egmId is taken from THAT record (a body egmId is IGNORED — a page can
-        only ever act on its own cabinet), and access is re-resolved LIVE
-        (_session_is_admin), never a client-claimed tier. Verbs:
+        """POST /api/glass/action {sess, action, ...}: what a carded
+        player's screen asks for itself, plus clearHandpay. (The admin
+        menus' own writes are POST /api/glass/admin, _handle_glass_admin.)
+        The hub is the authority: the token resolves to the server-side
+        record (401 for a missing/unknown/idle-expired sess; the resolve
+        refreshes the operator idle clock), the egmId is taken from THAT
+        record (a body egmId is IGNORED: a page can only ever act on its
+        own cabinet), and access is worked out on the hub for every
+        request, never from a tier the page claims. Verbs:
           logout          — any carded session: the SAME shared card-out a
                              physical re-tap runs (expect_tok closes the
                              resolve→act TOCTOU).
@@ -27486,10 +28433,13 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
           cashOutToWallet — any carded session with a linked wallet: arms
                              setWatCashOut so the machine's own cash-out
                              mirrors to the player's wallet. Moves no money.
-          clearHandpay    — ADMIN only: reset the pending lockup to credits.
-          refreshGames    — ADMIN only: gamePlay rescan (inventory + status).
-        Anything outside a session's band answers an honest 403 — NEVER a
-        500."""
+          clearHandpay    — an admin carded in normally, or a tap-over
+                             (_glass_caller): reset this machine's pending
+                             handpay.
+        The three wallet verbs are refused for a tap-over token: they
+        would move the admin's own money on the friend's screen. Anything
+        else, every name this endpoint once knew included, answers 403
+        "not yet" and does nothing. NEVER a 500."""
         engine = self.host_engine
         try:
             req = json.loads(raw) if raw.strip() else {}
@@ -27508,7 +28458,6 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
         action = str(req.get("action") or "")
         egm_id = rec.get("egmId")           # FROM THE TOKEN — body egmId ignored
         uid = rec.get("uid")
-        admin = engine._session_is_admin(uid, rec.get("tier"))
         # The carded player's OWN wallet (fob -> account), resolved server-
         # side — the SESSION is the account authority, never the body. None
         # unless a player-kind account is linked.
@@ -27603,49 +28552,81 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                 egm_id, acct_id, enable, expect_tok=tok)
             return done(status, payload)
 
-        if action in GLASS_ADMIN_ACTIONS:
-            if not admin:
+        if action == "clearHandpay":
+            # For an admin carded in normally (the admin menu) and for a
+            # tap-over (the service screen); nobody else. This branch
+            # names its one action and ends in a return: until the admin
+            # menus work, everything else in the admin band fell through
+            # to a rescan of the machine's games (several hundred
+            # requests on an AVP).
+            who = engine._glass_caller(tok)
+            if who is None:
+                return self._send(401, json.dumps(
+                    {"ok": False, "error": "unknown session"}),
+                    "application/json", soap=False)
+            if who["kind"] not in ("admin", "service"):
                 return done(403, {"ok": False, "error": "not authorized"})
-            if action == "clearHandpay":
-                # A machine with a SAS side is reset over SAS (the
-                # linked-machine rule), whether or not it has a G2S side
-                # and whether or not that side is up.
-                _leg = engine.linked_leg(egm_id)
-                if not _leg:
-                    with engine.sas_lock:
-                        _leg = egm_id if egm_id in engine.sas_machines \
-                            else None
-                if _leg:
-                    code, payload = engine.linked_command(
-                        "clearHandpay", egm_id, _leg, req)
-                    return done(code, payload)
+            log.info("🧑‍💼 [%s] handpay clear asked by %s", egm_id,
+                     engine._glass_by(who))
+            # A machine with a SAS side is reset over SAS (the
+            # linked-machine rule), whether or not it has a G2S side
+            # and whether or not that side is up.
+            _leg = engine.linked_leg(egm_id)
+            if not _leg:
+                with engine.sas_lock:
+                    _leg = egm_id if egm_id in engine.sas_machines \
+                        else None
+            if _leg:
+                code, payload = engine.linked_command(
+                    "clearHandpay", egm_id, _leg, req)
+                return done(code, payload)
             with engine.assoc_lock:
                 assoc = engine.associations.get(egm_id)
             if assoc is None:
                 return done(404, {"ok": False,
                                   "error": "machine not connected"})
-            if action == "clearHandpay":
-                # reset the pending lockup to credits — the SAME reset a
-                # reset-fob fires. A specific transactionId keys THAT lockup
-                # off; omitted keys the NEWEST (the one the operator just saw).
-                txn = req.get("transactionId")
-                if txn is not None:
-                    txn = str(txn)
-                    engine.enqueue_set_remote_key_off(assoc, txn_id=txn)
-                    return done(200, {"ok": True, "hpId": txn})
-                res = engine.reset_newest_handpay(assoc)
-                ok = not (isinstance(res, dict) and res.get("ok") is False)
-                payload = dict(res) if isinstance(res, dict) else {}
-                payload["ok"] = ok
-                return done(200, payload)   # honest ok:false at 200
-            # refreshGames — gamePlay rescan (inventory re-harvest + status)
-            res = engine.refresh_game_play_status(assoc)
+            # reset the pending lockup to credits — the SAME reset a
+            # reset-fob fires. A specific transactionId keys THAT lockup
+            # off; omitted keys the NEWEST (the one the operator just saw).
+            txn = req.get("transactionId")
+            if txn is not None:
+                txn = str(txn)
+                engine.enqueue_set_remote_key_off(assoc, txn_id=txn)
+                return done(200, {"ok": True, "hpId": txn})
+            res = engine.reset_newest_handpay(assoc)
             ok = not (isinstance(res, dict) and res.get("ok") is False)
             payload = dict(res) if isinstance(res, dict) else {}
             payload["ok"] = ok
-            return done(200, payload)
+            return done(200, payload)   # honest ok:false at 200
 
         return done(403, {"ok": False, "error": "not yet"})
+
+    def _handle_glass_admin(self, raw):
+        """POST /api/glass/admin {sess, action, ...}: the admin menus'
+        writes from a machine's screen (the tap-over service screen and
+        the companion screen's players menu). A thin caller of
+        G2SHost.glass_admin_action, which holds every rule. do_POST routes
+        here AHEAD of the wire logger: this body can carry a new PIN, and
+        it is never written to any log."""
+        try:
+            req = json.loads(raw) if raw.strip() else {}
+        except (ValueError, TypeError, RecursionError):
+            # RecursionError: a body nested thousands deep. It is not a
+            # ValueError, and uncaught it ended the request with no reply.
+            req = None
+        if not isinstance(req, dict):
+            return self._send(400, '{"ok": false, "error": "invalid JSON"}',
+                              "application/json", soap=False)
+        try:
+            status, payload = self.host_engine.glass_admin_action(req)
+            body = json.dumps(payload, allow_nan=False)
+        except Exception as e:  # noqa: BLE001 — never a 500 on a screen
+            # the class only: the text of a fault can quote what was typed
+            log.error("🪟 glass admin action failed on the hub side (%s)",
+                      type(e).__name__)
+            status, body = 200, json.dumps(
+                {"ok": False, "error": G2SHost.GLASS_SAY_AGAIN})
+        return self._send(status, body, "application/json", soap=False)
 
     @staticmethod
     def _reject_nonfinite(_c):
@@ -28994,6 +29975,21 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                     raise ValueError("pinMinDigits must be 4 or 6")
                 engine.hub_store.set_host_setting("pin_min_digits", str(md))
                 out["pinMinDigits"] = md
+            if "quickAddCents" in req:
+                # The three quick amounts on the admin's amount pad on a
+                # machine's screen (2026-11-18). Exactly three, each one
+                # an amount a chip can show exactly (quick_add_error). The
+                # screens pick it up on their next poll.
+                qa = req.get("quickAddCents")
+                if not isinstance(qa, list) or len(qa) != 3:
+                    raise ValueError("Give three quick amounts.")
+                for v in qa:
+                    why = quick_add_error(v)
+                    if why:
+                        raise ValueError(why)
+                engine.hub_store.set_host_setting(
+                    "quick_add_cents", ",".join(str(v) for v in qa))
+                out["quickAddCents"] = list(qa)
             if "pinAdminAllowed" in req:
                 # Whether a PIN login on an admin account gets the admin
                 # menu (default no — see _session_is_admin). Strict bool.
@@ -29439,6 +30435,17 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
             wire.info("IN  <<< POST %s from %s (%d bytes, body withheld)",
                       self.path.split("?", 1)[0], peer, len(raw))
             return self._handle_auth_post(raw, peer)
+        # A typed PIN is in these two bodies (a new PIN from a screen's
+        # admin menu, the PIN of a login), so they too are routed here,
+        # ahead of the wire logger. Until the admin menus work the login
+        # PIN was written to the wire log, which a support bundle copies.
+        if self.path.startswith("/api/glass/admin") \
+                or self.path.startswith("/api/glass/pinlogin"):
+            wire.info("IN  <<< POST %s from %s (%d bytes, body withheld)",
+                      self.path.split("?", 1)[0], peer, len(raw))
+            if self.path.startswith("/api/glass/admin"):
+                return self._handle_glass_admin(raw)
+            return self._handle_glass_pin_login(raw, peer)
         # SAS floor reports are periodic (every 1s per satellite) — route them
         # AROUND the verbatim wire logger below (like the meterInfo digest) so
         # steady-state satellite traffic never spams the wire capture (F1).
@@ -29456,7 +30463,15 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
         # ~15MB/h of wire log machine-on. Meter-heavy bodies log an INFO
         # digest; the full body still records at DEBUG, which reaches the
         # wire file only under --wire-full / -v.
-        if len(raw) >= WIRE_DIGEST_MIN_BYTES and "meterInfo" in raw:
+        if self.path.startswith("/api/players") and (
+                "setPin" in raw or '"pin"' in raw or "\\u" in raw):
+            # The Players web page setting a PIN. The logger runs before
+            # any JSON is parsed, so this is a plain test on the text; a
+            # body with an escaped character is withheld too, since the
+            # words looked for could be spelled that way.
+            wire.info("IN  <<< POST %s from %s (%d bytes, body withheld)",
+                      self.path.split("?", 1)[0], peer, len(raw))
+        elif len(raw) >= WIRE_DIGEST_MIN_BYTES and "meterInfo" in raw:
             wire.info("IN  <<< POST %s from %s SOAPAction=%s\n[meterInfo "
                       "digest: %d bytes, ~%d simpleMeters — full body "
                       "logged at DEBUG; run with --wire-full to capture]",
@@ -29470,8 +30485,6 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
 
         if self.path.startswith("/api/command"):
             return self._handle_command(raw)
-        if self.path.startswith("/api/glass/pinlogin"):
-            return self._handle_glass_pin_login(raw, peer)
         if self.path.startswith("/api/glass/action"):
             return self._handle_glass_action(raw)
         if self.path.startswith("/api/tito/"):

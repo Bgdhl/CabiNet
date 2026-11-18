@@ -6,19 +6,28 @@
      The WMS BB2E cannot be host-skinned on its own glass, so the FULL Funcino
      player experience lives HERE: a 1024x600 landscape HDMI panel on the
      cabinet's Zero 2 W SMIB, rendered by a local kiosk browser pointed at
-     http://<hub>:8081/webui/smib.html?egm=<egmId>. Same views, same flows,
+     http://<hub>:8081/webui/smib.html?egm=<egmId>. Same player flows and
      same server contracts as webui/glass.html (the IGT on-glass SPA — the
      behavioral spec for this page); only the PRESENTATION is re-laid for
-     landscape. The hub is the ONLY authority: this page is a thin client of
-     the exact endpoints the IGT glass uses —
+     landscape. This panel has room the narrow glass does not, so the
+     admin's PLAYERS menu and the letter keyboard exist here and not there.
+     The hub is the ONLY authority: this page is a thin client of —
        GET  /api/glass/state?egm=...&src=smib   (~1.5s poll; the carded /
             attract flip + the hub-minted sess token, kept in a JS closure
-            var, NEVER in the URL)
+            var, NEVER in the URL; during a tap-over it also carries the
+            friend's figures in "service")
        GET  /api/glass/data?sess=...&view=...   (cashout live ~2s while open;
-            tickets/handpay/games/settings fetch-on-open, glass.html parity)
-       POST /api/glass/action {sess, action, ...} (the hub re-resolves admin
-            and forces egmId FROM THE TOKEN — this page never sends an egmId
-            or trusts a client-side amount/access decision)
+            handpay and players fetch-on-open; players once a second while
+            ADD FOB waits for a tap)
+       POST /api/glass/action {sess, action, ...} (logout, the wallet verbs,
+            clearHandpay. The hub re-resolves admin and forces egmId FROM
+            THE TOKEN — this page never sends an egmId or trusts a
+            client-side amount/access decision)
+       POST /api/glass/admin {sess, action, ...} (what an admin does for a
+            player: add, take back, PIN, fob, rename, new player. For a
+            tap-over the hub takes the friend from this machine's card
+            session, never from this page. The hub keeps this body out of
+            its wire log, so a NEW PIN is sent here and nowhere else)
      src=smib on purpose and forever: only the AVP's resident on-glass page
      may brand its poll as the spa — that brand stamps mediaDisplay residency
      and advances the AVP content sequencer (hub-side, g2s_host.py:5591).
@@ -28,6 +37,25 @@
      restart the kiosk unit instead of self-reloading off another file's
      watermark.
 
+     Who sees what (the hub decides; this page only draws it):
+       * every account: MY WALLET / CASH OUT / LOG OUT
+       * an admin carded in normally (state.admin): the same, plus ONE
+         button, ADMIN, leading to
+           HANDPAY     this machine's pending handpay + CLEAR
+           PLAYERS     the list with balances -> one player's page: ADD
+                       FUNDS, TAKE BACK, ADD FREE SLOT PLAY, RENAME, SET
+                       PIN, CLEAR PIN, ADD FOB (tap it on this machine's
+                       reader), REMOVE FOB
+           NEW PLAYER  the letter keyboard
+         Making someone an admin and deleting a player stay on the hub's
+         web page.
+       * a TAP-OVER (state.overlay: an admin taps their fob while a friend
+         is carded in): the quick SERVICE screen for that friend and
+         nothing else — their wallet, Free Slot Play and machine credits,
+         CLEAR HANDPAY when one is pending, ADD TO WALLET, ADD FREE SLOT
+         PLAY, SET PIN, DONE. The friend stays carded in; DONE hands the
+         screen back.
+
      Behavior contract (mirrors glass.html):
        * carded=false while a menu is up -> attract (hub-side card-out wins)
        * 4 consecutive poll failures -> attract + "Reconnecting" note, polling
@@ -35,8 +63,16 @@
        * ok:false (hub disowns the egm) -> attract + "reconnecting" for the
          first ~2 min, then "not set up" (a hub restart disowns everyone
          briefly; only a persistent not-known is worth a human's attention)
-       * money moves (walletFund ADD, handpay CLEAR) go through the confirm
-         dialog; hub refusals are surfaced verbatim, never papered over
+       * money moves (walletFund ADD, handpay CLEAR, an admin's add / take
+         back) go through the confirm dialog; hub refusals are surfaced
+         verbatim, never papered over
+       * the hub writes every result sentence of an admin action (msg) and
+         every refusal (error); this page shows them as they come
+       * a new session token, or a fall to attract, closes the keypad and
+         the keyboard, forgets a half-typed PIN and drops an armed confirm;
+         a reply that comes back to a different session changes nothing
+       * a NEW PIN is typed twice and shown as bullets only; the digits are
+         never in the DOM, a URL or the console
        * logout tombstones its token (deadSess) so a stale in-flight poll
          can never resurrect the menu with a revoked session
        * fun-money/credits wording only; brand = the collector's gameroom name
@@ -62,8 +98,7 @@
          with Free Slot Play: label y=250(13), figure y=274(lh38)->312,
          ADMIN badge y=336(h30)->366                                 OK
          col A (base) top 72: 3 x 84 + 2 x 24 gap: 72/180/288 ->372  OK
-         col B (admin) top 72: 5 x 84 + 4 x 14 gap: 72/170/268/366/464
-           -> ends 548 < 600                                         OK
+         col B (admin) top 72: the one ADMIN button -> 156           OK
        attract: rule1 y=150 (x 412 w 200), brand y=176(lh84)->260,
          rule2 y=284, nick y=316(20)->336, tap y=392(lh44)->436,
          note y=524(lh22 x2)->568 < 600                              OK
@@ -82,18 +117,41 @@
          hint y=272 (w584, lh19 x2)->310; sec3 y=330, the CASH OUT button
          switch y=358..442, its hint y=454 (w280, up to 5 lines ->549);
          funding moved to MY WALLET, BACK 492..576                   OK
-       machine: 2 label columns (x=32 w320 / x=384 w304), 3 blocks each
-         at y=110/182/254 (block = 13px label + 20px value, 72 pitch)
-         -> last value ends ~298                                     OK
-       tickets/handpay: list x=32 w=656 y=88 h=460 = 10 x 46px rows
-         EXACT -> ends 548; CLEAR (720,392..476) + BACK (720,492..576),
+       handpay: list x=32 w=656 y=88 h=460 = 10 x 46px rows EXACT
+         -> ends 548; CLEAR (720,392..476) + BACK (720,492..576),
          gap 16                                                      OK
-       games: asOf y=70, list x=32 w=656 y=100 h=440 = 11 x 40px rows
-         EXACT -> ends 540; REFRESH (720,392..476), BACK 492..576    OK
+       left panel of SERVICE / ADMIN / PLAYER (the home panel's own
+         heights): title y=40->66, name y=76(h40)->116, hairline y=140,
+         wallet y=164 / 188(lh44)->232, Free Slot Play y=250 /
+         274(lh38)->312                                              OK
+       service: machine y=336 / 358(lh36)->394, foot y=556->570;
+         col A 72/170/268 ->352, message (416,372) w584 4 x 20 ->452;
+         col B CLEAR HANDPAY 72->156, caption y=166 3 x 18 ->220;
+         DONE in the BACK slot 492..576                              OK
+       admin: THIS MACHINE y=100 / 124(lh26)->150, HANDPAY PENDING
+         y=180 / 204(lh36)->240; col A 92/190/288 ->372; BACK        OK
+       players: list x=32 w=656 y=88 h=448 = 7 x 64px rows EXACT
+         -> ends 536; count (720,92); PREV (720,394) + NEXT (866,394)
+         134x84 -> ends 1000 / 478; BACK 492..576, gap 14            OK
+       player: info y=336(18)->354, message y=372 7 x 20 ->512;
+         col A + col B 92/190/288/386 ->470; BACK 492..576, gap 22   OK
+       fobs: name y=70(lh24)->94, list y=104 h=384 = 6 x 64px rows
+         EXACT -> ends 488, "+n more" y=498->516; BACK               OK
        confirms (logout + money): q y=160(lh40)->200, sub y=228(lh26 x2)
          ->280 (x 232 w 560), YES (232,330) 260x84 -> 492/414,
          NO (532,330) 260x84 -> 792/414 (232 margin each side, 40 gap),
-         note y=444(lh20 x2)->484 < 600                              OK -->
+         note y=444(lh20 x2)->484 < 600                              OK
+       keypad overlay: title y=40, figure y=68(lh66)->134, message
+         y=142->160, grid (342,168) 340x396: keys 104x72 at x 0/118/236
+         and y 0/86/172/258, CANCEL 340x52 at y 344 -> ends 564;
+         the admin's quick amounts: three 160x72 chips at x=736
+         (->896), y=168/254/340 ->412, right of the grid (ends 682)  OK
+       keyboard overlay: title y=18, box (112,44) 800x64 ->108, message
+         y=116->134; keys 88x72 with 8px gaps (pitch 96x80), rows at
+         y=144/224/304/384/464 -> ends 536; ten keys from x=36 -> 988;
+         nine from x=84 -> 940; SHIFT 136 + seven + DELETE 136 -> 988;
+         CANCEL 232 + hyphen 88 + SPACE 280 + apostrophe 88 + OK 232
+         -> 988 (+36 = 1024)                                         OK -->
 <head>
 <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
 <meta http-equiv="X-UA-Compatible" content="IE=edge">
@@ -133,6 +191,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
 .nb-red:active { background: #7c2c23; }
 .nb-off { color: #3a4757; background: #0f151d; border-color: #1c2634;
           cursor: default; }
+.nb-off:active { background: #0f151d; }
 
 /* the home button columns + shared positioned slots ---------------------- */
 #hm-cola { position: absolute; left: 416px; top: 72px; width: 280px; }
@@ -300,14 +359,6 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
 #wl-toggle-hint { position: absolute; left: 720px; top: 192px; width: 280px;
                   font-size: 14px; line-height: 19px; color: #55708a; }
 
-/* --- machine info (two label columns) ------------------------------------ */
-#mi-c1 { position: absolute; left: 32px;  top: 110px; width: 320px; }
-#mi-c2 { position: absolute; left: 384px; top: 110px; width: 304px; }
-.mi-l { font-size: 13px; letter-spacing: 2px; color: #55708a;
-        margin-bottom: 4px; }
-.mi-v { font-size: 20px; color: #dfe7ef; margin-bottom: 28px;
-        overflow: hidden; white-space: nowrap; }
-
 /* --- CASH OUT (machine credits + wallet + the cash-out DESTINATION toggle;
    funding lives in MY WALLET). .chip/.chip-sel/.chip-off are shared by the
    wallet's FUND pad and are defined here; .co-sec is shared by both views. */
@@ -341,7 +392,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
 #co-arm-hint { position: absolute; left: 416px; top: 454px; width: 280px;
                font-size: 14px; line-height: 19px; color: #55708a; }
 
-/* --- shared compact list rows (tickets / handpay) ------------------------ */
+/* --- compact list rows (handpay) ----------------------------------------- */
 .listbox { position: absolute; left: 32px; width: 656px; overflow: hidden; }
 .lr { position: relative; height: 46px; border-bottom: 1px solid #1c2634; }
 .lr-a { position: absolute; left: 0; top: 5px; font-size: 18px;
@@ -353,19 +404,117 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
 .lr-empty { text-align: center; font-size: 17px; color: #55708a;
             padding-top: 48px; }
 
-/* --- games rows ----------------------------------------------------------- */
-.gr { position: relative; height: 40px; border-bottom: 1px solid #1c2634;
-      cursor: pointer; }
-.gr-n { position: absolute; left: 0; top: 10px; width: 540px; font-size: 16px;
-        color: #dfe7ef; white-space: nowrap; overflow: hidden; }
-.gr-e { position: absolute; right: 0; top: 11px; font-size: 14px;
-        font-weight: bold; letter-spacing: 1px; }
-#gm-asof { position: absolute; left: 32px; top: 70px; width: 656px;
-           font-size: 13px; color: #55708a; overflow: hidden;
-           white-space: nowrap; }
+/* --- the left panel of SERVICE, ADMIN and PLAYER --------------------------
+   A name, then label + figure pairs at the home panel's own heights
+   (hairline y=140, wallet y=164/188, Free Slot Play y=250/274). The name
+   and the figures are fitted to the 320px lane in script (fitText). */
+#sv-title, #am-title, #pp-title { width: 320px; }
+.pn-name  { position: absolute; left: 32px; top: 76px; width: 320px;
+            height: 40px; font-size: 30px; line-height: 40px;
+            font-weight: bold; color: #f0f4f8; overflow: hidden;
+            white-space: nowrap; text-overflow: ellipsis; }
+.pn-rule  { left: 32px; top: 140px; width: 320px; }
+.pn-vrule { left: 384px; top: 32px; width: 1px; height: 536px; }
+.pn-l     { position: absolute; left: 32px; width: 320px; font-size: 13px;
+            letter-spacing: 3px; color: #55708a; white-space: nowrap; }
+.pn-v     { position: absolute; left: 32px; width: 320px; font-weight: bold;
+            overflow: hidden; white-space: nowrap; }
+.pn-wl-l  { top: 164px; }
+.pn-wl-v  { top: 188px; font-size: 40px; line-height: 44px; color: #e8c266; }
+.pn-fp-l  { top: 250px; }
+.pn-fp-v  { top: 274px; font-size: 32px; line-height: 38px; color: #7fd0a8; }
+/* A button placed by its own id. Every button of the views below is one,
+   so the strip lane can move each without fighting an inline style.
+   .pb-s = a label too long for the standard 21px type. */
+.pb   { position: absolute; margin: 0; }
+.pb-s { font-size: 17px; letter-spacing: 1px; }
 
-/* --- settings rows --------------------------------------------------------- */
-#se-rows { position: absolute; left: 32px; top: 100px; width: 600px; }
+/* --- SERVICE: the one screen of a tap-over --------------------------------
+   Left = the friend's name and figures. Col A = what the admin can give
+   them, then the message line. Col B = CLEAR HANDPAY and its caption (only
+   while one is pending), DONE in the BACK slot. */
+#sv-mc-l  { top: 336px; }
+#sv-mc-v  { top: 358px; font-size: 30px; line-height: 36px; color: #dfe7ef; }
+#sv-foot  { position: absolute; left: 32px; top: 556px; width: 320px;
+            font-size: 14px; color: #55708a; overflow: hidden;
+            white-space: nowrap; text-overflow: ellipsis; }
+#sv-add   { left: 416px; top: 72px; }
+#sv-fsp   { left: 416px; top: 170px; }
+#sv-pin   { left: 416px; top: 268px; }
+/* the hub's sentence carries the whole name: four lines, then cut */
+#sv-msg   { position: absolute; left: 416px; top: 372px; width: 584px;
+            height: 80px; font-size: 16px; line-height: 20px;
+            color: #c98a4f; overflow: hidden; }
+#sv-clear { left: 720px; top: 72px; }
+#sv-hp-cap { position: absolute; left: 720px; top: 166px; width: 280px;
+             height: 54px; font-size: 13px; line-height: 18px;
+             color: #c98a4f; overflow: hidden; }
+
+/* --- ADMIN menu ------------------------------------------------------------ */
+#am-nick-l { top: 100px; }
+#am-nick   { top: 124px; font-size: 20px; line-height: 26px; color: #dfe7ef; }
+#am-hp-l   { top: 180px; display: none; }
+#am-hp-v   { top: 204px; font-size: 30px; line-height: 36px; color: #e8c266;
+             display: none; }
+#am-handpay { left: 416px; top: 92px; }
+#am-players { left: 416px; top: 190px; }
+#am-new     { left: 416px; top: 288px; }
+
+/* --- PLAYERS and the fob list: 64px rows, each row ONE touch target ------
+   Nothing on this page scrolls, so the list pages: seven rows, PREV / NEXT. */
+#pl-list  { top: 88px; height: 448px; }
+.pr   { position: relative; height: 64px; border-bottom: 1px solid #1c2634;
+        cursor: pointer; }
+.pr:active { background: #141c26; }
+.pr-n { position: absolute; left: 12px; top: 6px; width: 330px;
+        font-size: 22px; line-height: 30px; font-weight: bold;
+        color: #f0f4f8; white-space: nowrap; overflow: hidden;
+        text-overflow: ellipsis; }
+.pr-i { position: absolute; left: 12px; top: 38px; width: 330px;
+        font-size: 13px; line-height: 18px; color: #55708a;
+        white-space: nowrap; overflow: hidden; }
+.pr-w { position: absolute; right: 12px; top: 6px; width: 288px;
+        text-align: right; font-size: 22px; line-height: 30px;
+        font-weight: bold; color: #e8c266; white-space: nowrap;
+        overflow: hidden; }
+.pr-neg { color: #ff7a6e; }
+.pr-f { position: absolute; right: 12px; top: 38px; width: 288px;
+        text-align: right; font-size: 13px; line-height: 18px;
+        color: #7fd0a8; white-space: nowrap; overflow: hidden; }
+.pr-t { position: absolute; right: 12px; top: 18px; width: 288px;
+        text-align: right; font-size: 18px; line-height: 28px;
+        color: #9fb2c8; white-space: nowrap; overflow: hidden; }
+#pl-count { position: absolute; left: 720px; top: 92px; width: 280px;
+            text-align: center; font-size: 16px; color: #9fb2c8; }
+#pl-prev, #pl-next { top: 394px; width: 134px; }
+#pl-prev  { left: 720px; }
+#pl-next  { left: 866px; }
+
+/* --- one PLAYER: figures left, eight actions in two columns --------------- */
+#pp-info  { position: absolute; left: 32px; top: 336px; width: 320px;
+            font-size: 15px; line-height: 18px; color: #9fb2c8;
+            overflow: hidden; white-space: nowrap; }
+/* seven lines: the ADD FOB wait is two lines, the count, and a note that
+   can name two players. pre-line keeps the count on its own line. */
+#pp-msg   { position: absolute; left: 32px; top: 372px; width: 320px;
+            height: 140px; font-size: 16px; line-height: 20px;
+            color: #c98a4f; overflow: hidden; white-space: pre-line; }
+#pp-add    { left: 416px; top: 92px; }
+#pp-take   { left: 416px; top: 190px; }
+#pp-fsp    { left: 416px; top: 288px; }
+#pp-rename { left: 416px; top: 386px; }
+#pp-setpin { left: 720px; top: 92px; }
+#pp-clrpin { left: 720px; top: 190px; }
+#pp-addfob { left: 720px; top: 288px; }
+#pp-remfob { left: 720px; top: 386px; }
+
+/* --- REMOVE FOB: which one (a player with more than one fob) -------------- */
+#fb-name  { position: absolute; left: 32px; top: 70px; width: 656px;
+            font-size: 18px; line-height: 24px; color: #f0f4f8;
+            overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+#fb-list  { top: 104px; height: 384px; }
+#fb-more  { position: absolute; left: 32px; top: 498px; width: 656px;
+            font-size: 14px; line-height: 18px; color: #55708a; }
 
 /* --- confirms (logout + money): centered dialog geometry ------------------ */
 .cf-q   { position: absolute; left: 112px; top: 160px; width: 800px;
@@ -380,12 +529,16 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
 .cf-yes { position: absolute; left: 232px; top: 330px; width: 260px; }
 .cf-no  { position: absolute; left: 532px; top: 330px; width: 260px; }
 
-/* --- custom-amount keypad: a modal overlay opened from the FUND selection,
-   so ADD isn't stuck at the biggest preset chip. ATM-style entry (digits
+/* --- keypad: ONE modal overlay, four jobs (kpMode in the script).
+   'amount' = MY WALLET's custom amount, opened from the FUND selection so
+   ADD isn't stuck at the biggest preset chip: ATM-style entry (digits
    shift in from the right as cents); OK feeds selCents, chips stay as quick
-   picks. Bounded by the wallet (the AFT cap is just the BCD wire max). ------ */
+   picks. Bounded by the wallet (the AFT cap is just the BCD wire max).
+   'pin' = a player logs in on attract. 'give' = an admin adds to or takes
+   back from a player's wallet (same entry, plus the quick amounts below).
+   'newpin' = an admin sets a player's PIN (bullets, typed twice). ---------- */
 #kp-scrim { position: absolute; left: 0; top: 0; width: 1024px; height: 600px;
-            background: rgba(6, 9, 13, 0.94); z-index: 60; display: none; }
+            background: rgba(6, 9, 13, 0.97); z-index: 60; display: none; }
 #kp-ttl { position: absolute; left: 312px; top: 40px; width: 400px;
           text-align: center; font-size: 15px; letter-spacing: 3px;
           color: #9fb2c8; }
@@ -412,6 +565,62 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
              border: 2px solid #1c2634; cursor: pointer; }
 #kp-cancel:active { background: #1c2634; }
 
+/* the admin's three quick amounts (the owner's own, from Settings; $20 /
+   $50 / $100 until the hub says), right of the grid; shown
+   only while the pad is adding to or taking back from a player's wallet
+   (#kp-scrim.give). A chip is the same as typing that amount and OK. */
+.kp-chip { position: absolute; left: 736px; width: 160px; height: 72px;
+           line-height: 68px; text-align: center; font-size: 26px;
+           font-weight: bold; color: #e8c266; background: #141c26;
+           border: 2px solid #2c3a4a; cursor: pointer; display: none; }
+.kp-chip:active { background: #26364a; }
+.give .kp-chip { display: block; }
+#kp-chip0 { top: 168px; }
+#kp-chip1 { top: 254px; }
+#kp-chip2 { top: 340px; }
+
+/* --- letter keyboard: a modal overlay like the keypad, for a player's name
+   (NEW PLAYER, RENAME). Five rows of 88x72 keys with 8px gaps; each row is
+   a strip of floated keys, so the strip lane re-lays it by moving rows. */
+#kb-scrim { position: absolute; left: 0; top: 0; width: 1024px; height: 600px;
+            background: rgba(6, 9, 13, 0.97); z-index: 60; display: none; }
+#kb-ttl { position: absolute; left: 112px; top: 18px; width: 800px;
+          text-align: center; font-size: 15px; letter-spacing: 3px;
+          color: #9fb2c8; }
+#kb-box { position: absolute; left: 112px; top: 44px; width: 800px;
+          height: 64px; line-height: 60px; text-align: center;
+          font-size: 36px; font-weight: bold; color: #e8c266;
+          background: #141c26; border: 2px solid #2c3a4a;
+          overflow: hidden; white-space: pre; }
+#kb-msg { position: absolute; left: 112px; top: 116px; width: 800px;
+          height: 18px; line-height: 18px; text-align: center;
+          font-size: 14px; color: #c98a4f; overflow: hidden;
+          white-space: nowrap; }
+.kb-row { position: absolute; left: 36px; width: 960px; height: 72px; }
+#kb-r1 { top: 144px; }
+#kb-r2 { top: 224px; }
+#kb-r3 { top: 304px; left: 84px; width: 864px; }
+#kb-r4 { top: 384px; }
+#kb-r5 { top: 464px; }
+.kb-key { float: left; width: 88px; height: 72px; margin-right: 8px;
+          line-height: 68px; text-align: center; font-size: 28px;
+          font-weight: bold; color: #dfe7ef; background: #141c26;
+          border: 2px solid #2c3a4a; cursor: pointer; }
+.kb-key:active { background: #26364a; }
+.kb-w { width: 136px; font-size: 16px; letter-spacing: 2px; }
+.kb-x { width: 232px; font-size: 18px; letter-spacing: 2px; }
+#kb-space { width: 280px; font-size: 16px; letter-spacing: 2px; }
+/* SHIFT is drawn gold while the next letter will be a capital */
+.kb-on { color: #0b0f14; background: #e8c266; border-color: #e8c266; }
+.kb-on:active { background: #f4d98c; }
+#kb-del { color: #ffd7d2; background: #58201a; border-color: #8a2f27; }
+#kb-del:active { background: #7c2c23; }
+#kb-cancel { color: #9fb2c8; background: #0f151d; border-color: #1c2634; }
+#kb-cancel:active { background: #1c2634; }
+#kb-ok { font-size: 26px; color: #0b0f14; background: #e8c266;
+         border-color: #e8c266; }
+#kb-ok:active { background: #f4d98c; }
+
 /* ======================================================================
    STRIP LANE — a WIDE, LOW player-tracking panel (1280x400: the Waveshare
    7.9" and its kin), bench 2026-09-15. The page's own lane is 1024x600;
@@ -430,9 +639,9 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
    that is the only reason those rules shout. ===================== */
 @media (min-width: 1100px) and (max-height: 480px) {
   html, body { width: 1280px; height: 400px; }
-  .view, #kp-scrim { width: 1280px; height: 400px; }
+  .view, #kp-scrim, #kb-scrim { width: 1280px; height: 400px; }
 
-  /* buttons lose 20px of height so a five-button column still fits */
+  /* buttons lose 20px of height so three in a column end above BACK */
   .nb { height: 64px; line-height: 60px; margin-bottom: 12px;
         font-size: 18px; letter-spacing: 1px; }
   #hm-cola .nb { margin-bottom: 12px; }
@@ -449,7 +658,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   #at-pin   { left: 500px; top: 278px; width: 280px; height: 52px;
               line-height: 48px; font-size: 17px; }
 
-  /* --- home: identity left, the menu as a 3-wide grid ----------------- */
+  /* --- home: identity left, the menu in columns beside it ------------ */
   #ph-hello   { left: 24px; top: 24px; width: 300px; font-size: 26px;
                 line-height: 32px; }
   #ph-nick    { left: 24px; top: 60px; width: 300px; }
@@ -467,21 +676,17 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   #hm-vrule   { left: 336px !important; top: 24px !important;
                 height: 352px !important; }
   #hm-cola { left: 352px; top: 26px; width: 280px; }
-  /* 608 = two 280 columns plus the 24px gutter each carries, so the five
-     admin buttons wrap into 2 x 3 instead of a 5-high stack */
-  #hm-colb { left: 656px; top: 26px; width: 608px; }
-  #hm-colb .nb { float: left; width: 280px; margin: 0 24px 12px 0; }
+  #hm-colb { left: 656px; top: 26px; }
 
   /* --- shared slots + titles ------------------------------------------ */
   .vt { top: 22px; }
   .backslot { top: 300px; }
-  #hp-btn, #gm-btn { top: 300px !important; }
+  /* CLEAR sits above BACK (224..288, then 300..364). It used to share
+     BACK's own spot here and was drawn underneath it. */
+  #hp-btn { top: 224px !important; }
   /* whole rows only — a half-drawn row at the cut looks broken.
-     46px rows (tickets/handpay) x 5, 40px rows (games) x 6. */
+     46px rows (handpay) x 5. */
   .listbox { height: 230px !important; }
-  #gm-list { height: 240px !important; }
-  #gm-asof { top: 62px; }
-  #se-rows { top: 88px; }
 
   /* --- MY WALLET ------------------------------------------------------- */
   /* one balance: label y=72, figure y=92 (the row box starts at 64) */
@@ -521,10 +726,6 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   #co-arm-slot { left: 720px !important; top: 120px !important; }
   #co-arm-hint { left: 720px; top: 196px; width: 520px; }
 
-  /* --- machine info ----------------------------------------------------- */
-  #mi-c1, #mi-c2 { top: 68px; }
-  .mi-v { margin-bottom: 12px; font-size: 18px; }
-
   /* --- confirms --------------------------------------------------------- */
   .cf-q   { left: 240px; top: 84px; width: 800px; font-size: 30px;
             line-height: 36px; }
@@ -554,6 +755,83 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   #kp-ok  { left: 570px !important; top: 74px !important; }
   #kp-cancel { left: 0; top: 156px; width: 674px; height: 46px;
                line-height: 42px; }
+  .kp-chip { left: 1004px; width: 252px; height: 64px; line-height: 60px; }
+  #kp-chip0 { top: 130px; }
+  #kp-chip1 { top: 204px; }
+  #kp-chip2 { top: 278px; }
+
+  /* --- the left panel of SERVICE / ADMIN / PLAYER, lifted like the home's:
+     title y=22, name y=50, rule y=96, wallet y=112/132, Free Slot Play
+     y=180/198 ------------------------------------------------------------ */
+  #sv-title, #am-title, #pp-title { width: 300px; }
+  .pn-name  { left: 24px; top: 50px; width: 300px; height: 34px;
+              font-size: 26px; line-height: 34px; }
+  .pn-rule  { left: 24px; top: 96px; width: 300px; }
+  .pn-vrule { left: 336px; top: 24px; height: 352px; }
+  .pn-l     { left: 24px; width: 300px; }
+  .pn-v     { left: 24px; width: 300px; }
+  .pn-wl-l  { top: 112px; }
+  .pn-wl-v  { top: 132px; font-size: 34px; line-height: 38px; }
+  .pn-fp-l  { top: 180px; }
+  .pn-fp-v  { top: 198px; font-size: 26px; line-height: 32px; }
+
+  /* --- SERVICE: machine y=244/262, foot y=366; three buttons down col A,
+     the message under them (left of DONE); CLEAR HANDPAY heads col B ----- */
+  #sv-mc-l  { top: 244px; }
+  #sv-mc-v  { top: 262px; font-size: 24px; line-height: 30px; }
+  #sv-foot  { left: 24px; top: 366px; width: 300px; }
+  #sv-add   { left: 352px; top: 26px; }
+  #sv-fsp   { left: 352px; top: 102px; }
+  #sv-pin   { left: 352px; top: 178px; }
+  #sv-msg   { left: 352px; top: 256px; width: 340px; }
+  #sv-clear { left: 656px; top: 26px; }
+  #sv-hp-cap { left: 656px; top: 98px; }
+
+  /* --- ADMIN menu -------------------------------------------------------- */
+  #am-nick-l { top: 62px; }
+  #am-nick   { top: 80px; }
+  #am-hp-l   { top: 132px; }
+  #am-hp-v   { top: 150px; font-size: 26px; line-height: 32px; }
+  #am-handpay { left: 352px; top: 26px; }
+  #am-players { left: 352px; top: 102px; }
+  #am-new     { left: 352px; top: 178px; }
+
+  /* --- PLAYERS / fob list: five 64px rows y=60..380, paging beside them -- */
+  #pl-list, #fb-list { top: 60px; height: 320px !important; }
+  #pl-prev, #pl-next { top: 60px; }
+  #pl-count { left: 1020px; top: 82px; width: 236px; }
+  #fb-name  { left: 300px; top: 23px; width: 388px; }
+  #fb-more  { left: 720px; top: 82px; width: 536px; }
+
+  /* --- one PLAYER: the eight actions three across, the message under the
+     first column (left of BACK) ------------------------------------------- */
+  #pp-info  { left: 24px; top: 250px; width: 300px; }
+  #pp-msg   { left: 352px; top: 256px; width: 340px; }
+  #pp-add    { left: 352px; top: 26px; }
+  #pp-take   { left: 352px; top: 102px; }
+  #pp-fsp    { left: 352px; top: 178px; }
+  #pp-setpin { left: 656px; top: 26px; }
+  #pp-clrpin { left: 656px; top: 102px; }
+  #pp-rename { left: 656px; top: 178px; }
+  #pp-addfob { left: 960px; top: 26px; }
+  #pp-remfob { left: 960px; top: 102px; }
+
+  /* --- keyboard: four rows of 112x64 keys (no room for a fifth, so the
+     digit row is left out): rows y=112/184/256/328 -> ends 392 ----------- */
+  #kb-ttl { left: 240px; top: 14px; }
+  #kb-box { left: 240px; top: 36px; height: 48px; line-height: 44px;
+            font-size: 30px; }
+  #kb-msg { left: 240px; top: 92px; }
+  .kb-row { left: 44px; width: 1200px; height: 64px; }
+  #kb-r1  { display: none; }
+  #kb-r2  { top: 112px; }
+  #kb-r3  { top: 184px; left: 104px; width: 1080px; }
+  #kb-r4  { top: 256px; }
+  #kb-r5  { top: 328px; }
+  .kb-key { width: 112px; height: 64px; line-height: 60px; }
+  .kb-w   { width: 172px; }
+  .kb-x   { width: 292px; }
+  #kb-space { width: 352px; }
 }
 </style>
 </head>
@@ -572,10 +850,11 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   <div id="at-note"></div>
 </div>
 
-<!-- HOME: identity/credits panel left, ONE stacked menu right, keyed on
+<!-- HOME: identity/credits panel left, the menu right, keyed on
      state.admin. Base (every account): MY WALLET / CASH OUT / LOG OUT in
-     column A. Admin adds column B (MACHINE / TICKETS / HANDPAY / GAMES /
-     SETTINGS) + the ADMIN badge — same set as the IGT glass, re-laid. -->
+     column A. An admin also gets the ADMIN badge and ONE button in column
+     B, ADMIN, which leads to HANDPAY / PLAYERS / NEW PLAYER. Never shown
+     during a tap-over: that has its own screen (SERVICE, below). -->
 <div class="view" id="v-home">
   <div id="ph-hello">Hello</div>
   <div id="ph-nick">&nbsp;</div>
@@ -592,11 +871,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     <div class="nb nb-red" id="hb-logout">LOG OUT</div>
   </div>
   <div id="hm-colb" style="display:none;">
-    <div class="nb" id="hb-machine">MACHINE</div>
-    <div class="nb" id="hb-tickets">TICKETS</div>
-    <div class="nb" id="hb-handpay">HANDPAY</div>
-    <div class="nb" id="hb-games">GAMES</div>
-    <div class="nb" id="hb-settings">SETTINGS</div>
+    <div class="nb" id="hb-admin">ADMIN</div>
   </div>
   <div id="ph-foot">GAME ROOM</div>
 </div>
@@ -640,22 +915,6 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   <div class="backslot"><div class="nb" id="wl-back">BACK</div></div>
 </div>
 
-<!-- MACHINE INFO: real data from the state poll, read-only, two columns -->
-<div class="view" id="v-machine">
-  <div class="vt">MACHINE</div>
-  <div id="mi-c1">
-    <div class="mi-l">NICKNAME</div>   <div class="mi-v" id="mi-nick">&#8212;</div>
-    <div class="mi-l">EGM ID</div>     <div class="mi-v" id="mi-egm">&#8212;</div>
-    <div class="mi-l">SIGNED IN</div>  <div class="mi-v" id="mi-who">&#8212;</div>
-  </div>
-  <div id="mi-c2">
-    <div class="mi-l">SINCE</div>      <div class="mi-v" id="mi-since">&#8212;</div>
-    <div class="mi-l">HUB LINK</div>   <div class="mi-v" id="mi-link">&#8212;</div>
-    <div class="mi-l">PANEL</div>      <div class="mi-v" id="mi-panel">&#8212;</div>
-  </div>
-  <div class="backslot"><div class="nb" id="mi-back">BACK</div></div>
-</div>
-
 <!-- LOGOUT CONFIRM -->
 <div class="view" id="v-logout">
   <div class="cf-q">LOG OUT?</div>
@@ -692,14 +951,8 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   <div class="backslot"><div class="nb" id="co-back">BACK</div></div>
 </div>
 
-<!-- TICKETS: admin, read-only, newest first -->
-<div class="view" id="v-tickets">
-  <div class="vt">TICKETS</div>
-  <div class="listbox" id="tk-list" style="top:88px; height:460px;"></div>
-  <div class="backslot"><div class="nb" id="tk-back">BACK</div></div>
-</div>
-
-<!-- HANDPAY: admin. Pending handpays + CLEAR (money, confirm) when canClear -->
+<!-- HANDPAY: admin, reached from the ADMIN menu. This machine's pending
+     handpays + CLEAR (money, confirm) when canClear. BACK returns to ADMIN. -->
 <div class="view" id="v-handpay">
   <div class="vt">HANDPAY</div>
   <div class="listbox" id="hp-list" style="top:88px; height:460px;"></div>
@@ -708,25 +961,99 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   <div class="backslot"><div class="nb" id="hp-back">BACK</div></div>
 </div>
 
-<!-- GAMES: admin. Two-level drill: machine-enabled games -> paytables.
-     REFRESH = status-only refreshGames. -->
-<div class="view" id="v-games">
-  <div class="vt" id="gm-title">GAMES</div>
-  <div id="gm-asof"></div>
-  <div class="listbox" id="gm-list" style="top:100px; height:440px;"></div>
-  <div class="btnslot" id="gm-btn" style="top:392px;">
-    <div class="nb" id="gm-refresh">REFRESH</div></div>
-  <div class="backslot"><div class="nb" id="gm-back">BACK</div></div>
+<!-- SERVICE: the one screen of a TAP-OVER (an admin tapped their fob while a
+     friend is carded in). Painted from state.service on every state poll:
+     the friend's name, wallet, Free Slot Play and machine credits on the
+     left; what the admin can do for them on the right. CLEAR HANDPAY and
+     its caption show only while a handpay is pending. The hub decides who
+     the friend is; nothing here names them in a request. DONE hands the
+     screen back (the friend was never carded out). -->
+<div class="view" id="v-service">
+  <div class="vt" id="sv-title">SERVICE</div>
+  <div class="pn-name" id="sv-name">&nbsp;</div>
+  <div class="hairline pn-rule"></div>
+  <div class="pn-l pn-wl-l" id="sv-wl-l">WALLET</div>
+  <div class="pn-v pn-wl-v" id="sv-wl-v">&#8212;</div>
+  <div class="pn-l pn-fp-l" id="sv-fp-l">FREE SLOT PLAY</div>
+  <div class="pn-v pn-fp-v" id="sv-fp-v">&#8212;</div>
+  <div class="pn-l" id="sv-mc-l">ON THIS MACHINE</div>
+  <div class="pn-v" id="sv-mc-v">&#8212;</div>
+  <div id="sv-foot"></div>
+  <div class="hairline pn-vrule"></div>
+  <div class="nb pb" id="sv-add">ADD TO WALLET</div>
+  <div class="nb pb pb-s" id="sv-fsp">ADD FREE SLOT PLAY</div>
+  <div class="nb pb" id="sv-pin">SET PIN</div>
+  <div id="sv-msg"></div>
+  <div class="nb nb-gold pb" id="sv-clear" style="display:none;">CLEAR HANDPAY</div>
+  <div id="sv-hp-cap"></div>
+  <div class="backslot"><div class="nb nb-red" id="sv-done">DONE</div></div>
 </div>
 
-<!-- SETTINGS: admin, read-only machine summary -->
-<div class="view" id="v-settings">
-  <div class="vt">SETTINGS</div>
-  <div id="se-rows"></div>
-  <div class="backslot"><div class="nb" id="se-back">BACK</div></div>
+<!-- ADMIN menu: an admin carded in normally. The left panel names this
+     machine and, when one is pending, its handpay (one handpay read on
+     opening). HANDPAY is this machine's; PLAYERS and NEW PLAYER are the
+     whole floor's. -->
+<div class="view" id="v-admin">
+  <div class="vt" id="am-title">ADMIN</div>
+  <div class="pn-l" id="am-nick-l">THIS MACHINE</div>
+  <div class="pn-v" id="am-nick">&#8212;</div>
+  <div class="pn-l" id="am-hp-l">HANDPAY PENDING</div>
+  <div class="pn-v" id="am-hp-v">&#8212;</div>
+  <div class="hairline pn-vrule"></div>
+  <div class="nb pb" id="am-handpay">HANDPAY</div>
+  <div class="nb pb" id="am-players">PLAYERS</div>
+  <div class="nb pb" id="am-new">NEW PLAYER</div>
+  <div class="backslot"><div class="nb" id="am-back">BACK</div></div>
 </div>
 
-<!-- MONEY CONFIRM: shared by ADD-from-wallet + CLEAR-handpay -->
+<!-- PLAYERS: every player with their balances, seven to a page. A row is
+     one touch target and opens that player's page. -->
+<div class="view" id="v-players">
+  <div class="vt">PLAYERS</div>
+  <div class="listbox" id="pl-list"></div>
+  <div id="pl-count"></div>
+  <div class="nb pb" id="pl-prev">PREV</div>
+  <div class="nb pb" id="pl-next">NEXT</div>
+  <div class="backslot"><div class="nb" id="pl-back">BACK</div></div>
+</div>
+
+<!-- PLAYER: one player's balances and the eight things an admin can do for
+     them. Painted from the page's copy of that player's row, which every
+     reply replaces. The message line holds the hub's last sentence, and the
+     count while ADD FOB waits for a tap on this machine's reader. -->
+<div class="view" id="v-player">
+  <div class="vt" id="pp-title">PLAYER</div>
+  <div class="pn-name" id="pp-name">&nbsp;</div>
+  <div class="hairline pn-rule"></div>
+  <div class="pn-l pn-wl-l" id="pp-wl-l">WALLET</div>
+  <div class="pn-v pn-wl-v" id="pp-wl-v">&#8212;</div>
+  <div class="pn-l pn-fp-l" id="pp-fp-l">FREE SLOT PLAY</div>
+  <div class="pn-v pn-fp-v" id="pp-fp-v">&#8212;</div>
+  <div id="pp-info"></div>
+  <div id="pp-msg"></div>
+  <div class="hairline pn-vrule"></div>
+  <div class="nb nb-gold pb" id="pp-add">ADD FUNDS</div>
+  <div class="nb pb" id="pp-take">TAKE BACK</div>
+  <div class="nb pb pb-s" id="pp-fsp">ADD FREE SLOT PLAY</div>
+  <div class="nb pb" id="pp-rename">RENAME</div>
+  <div class="nb pb" id="pp-setpin">SET PIN</div>
+  <div class="nb pb" id="pp-clrpin">CLEAR PIN</div>
+  <div class="nb pb" id="pp-addfob">ADD FOB</div>
+  <div class="nb pb" id="pp-remfob">REMOVE FOB</div>
+  <div class="backslot"><div class="nb" id="pp-back">BACK</div></div>
+</div>
+
+<!-- REMOVE FOB for a player with more than one fob: pick which. -->
+<div class="view" id="v-fobs">
+  <div class="vt">REMOVE FOB</div>
+  <div id="fb-name"></div>
+  <div class="listbox" id="fb-list"></div>
+  <div id="fb-more"></div>
+  <div class="backslot"><div class="nb" id="fb-back">BACK</div></div>
+</div>
+
+<!-- MONEY CONFIRM: shared by ADD-from-wallet, CASH OUT TO WALLET, CLEAR
+     handpay, and the admin's add / take back / CLEAR PIN / REMOVE FOB -->
 <div class="view" id="v-confirm">
   <div class="cf-q" id="cf-q">CONFIRM?</div>
   <div class="cf-sub" id="cf-sub"></div>
@@ -735,9 +1062,12 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   <div class="cf-note" id="cf-note"></div>
 </div>
 
-<!-- CUSTOM-AMOUNT KEYPAD: modal overlay opened from the FUND selection so ADD
-     can be any amount (not just the biggest preset chip). ATM-style: digits
-     shift in from the right as cents; OK feeds selCents. -->
+<!-- KEYPAD: one modal overlay, four jobs. MY WALLET's custom amount (opened
+     from the FUND selection so ADD can be any amount, not just the biggest
+     preset chip; ATM-style: digits shift in from the right as cents; OK
+     feeds selCents). The PIN login on attract. An admin's amount for a
+     player, with the three quick-amount chips beside the grid. A player's
+     new PIN (bullets, typed twice). -->
 <div id="kp-scrim">
   <div id="kp-ttl">ADD TO MACHINE &#183; AMOUNT</div>
   <div id="kp-amt">$0.00</div>
@@ -756,6 +1086,72 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     <div class="kp-key" id="kp0"  style="left:118px;top:258px;">0</div>
     <div class="kp-key" id="kp-ok" style="left:236px;top:258px;">OK</div>
     <div id="kp-cancel">CANCEL</div>
+  </div>
+  <div class="kp-chip" id="kp-chip0">$20</div>
+  <div class="kp-chip" id="kp-chip1">$50</div>
+  <div class="kp-chip" id="kp-chip2">$100</div>
+</div>
+
+<!-- LETTER KEYBOARD: modal overlay for a player's name (NEW PLAYER, RENAME).
+     Letters, digits, space, hyphen, apostrophe; sixteen characters. The
+     box shows exactly what will be saved. The key caps are always
+     capitals; SHIFT (gold while on) decides the case of the next letter. -->
+<div id="kb-scrim">
+  <div id="kb-ttl">NEW PLAYER &#183; NAME</div>
+  <div id="kb-box"></div>
+  <div id="kb-msg"></div>
+  <div class="kb-row" id="kb-r1">
+    <div class="kb-key" id="kb-k1">1</div>
+    <div class="kb-key" id="kb-k2">2</div>
+    <div class="kb-key" id="kb-k3">3</div>
+    <div class="kb-key" id="kb-k4">4</div>
+    <div class="kb-key" id="kb-k5">5</div>
+    <div class="kb-key" id="kb-k6">6</div>
+    <div class="kb-key" id="kb-k7">7</div>
+    <div class="kb-key" id="kb-k8">8</div>
+    <div class="kb-key" id="kb-k9">9</div>
+    <div class="kb-key" id="kb-k0">0</div>
+  </div>
+  <div class="kb-row" id="kb-r2">
+    <div class="kb-key" id="kb-kQ">Q</div>
+    <div class="kb-key" id="kb-kW">W</div>
+    <div class="kb-key" id="kb-kE">E</div>
+    <div class="kb-key" id="kb-kR">R</div>
+    <div class="kb-key" id="kb-kT">T</div>
+    <div class="kb-key" id="kb-kY">Y</div>
+    <div class="kb-key" id="kb-kU">U</div>
+    <div class="kb-key" id="kb-kI">I</div>
+    <div class="kb-key" id="kb-kO">O</div>
+    <div class="kb-key" id="kb-kP">P</div>
+  </div>
+  <div class="kb-row" id="kb-r3">
+    <div class="kb-key" id="kb-kA">A</div>
+    <div class="kb-key" id="kb-kS">S</div>
+    <div class="kb-key" id="kb-kD">D</div>
+    <div class="kb-key" id="kb-kF">F</div>
+    <div class="kb-key" id="kb-kG">G</div>
+    <div class="kb-key" id="kb-kH">H</div>
+    <div class="kb-key" id="kb-kJ">J</div>
+    <div class="kb-key" id="kb-kK">K</div>
+    <div class="kb-key" id="kb-kL">L</div>
+  </div>
+  <div class="kb-row" id="kb-r4">
+    <div class="kb-key kb-w" id="kb-shift">SHIFT</div>
+    <div class="kb-key" id="kb-kZ">Z</div>
+    <div class="kb-key" id="kb-kX">X</div>
+    <div class="kb-key" id="kb-kC">C</div>
+    <div class="kb-key" id="kb-kV">V</div>
+    <div class="kb-key" id="kb-kB">B</div>
+    <div class="kb-key" id="kb-kN">N</div>
+    <div class="kb-key" id="kb-kM">M</div>
+    <div class="kb-key kb-w" id="kb-del">DELETE</div>
+  </div>
+  <div class="kb-row" id="kb-r5">
+    <div class="kb-key kb-x" id="kb-cancel">CANCEL</div>
+    <div class="kb-key" id="kb-hyph">-</div>
+    <div class="kb-key" id="kb-space">SPACE</div>
+    <div class="kb-key" id="kb-apos">'</div>
+    <div class="kb-key kb-x" id="kb-ok">OK</div>
   </div>
 </div>
 
@@ -781,22 +1177,27 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   var egmId = qp('egm');
 
   // ---- state: sess lives ONLY here (a closure var, never the URL) -------
-  var sess = null, tier = '', who = '', nick = '', sinceIso = '';
-  // PIN login (2026-09-16): the amount keypad doubles as a PIN pad on
-  // attract. kpMode 'amount' (wallet funding) | 'pin'; pinMin/pinAvail
-  // ride the state poll (pinLogin.minDigits / .available).
+  var sess = null, who = '', nick = '', sinceIso = '';
+  // The keypad overlay does four jobs (kpMode):
+  //   'amount'  MY WALLET: how much to move to this machine
+  //   'pin'     attract: a player logs in with their PIN (2026-09-16)
+  //   'give'    an admin adds to, or takes back from, a player's wallet
+  //   'newpin'  an admin sets a player's PIN (typed twice)
+  // pinMin/pinAvail ride the state poll (pinLogin.minDigits / .available).
   var kpMode = 'amount', kpPin = '', pinMin = 6, pinAvail = false;
   var pinBusy = false;
   var admin = false;         // the MENU authority: state.admin from the hub
-  var overlay = false;       // ADMIN OVERLAY: a supervisor tapped OVER a
-                             // carded friend (hub set state.overlay on the
-                             // admin's override token). Render the admin stack
-                             // but HIDE the money buttons and label LOG OUT as
-                             // "DONE" (its POST ends the overlay -> the friend
-                             // is restored, never carded out). Parity with
-                             // glass.html.
-  var supervising = '';      // overlay only: the carded FRIEND's name (context
-                             // for the admin; never their wallet).
+  var overlay = false;       // TAP-OVER: an admin tapped their fob while a
+                             // friend is carded in (state.overlay, on the
+                             // admin's own token). The page shows the quick
+                             // SERVICE screen for that friend and nothing
+                             // else; DONE (a logout with that token) ends
+                             // the tap-over. The friend is never carded out.
+  var supervising = '';      // tap-over only: the carded friend's name
+  var svc = null;            // tap-over only: state.service, the friend's
+                             // figures and pending handpay (null = the hub
+                             // left it out)
+  var svMsg = '';            // the last result of an action on SERVICE
   var gameroom = '';         // collector-set gameroom name (Settings tab) shown
                              // in lights on attract + footer; '' -> neutral
                              // fallback. CabiNet is the product, THIS is theirs.
@@ -818,12 +1219,10 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   var logoutBusy = false;
 
   // ---- sub-view + confirm state ------------------------------------------
-  var dataTimer = null;              // cashout's ~2s live-data re-poll handle
-  var confirmBusy = false;           // money-confirm POST in flight
-  var gmBusy = false;                // games REFRESH POST in flight
-  var gmData = null;                 // last games payload (grouped by game)
-  var gmGame = -1;                   // drilled-into game index, -1 = list
-  var pendingConfirm = null;         // {body, back} armed for the confirm view
+  var dataTimer = null;              // the ONE data re-poll handle: cashout
+                                     // and wallet ~2s, ADD FOB's wait 1s
+  var pendingConfirm = null;         // the armed confirm dialog: {body, back,
+                                     // viaAdmin, busy}
   var CUR = '$';                     // money symbol; the state poll's
                                      // "currency" (hub setting or the
                                      // machine's currencyId) overrides it
@@ -850,6 +1249,36 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   var coArmMsg = '';                 // the hub's last refusal, kept on screen
   var hpCanClear = false;            // handpay CLEAR gate (from the data view)
 
+  // ---- what an admin does for a player ------------------------------------
+  var GIVE_CHIPS = [2000, 5000, 10000];  // quick amounts (cents) on the
+                                     // admin's amount pad. $20 / $50 / $100
+                                     // until the hub sends the owner's own
+                                     // (Settings): service.quickCents and
+                                     // the players view's limits.quickCents
+  var kpCtx = null;                  // amount pad in 'give' mode: who it is
+                                     // for and what it will ask (openGivePad)
+  var pinCtx = null;                 // SET PIN: {action, accountId, back}
+  var kpStep = 1;                    // SET PIN: 1 = first entry, 2 = again
+  var kpPin1 = '';                   // SET PIN: the first entry, kept only
+                                     // until the second is compared with it
+  var plRows = null;                 // PLAYERS: the page's copy of the list
+  var plPage = 0;                    // PLAYERS: which page of it is showing
+  var plMax = 9999999999;            // most cents per add / take back (the
+                                     // players view's limits.maxCents): the
+                                     // largest figure the pad shows
+  var ppRow = null;                  // PLAYER: the row whose page is open
+  var ppMsg = '';                    // PLAYER: the hub's last sentence
+  var fwOn = false;                  // ADD FOB: waiting for a tap
+  var fwSince = 0;                   // ADD FOB: when that wait began (ms)
+  var fwBusy = null;                 // ADD FOB: the arming request in flight
+                                     // (its own marker object), else null
+  var fwWait = null;                 // ADD FOB: the hub's last fobWait
+  var fwFails = 0;                   // ADD FOB: failed reads in a row
+  var kbCtx = null;                  // keyboard: what the name is for
+  var kbText = '';                   // keyboard: the name as typed so far
+  var kbShift = true;                // keyboard: next letter is a capital
+  var kbBusy = false;                // keyboard: OK's request in flight
+
   function $(id) { return document.getElementById(id); }
   function setText(id, s) {
     // the poll repaints the SAME strings all night and the WPE kiosk runs
@@ -865,10 +1294,10 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   }
 
   // ---- view switching: pure display flips --------------------------------
-  var VIEWS = ['attract', 'home', 'wallet', 'machine', 'logout', 'cashout',
-               'tickets', 'handpay', 'games', 'settings', 'confirm'];
+  var VIEWS = ['attract', 'home', 'wallet', 'logout', 'cashout', 'handpay',
+               'confirm', 'service', 'admin', 'players', 'player', 'fobs'];
   function show(name) {
-    stopDataPoll();   // any view flip cancels the cashout live-data re-poll
+    stopDataPoll();   // any view flip cancels the live-data re-poll
     for (var i = 0; i < VIEWS.length; i++) {
       $('v-' + VIEWS[i]).style.display = (VIEWS[i] === name) ? 'block' : 'none';
     }
@@ -876,7 +1305,27 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     // NO idle collapse on this dedicated panel: attract is the only idle
     // state, and only the hub (card-out) or a poll failure sends us there.
   }
-  function home() { return 'home'; }   // one stacked home for every account
+  // Where BACK, CANCEL and a card-in land. A tap-over has ONE screen, so
+  // while it is up every one of them lands on SERVICE.
+  function home() { return overlay ? 'service' : 'home'; }
+  // Everything that must not outlive the session it was started in. The
+  // keypad and the keyboard are overlays, not views, so show() does not
+  // close them; a half-typed PIN is in memory; a confirm is armed with a
+  // request; ADD FOB may be waiting. Run on a new session token, on the
+  // way to attract, and when a view is taken away (the admin right gone,
+  // a tap-over begun or ended).
+  function endFlows() {
+    closeKeypad();
+    closeKeyboard();
+    pendingConfirm = null;
+    fwOn = false; fwBusy = null; fwWait = null;
+    stopDataPoll();
+  }
+  function toAttract() {
+    if (view === 'attract') { return; }   // the PIN pad may be open there
+    endFlows();
+    show('attract');
+  }
 
   // Redeploy refresh: navigate to a stamp-busted URL (not a soft reload the
   // kiosk browser might satisfy from cache), preserving the egm param the
@@ -938,7 +1387,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
           failStreak++;
           if (failStreak >= OFFLINE_AFTER && !hubOffline) {
             hubOffline = true;
-            if (view !== 'attract') { show('attract'); }
+            toAttract();
             // guest wording, not plumbing: "hub offline" named a component
             // no player has ever met (2026-08-17)
             note('Reconnecting — back in a moment');
@@ -958,7 +1407,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
       // only a not-known that OUTLIVES that window is a real setup problem
       // worth a human's attention (glass.html parity, 2026-08-17).
       sess = null;
-      if (view !== 'attract') { show('attract'); }
+      toAttract();
       unknownStreak++;
       note(unknownStreak > UNKNOWN_AFTER
         ? 'This screen isn’t set up yet — ask your host.'
@@ -1013,55 +1462,76 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     if (s.carded) {
       if (kpMode === 'pin') { closeKeypad(); }  // the PIN worked (or a tap won)
       if (s.sess && s.sess !== deadSess) { deadSess = null; } // superseded
-      tier = s.tier || 'player';
       admin = (s.admin === true);
-      overlay = (s.overlay === true);   // supervisor over a carded friend
+      overlay = (s.overlay === true);   // a tap-over: the admin's own token
       supervising = overlay ? (s.supervising || '') : '';
+      // the friend's figures for SERVICE ride the state poll (a data poll
+      // on a timer would hold the tap-over open for ever)
+      svc = (overlay && s.service && typeof s.service === 'object')
+        ? s.service : null;
+      if (svc) { takeQuick(svc.quickCents); }
       who = s.name || '';
       sinceIso = s.sinceIso || '';
-      // hub suppresses credits during an overlay (the friend's balance must
-      // never paint under the admin's token) — belt-and-braces blank here too
+      // the hub leaves credits out during a tap-over (the friend's balance
+      // must never paint as the admin's own) — belt-and-braces blank here
       credits = overlay ? '' : (
         (s.credits === undefined || s.credits === null)
           ? '' : String(s.credits));
       // Free Slot Play balance: sent only when the player has some, and
-      // hidden with the credits during an overlay
+      // left out with the credits during a tap-over
       setRestrMc(overlay ? 0 : s.restrictedMc);
       var fresh = (s.sess && s.sess !== sess);   // new hub-minted session
       if (s.sess) { sess = s.sess; }
       // Reset the FUND amount when a DIFFERENT player takes the seat, keyed on
-      // the session start (sinceIso) — NOT the token. An admin overlay re-mints
-      // the player's token when it POPS, but the underlying card session
+      // the session start (sinceIso) — NOT the token. A tap-over re-mints
+      // the player's token when it ENDS, but the underlying card session
       // (sinceIso) is unchanged, so the friend's amount must survive that.
-      // Sample ONLY in a real player state — never during an admin overlay.
+      // Sample ONLY in a real player state — never during a tap-over.
       if (!overlay && sinceIso && sinceIso !== lastPlayerSince) {
         lastPlayerSince = sinceIso;
         selIdx = 1; selCents = CHIPS[selIdx];   // no carryover between players
         coUseRestr = false;
       }
+      // a confirm that was opened from SERVICE / from an admin's view
+      var cfBack = (view === 'confirm' && pendingConfirm)
+        ? pendingConfirm.back : '';
+      var onService = (view === 'service' || cfBack === 'service');
       if (fresh || view === 'attract') {
-        show('home');          // card-in (or back from offline) -> home menu
-      } else if (!admin && (view === 'tickets' || view === 'handpay' ||
-                            view === 'games' || view === 'settings')) {
-        // Admin revoked mid-session while inside an admin sub-view: fall
-        // home so a demoted user can't keep viewing admin-only data
-        // (these sub-views don't re-poll). The hub already 403s any write.
-        show('home');
+        // a card-in, a tap-over beginning or ending (each is a new token),
+        // or back from offline: nothing of the last session stays up
+        endFlows();
+        if (fresh) { svMsg = ''; }
+        show(home());
+      } else if (overlay && !onService) {
+        // whatever order replies arrive in, a tap-over shows SERVICE only
+        endFlows();
+        show('service');
+      } else if (!overlay && onService) {
+        // ...and SERVICE is never shown to anything but a tap-over
+        endFlows();
+        show(home());
+      } else if (!admin && (view === 'admin' || view === 'players' ||
+                            view === 'player' || view === 'fobs' ||
+                            view === 'handpay' || cfBack === 'player' ||
+                            cfBack === 'handpay')) {
+        // Admin taken away mid-session while inside an admin view (or with
+        // the keypad or the keyboard open over one): close it all and fall
+        // home, so a demoted user can't keep looking at admin-only data.
+        // The hub already 403s any write.
+        endFlows();
+        show(home());
       }
     } else {
-      sess = null; tier = ''; admin = false; overlay = false; supervising = '';
+      sess = null; admin = false; overlay = false; supervising = '';
+      svc = null; svMsg = '';
       who = ''; sinceIso = ''; credits = '';
       setRestrMc(0);
-      if (view !== 'attract') { show('attract'); }   // hub-side card-out wins
+      toAttract();             // hub-side card-out wins
     }
     updateTexts();
   }
 
   function note(msg) { setText('at-note', msg); }
-  function fmtSince(iso) {
-    if (!iso || iso.length < 19) { return '—'; }
-    return iso.substr(11, 8) + ' · ' + iso.substr(0, 10);
-  }
 
   // ---- small formatters ---------------------------------------------------
   // escape for the few innerHTML row builders (data is hub-minted, but
@@ -1082,13 +1552,46 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   }
   // millicents -> dollars string (1 cent = 1000 millicents, the hub rule)
   function fmtMc(mc) { return fmtCents(Math.floor((mc || 0) / 1000)); }
-  // the preset chips are static HTML ("$1 $5 $20"); repaint them and the
-  // live amount button whenever the hub's money symbol changes
+  // the preset chips are static HTML ("$1 $5 $20", and the admin pad's
+  // quick amounts); repaint them and the live amount button whenever the
+  // hub's money symbol changes
   function repaintCurrency() {
     for (var i = 0; i < 3; i++) {
       setText('wl-chip' + i, CUR + String(CHIPS[i] / 100));
     }
+    paintGiveChips();
     setText('wl-custom', fmtCents(selCents));
+  }
+  // A quick amount's label, short enough for a chip: written out up to
+  // 9,999, as thousands from 10,000 (25K) and as millions from a million
+  // (2.5M). The hub only lets the owner pick amounts this writes exactly;
+  // anything else is written out in full and the type steps down to fit.
+  function chipLabel(cents) {
+    var d = cents / 100;
+    if (d >= 1000000 && d % 100000 === 0) { return CUR + String(d / 1000000) + 'M'; }
+    if (d >= 10000 && d % 1000 === 0) { return CUR + String(d / 1000) + 'K'; }
+    return fmtCents(cents).replace(/\.00$/, '');
+  }
+  function paintGiveChips() {
+    for (var i = 0; i < 3; i++) {
+      setText('kp-chip' + i, chipLabel(GIVE_CHIPS[i]));
+      // a chip is 160px wide (252px in the strip lane), 26px type
+      fitText('kp-chip' + i, isStrip() ? 240 : 148, 26, 14);
+    }
+  }
+  // The owner's quick amounts as the hub sends them: three whole positive
+  // numbers of cents. Anything else and the page keeps what it has.
+  function takeQuick(q) {
+    var i;
+    if (!q || q.length !== 3) { return; }
+    for (i = 0; i < 3; i++) {
+      if (typeof q[i] !== 'number' || !(q[i] >= 1) ||
+          q[i] !== Math.floor(q[i])) { return; }
+    }
+    if (q[0] === GIVE_CHIPS[0] && q[1] === GIVE_CHIPS[1] &&
+        q[2] === GIVE_CHIPS[2]) { return; }
+    GIVE_CHIPS = [q[0], q[1], q[2]];
+    paintGiveChips();
   }
   // paint a money string; a below-zero amount goes RED (house rule: negative
   // balances read red on every surface). '' hands the color back to the
@@ -1099,11 +1602,6 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     setText(id, s);
     setStyle($(id), 'color',
       (s && s.indexOf('-' + CUR) !== -1) ? '#ff7a6e' : '');
-  }
-  function sdot(a, b) {
-    a = (a === null || a === undefined) ? '' : String(a);
-    b = (b === null || b === undefined) ? '' : String(b);
-    return (a && b) ? (a + ' · ' + b) : (a + b);
   }
   function dataErr(status) {
     if (status === 403) { return 'Not permitted'; }
@@ -1121,12 +1619,6 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     if (status === 401) { return 'Session ended — tap your card again'; }
     return 'Couldn’t complete that — try again';
   }
-  function fmtLink(v) {
-    if (v === true) { return 'linked'; }
-    if (v === false) { return 'not linked'; }
-    return v;
-  }
-
   function brandName() {
     // the collector's gameroom name (Settings tab) painted in lights; until
     // they set one, a neutral house label (never the product name "CabiNet" —
@@ -1137,8 +1629,9 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   function updateTexts() {
     // Attract + menu headers show the NICKNAME only — never the EGM id
     // (serial-derived; keeping it off menu screens makes machine photos
-    // shareable — the glass.html rule, applied here 2026-08-17). Admin
-    // diagnostics keep it: the MACHINE INFO panel's EGM ID row below.
+    // shareable — the glass.html rule, applied here 2026-08-17). The one
+    // place it can show is the ADMIN menu's THIS MACHINE line, and only
+    // for a machine that has no nickname.
     var place = nick || '';
     var brand = brandName();
     setText('at-brand', brand);
@@ -1172,26 +1665,12 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     // footer = just the gameroom name (the raw UTC "in since HH:MM" was
     // confusing to players and served no purpose — dropped 2026-07-14)
     setText('ph-foot', brand);
-    // ADMIN badge + the whole backend column: shown as one set off "admin"
+    // ADMIN badge + the ADMIN button: shown as one set off "admin"
     setStyle($('hm-badge'), 'display', admin ? 'block' : 'none');
     setStyle($('hm-colb'), 'display', admin ? 'block' : 'none');
-    // ADMIN OVERLAY: hide the money buttons so a supervisor stacked over a
-    // friend can't touch the friend's wallet, relabel the badge, and turn
-    // LOG OUT into DONE (its POST ends the overlay, not a card-out). The hub
-    // also 403s wallet verbs on an overlay token (defense in depth).
-    setStyle($('hb-wallet'), 'display', overlay ? 'none' : 'block');
-    setStyle($('hb-cashout'), 'display', overlay ? 'none' : 'block');
-    setText('hb-logout', overlay ? 'DONE' : 'LOG OUT');
-    setText('hm-badge', overlay
-      ? ('SUPERVISOR' + (supervising ? (' · ' + supervising + ' stays carded')
-                                     : ' — friend stays carded'))
-      : 'ADMIN');
-    setText('mi-nick', nick || '—');
-    setText('mi-egm', egmId || '—');
-    setText('mi-who', who ? (who + ' · ' + tier) : '—');
-    setText('mi-since', fmtSince(sinceIso));
-    setText('mi-link', hubOffline ? 'OFFLINE' : 'online');
-    setText('mi-panel', 'SMIB · 1024×600');
+    setText('am-nick', nick || egmId || '—');
+    // a tap-over: the friend's figures, fresh from this poll
+    if (overlay) { paintService(); }
   }
 
   // ---- logout -> hub runs the true card-out ------------------------------
@@ -1220,23 +1699,28 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
       });
   }
 
-  // ---- ADMIN OVERLAY "DONE": end the overlay, hand the panel back --------
-  // Posts the same logout verb; the hub recognizes an overlay token and POPS
-  // THE OVERLAY (re-mints the friend's token) rather than carding anyone out.
-  // No attract flash — the next ~1.5s poll arrives carded:true with the
-  // FRIEND's fresh token, which renderState treats as a card-in.
+  // ---- TAP-OVER "DONE": end the tap-over, hand the panel back -------------
+  // Posts the same logout verb; the hub recognizes a tap-over token and
+  // ENDS THE TAP-OVER (re-mints the friend's token) rather than carding
+  // anyone out. The page stays on SERVICE until the next ~1.5s poll arrives
+  // carded:true with the FRIEND's fresh token, which renderState treats as
+  // a card-in. Until then sess is null and every SERVICE button rests.
   function doOverlayDone() {
     if (logoutBusy || !sess) { return; }
     logoutBusy = true;
-    setText('hb-logout', 'handing back…');
+    setText('sv-done', 'handing back…');
+    var tok = sess;
     xreq('POST', '/api/glass/action',
-      JSON.stringify({ sess: sess, action: 'logout' }),
+      JSON.stringify({ sess: tok, action: 'logout' }),
       function (status, data) {
         logoutBusy = false;
+        // the tap-over already ended another way (it timed out, the admin
+        // right went): the token on the page now is somebody else's
+        if (sess !== tok) { return; }
         if ((status === 200 && data && data.ok !== false) || status === 401) {
-          deadSess = sess; sess = null;   // tombstone the dead admin token
+          deadSess = tok; sess = null;    // tombstone the dead admin token
         } else {
-          setText('hb-logout', 'DONE');   // couldn't reach the hub — stay up
+          setText('sv-done', 'DONE');     // couldn't reach the hub — stay up
         }
       });
   }
@@ -1331,7 +1815,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   // not the class, so a stale className never re-enables an action)
   function setBtnOff(id, off) {
     var el = $(id), base = el.className.replace(/ *nb-off/g, '');
-    el.className = off ? (base + ' nb-off') : base;
+    setCls(el, off ? (base + ' nb-off') : base);   // no write when unchanged
   }
   function resetCashout() {
     // setMoney (not setText) so a lingering red from a negative balance
@@ -1450,10 +1934,10 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     paintWalletChips();
     setText('wl-fund-msg', '');
   }
-  // ---- custom-amount keypad (ATM-style: digits shift in as cents) ---------
+  // ---- the keypad overlay (ATM-style: digits shift in as cents) -----------
   var kpCents = 0;                        // amount being typed, in cents
   function kpRepaint() {
-    if (kpMode === 'pin') {
+    if (kpMode === 'pin' || kpMode === 'newpin') {
       var dots = '', di;
       for (di = 0; di < kpPin.length; di++) { dots += '\u2022'; }
       setText('kp-amt', dots || '\u00a0');     // never the digits themselves
@@ -1462,6 +1946,8 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     }
     setText('kp-amt', fmtCents(kpCents));
     fitKeypadFigure();
+    if (kpMode === 'give') { return; }    // its message line is not a
+                                          // running check (giveOk, kpDigit)
     var msg = '';
     if (coWalletMc !== null && kpCents * 1000 > coWalletMc) {
       msg = 'More than your wallet (' + fmtMc(coWalletMc) + ')';
@@ -1474,20 +1960,37 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   // layout's lane is 680px at 42px, where the longest figure fits.
   function fitKeypadFigure() {
     var f = $('kp-amt').firstChild, n = f ? f.nodeValue.length : 0;
-    var strip = window.matchMedia && window.matchMedia(
-      '(min-width: 1100px) and (max-height: 480px)').matches;
-    setStyle($('kp-amt'), 'fontSize', (strip || n <= 10) ? ''
+    setStyle($('kp-amt'), 'fontSize', (isStrip() || n <= 10) ? ''
       : (n <= 11 ? '54px' : n <= 13 ? '46px' : '42px'));
   }
   function kpDigit(d) {
-    if (kpMode === 'pin') {
+    if (kpMode === 'pin' || kpMode === 'newpin') {
       if (kpPin.length >= 8 || pinBusy) { return; }
-      kpPin += String(d); setText('kp-msg', ''); kpRepaint();
+      kpPin += String(d);
+      setText('kp-msg', kpMode === 'pin' ? '' : pinHint());
+      kpRepaint();
       return;
     }
     var n = kpCents * 10 + d;
+    if (kpMode === 'give') {
+      // a digit that would pass the most the hub takes at once is ignored
+      if (n > kpCtx.maxCents) {
+        setText('kp-msg', 'The most at once is ' + fmtCents(kpCtx.maxCents));
+        return;
+      }
+      kpCents = n; setText('kp-msg', giveHint()); kpRepaint();
+      return;
+    }
     if (n > 9999999999) { return; }       // 5-byte BCD wire max ($99,999,999.99, SAS_AFT_MAX_CENTS); real bound is the wallet balance (checked above)
     kpCents = n; kpRepaint();
+  }
+  // C clears whichever entry is current
+  function kpClear() {
+    if (kpMode === 'newpin' && pinBusy) { return; }
+    kpCents = 0; kpPin = '';
+    if (kpMode === 'give') { setText('kp-msg', giveHint()); }
+    else if (kpMode === 'newpin') { setText('kp-msg', pinHint()); }
+    kpRepaint();
   }
   function openKeypad() {
     if (!coCanFund) { return; }
@@ -1497,9 +2000,12 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     kpRepaint();                          // no preset to clear first (ATM-style)
     $('kp-scrim').style.display = 'block';
   }
+  // closing the pad forgets everything typed on it, in every mode
   function closeKeypad() {
     $('kp-scrim').style.display = 'none';
-    kpMode = 'amount'; kpPin = ''; pinBusy = false;
+    setCls($('kp-scrim'), '');            // the quick-amount chips go with it
+    kpMode = 'amount'; kpPin = ''; kpPin1 = ''; kpStep = 1; pinBusy = false;
+    kpCtx = null; pinCtx = null;
   }
   // ---- PIN login (2026-09-16): the same keypad, digits masked. OK posts
   // POST /api/glass/pinlogin {egm, pin} — the hub's one sessionless write.
@@ -1523,8 +2029,10 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     xreq('POST', '/api/glass/pinlogin',
       JSON.stringify({ egm: egmId, pin: kpPin }),
       function (status, data) {
+        // pad already closed (state flip): closing it cleared the entry
+        // and the busy flag, and it may be open again for another job
+        if (kpMode !== 'pin') { return; }
         pinBusy = false; kpPin = '';
-        if (kpMode !== 'pin') { return; }   // pad already closed (state flip)
         kpRepaint();
         if (status === 200 && data && data.ok) {
           setText('kp-msg', 'Welcome, ' + (data.name || 'player'));
@@ -1537,6 +2045,8 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   }
   function kpOk() {
     if (kpMode === 'pin') { pinSubmit(); return; }
+    if (kpMode === 'newpin') { newPinOk(); return; }
+    if (kpMode === 'give') { giveOk(kpCents); return; }
     if (kpCents < 1) { setText('kp-msg', 'Enter an amount'); return; }
     selCents = kpCents; selIdx = -1;      // custom -> no preset chip highlighted
     paintWalletChips();
@@ -1563,7 +2073,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     pollWallet();           // fetches immediately, then re-arms every ~2s
   }
 
-  // ---- admin sub-view row builders + renderers ----------------------------
+  // ---- HANDPAY (this machine): row builders + renderer ---------------------
   function listRow(a, s, b) {
     return '<div class="lr"><div class="lr-a">' + esc(a) + '</div>' +
       '<div class="lr-s">' + esc(s) + '</div>' +
@@ -1571,17 +2081,6 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   }
   function emptyRow(msg) { return '<div class="lr-empty">' + esc(msg) + '</div>'; }
 
-  function renderTickets(status, d) {
-    var el = $('tk-list');
-    if (status !== 200 || !d) { el.innerHTML = emptyRow(dataErr(status)); return; }
-    var arr = d.tickets || [], html = '', i, t;
-    if (!arr.length) { el.innerHTML = emptyRow('No tickets on this machine'); return; }
-    for (i = 0; i < arr.length && i < 10; i++) {   // 10 x 46px = the 460px box
-      t = arr[i];
-      html += listRow(t.amount, t.state, sdot(t.id, t.when));
-    }
-    el.innerHTML = html;
-  }
   function renderHandpay(status, d) {
     var el = $('hp-list');
     hpCanClear = false;
@@ -1599,87 +2098,9 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     hpCanClear = (d.canClear === true);
     $('hp-clear').style.display = hpCanClear ? 'block' : 'none';
   }
-  // GAMES: level 1 = one row per machine-enabled game (hub-grouped and
-  // filtered); tap a game -> level 2 = its paytables. BACK walks the levels.
-  function renderGames(status, d) {
-    gmData = null; gmGame = -1;
-    if (status !== 200 || !d) {
-      setText('gm-title', 'GAMES'); setText('gm-asof', '');
-      $('gm-list').innerHTML = emptyRow(dataErr(status)); return;
-    }
-    gmData = d;
-    paintGameList();
-  }
-  // #gm-list is 440px tall with 40px .gr rows, so exactly 11 rows fit and
-  // overflow is hidden. Cap the render; when there are more, spend the last
-  // slot on a "+N more" notice so clipped rows aren't silently unreachable.
-  function gmCap(arr) {
-    var CAP = 11, shown = arr.length, more = 0;
-    if (arr.length > CAP) { shown = CAP - 1; more = arr.length - shown; }
-    return { shown: shown, more: more };
-  }
-  function gmMoreRow(more) {
-    return more ? ('<div class="gr"><div class="gr-n" style="color:#55708a;">+' +
-      esc(more) + ' more not shown</div></div>') : '';
-  }
-  function paintGameList() {
-    var el = $('gm-list'), arr = (gmData && gmData.games) || [], html = '', i;
-    gmGame = -1;
-    setText('gm-title', 'GAMES');
-    setText('gm-asof', (gmData && gmData.asOf) ? ('as of ' + gmData.asOf) : '');
-    if (!arr.length) { el.innerHTML = emptyRow('No machine-enabled games'); return; }
-    var c = gmCap(arr);
-    for (i = 0; i < c.shown; i++) {
-      html += '<div class="gr" id="gm-g' + i + '"><div class="gr-n">' +
-        esc(arr[i].name) + '</div>' +
-        '<div class="gr-e" style="color:#e8c266;">' +
-        esc(arr[i].count || 0) + ' &rsaquo;</div></div>';
-    }
-    el.innerHTML = html + gmMoreRow(c.more);
-    for (i = 0; i < c.shown; i++) { $('gm-g' + i).onclick = gmOpenGame(i); }
-  }
-  function gmOpenGame(i) { return function () { paintPaytables(i); }; }
-  function paintPaytables(i) {
-    var el = $('gm-list'), g = ((gmData && gmData.games) || [])[i];
-    if (!g) { paintGameList(); return; }
-    gmGame = i;
-    setText('gm-title', g.name || 'GAME');
-    setText('gm-asof', (g.count || 0) + ' paytable' + (g.count === 1 ? '' : 's'));
-    var arr = g.paytables || [], html = '', j, p, on;
-    if (!arr.length) { el.innerHTML = emptyRow('No paytables'); return; }
-    var c = gmCap(arr);
-    for (j = 0; j < c.shown; j++) {
-      p = arr[j];
-      on = (p.on === true);
-      html += '<div class="gr"><div class="gr-n">' + esc(p.label || p.id) + '</div>' +
-        '<div class="gr-e" style="color:' + (on ? '#6fcf97' : '#c98a4f') + ';">' +
-        (on ? 'ON' : 'OFF') + '</div></div>';
-    }
-    el.innerHTML = html + gmMoreRow(c.more);
-  }
-  function renderSettings(status, d) {
-    var el = $('se-rows');
-    if (status !== 200 || !d) { el.innerHTML = emptyRow(dataErr(status)); return; }
-    var rows = [['NICKNAME', d.nick], ['EGM ID', d.egmId],
-                ['PROTOCOL', d.protocol], ['SAS LINK', fmtLink(d.sasLink)]];
-    var html = '', i;
-    for (i = 0; i < rows.length; i++) {
-      if (rows[i][1] === null || rows[i][1] === undefined || rows[i][1] === '') { continue; }
-      html += '<div class="mi-l">' + esc(rows[i][0]) + '</div>' +
-        '<div class="mi-v">' + esc(rows[i][1]) + '</div>';
-    }
-    el.innerHTML = html || emptyRow('No settings');
-  }
-
-  // ---- open an admin sub-view: show, paint loading, GET, render -----------
-  // (fetch-on-open, glass.html parity — a hub 403 paints dataErr and the
-  // state poll's admin fall-home handles a mid-session demotion)
-  function openTickets() {
-    show('tickets'); $('tk-list').innerHTML = emptyRow('Loading…');
-    fetchData('tickets', function (s, d) {
-      if (view === 'tickets') { renderTickets(s, d); }
-    });
-  }
+  // fetch-on-open (glass.html parity): show, paint loading, GET, render. A
+  // hub 403 paints dataErr and the state poll's admin fall-home handles a
+  // mid-session demotion.
   function openHandpay() {
     show('handpay'); $('hp-list').innerHTML = emptyRow('Loading…');
     $('hp-clear').style.display = 'none';
@@ -1687,47 +2108,668 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
       if (view === 'handpay') { renderHandpay(s, d); }
     });
   }
-  function openGames() {
-    gmData = null; gmGame = -1;
-    show('games'); setText('gm-title', 'GAMES');
-    $('gm-list').innerHTML = emptyRow('Loading…'); setText('gm-asof', '');
-    fetchData('games', function (s, d) {
-      if (view === 'games') { renderGames(s, d); }
-    });
+
+  // ==== WHAT AN ADMIN DOES FOR A PLAYER ====================================
+  // Two ways in. A TAP-OVER shows SERVICE for the friend who is carded in.
+  // An admin carded in normally has ADMIN -> HANDPAY / PLAYERS / NEW PLAYER.
+  // Both write through POST /api/glass/admin; the hub decides who may ask
+  // for what, moves the money, and writes the sentence the screen shows.
+
+  // Like postAction it NEVER sends an egmId, and for a tap-over it never
+  // names the friend either: the hub takes both from the token. The hub
+  // keeps this body out of its wire log, which is why a NEW PIN goes
+  // through here and nowhere else.
+  function postAdmin(obj, cb) {
+    obj.sess = sess;
+    xreq('POST', '/api/glass/admin', JSON.stringify(obj), cb);
   }
-  function openSettings() {
-    show('settings'); $('se-rows').innerHTML = emptyRow('Loading…');
-    fetchData('settings', function (s, d) {
-      if (view === 'settings') { renderSettings(s, d); }
+  // One request id per dialog: made when the confirm or the keyboard OPENS
+  // and sent again by every CONFIRM / OK of it, so a second tap, or a
+  // retry after a lost reply, can never pay or create twice.
+  function newRid() {
+    var a = 'abcdefghijklmnopqrstuvwxyz0123456789', s = '', i;
+    for (i = 0; i < 16; i++) {
+      s += a.charAt(Math.floor(Math.random() * a.length));
+    }
+    return s;
+  }
+  // A name inside a sentence THIS PAGE writes: past twelve characters it
+  // is cut to eleven and three dots. The hub's own sentences come whole.
+  function shortName(n) {
+    n = (n === null || n === undefined) ? '' : String(n);
+    return n.length > 12 ? (n.substr(0, 11) + '…') : n;
+  }
+  // a money figure: the hub's ready-made string, else from the millicents
+  function figure(str, mc) {
+    return (str === null || str === undefined || str === '')
+      ? fmtMc(mc) : String(str);
+  }
+  // ...painted, and RED when the balance is below zero (house rule). The
+  // sign is taken from the millicents: the hub writes such a figure as
+  // "$-5.00", which setMoney's "-$" test does not see.
+  function setFigure(id, str, mc) {
+    setText(id, figure(str, mc));
+    setStyle($(id), 'color', (mc < 0) ? '#ff7a6e' : '');
+  }
+  // a handpay's amount, or '' when the hub only knows that one is pending
+  // (it then sends the word "Handpay" in place of a figure)
+  function hpAmount(h) {
+    var a = (!h || h.amount === null || h.amount === undefined)
+      ? '' : String(h.amount);
+    return (a === 'Handpay') ? '' : a;
+  }
+  function isStrip() {
+    return !!(window.matchMedia && window.matchMedia(
+      '(min-width: 1100px) and (max-height: 480px)').matches);
+  }
+
+  // ---- fit a name or a figure to its lane by MEASURING it -----------------
+  // A name can be any letters (sixteen W are three times as wide as
+  // sixteen l), so a size table by length either clips it or wastes the
+  // lane. An off-screen bold ruler gives the real width in this panel's own
+  // font. The answer is remembered per element, so an idle poll measures
+  // nothing and writes nothing; '' hands the size back to the stylesheet.
+  var ruler = null, fitSeen = {};
+  function fitText(id, lane, maxPx, minPx) {
+    var el = $(id), f = el.firstChild, s = f ? f.nodeValue : '';
+    var key = s + '\n' + lane + '\n' + maxPx;
+    if (fitSeen[id] === key) { return; }
+    fitSeen[id] = key;
+    if (!ruler) {
+      ruler = document.createElement('span');
+      ruler.style.cssText = 'position:absolute;left:0;top:-200px;' +
+        'visibility:hidden;white-space:nowrap;font-weight:bold;';
+      document.body.appendChild(ruler);
+    }
+    ruler.style.fontSize = maxPx + 'px';
+    ruler.textContent = s;
+    var w = ruler.offsetWidth, px = maxPx;
+    if (w > lane) { px = Math.max(minPx, Math.floor(maxPx * (lane - 2) / w)); }
+    setStyle(el, 'fontSize', px === maxPx ? '' : (px + 'px'));
+  }
+  // the left panel's lane: 320px, or 300px in the strip lane (whose
+  // stylesheet sizes are smaller)
+  function fitPanel(id, px, stripPx) {
+    var st = isStrip();
+    fitText(id, st ? 300 : 320, st ? stripPx : px, 14);
+  }
+
+  // ---- SERVICE: the tap-over's one screen ----------------------------------
+  // Painted from state.service on every state poll, and from the same
+  // object when an action's reply brings a fresh one. Never from a data
+  // poll: reading /api/glass/data on a timer would hold a tap-over open
+  // for ever. Everything goes through setText / setStyle / setCls, so an
+  // idle poll writes nothing.
+  function svcHandpay() {
+    return (svc && svc.handpay && svc.handpay.pending === true)
+      ? svc.handpay : null;
+  }
+  function paintService() {
+    var has = !!(svc && svc.hasWallet === true), hp = svcHandpay();
+    setText('sv-name', (svc && svc.name) ? String(svc.name)
+      : (supervising || 'Player'));
+    fitPanel('sv-name', 30, 26);
+    if (has) { setFigure('sv-wl-v', svc.wallet, svc.walletMc); }
+    else { setFigure('sv-wl-v', '—', 0); }
+    fitPanel('sv-wl-v', 40, 34);
+    if (has) { setFigure('sv-fp-v', svc.freePlay, svc.freePlayMc); }
+    else { setFigure('sv-fp-v', '—', 0); }
+    fitPanel('sv-fp-v', 32, 26);
+    if (svc) { setFigure('sv-mc-v', svc.machine, svc.machineMc); }
+    else { setFigure('sv-mc-v', '—', 0); }
+    fitPanel('sv-mc-v', 30, 24);
+    // the handpay CLEAR resets next; a machine can hold more than one
+    // record, and each CLEAR resets one
+    var cap = '';
+    if (hp) {
+      var amt = hpAmount(hp);
+      cap = amt ? ('HANDPAY ' + amt + (hp.type ? (' · ' + hp.type) : ''))
+                : 'HANDPAY PENDING';
+      if (typeof hp.more === 'number' && hp.more > 0) {
+        cap += ' (+' + hp.more + '\u00a0more)';   // kept on one line
+      }
+    }
+    setText('sv-hp-cap', cap);
+    setStyle($('sv-clear'), 'display', hp ? 'block' : 'none');
+    setBtnOff('sv-add', !has);
+    setBtnOff('sv-fsp', !has);
+    setBtnOff('sv-pin', !has);
+    setText('sv-msg', svMsg ? svMsg
+      : ((svc && !has) ? 'This fob is not linked to a player.' : ''));
+    setText('sv-foot', (nick ? (nick + ' · ') : '') +
+      (who || 'Admin') + ' is helping');
+    if (!logoutBusy && sess) { setText('sv-done', 'DONE'); }
+  }
+  // No token, no action: once DONE is tapped (and until the friend's own
+  // token arrives) every button of this screen rests.
+  function svIdle() { return !!(sess && !logoutBusy); }
+  function svcGive(restricted) {
+    if (!svIdle() || !svc || svc.hasWallet !== true) { return; }
+    openGivePad({ verb: 'svcFund', restricted: restricted, accountId: null,
+      name: String(svc.name || supervising || 'Player'),
+      walletMc: null, wallet: '',
+      maxCents: (svc.maxCents > 0) ? svc.maxCents : plMax, back: 'service' });
+  }
+
+  // An admin action worked: land on the view it was started from, with the
+  // hub's sentence on that view's message line and its fresh figures.
+  function adminDone(back, data, msg) {
+    msg = msg ? String(msg) : '';
+    if (back === 'service') {
+      if (data && data.service && typeof data.service === 'object') {
+        svc = data.service;
+        takeQuick(svc.quickCents);
+      }
+      svMsg = msg;
+      show('service');
+      paintService();
+    } else if (data && data.player && typeof data.player === 'object' &&
+               data.player.id) {
+      takePlayer(data.player);
+      ppMsg = msg;
+      show('player');
+      paintPlayer();
+    } else {
+      openPlayers(plPage);    // the player went in between: read the list again
+    }
+  }
+
+  // ---- the amount pad: the keypad overlay in mode 'give' -------------------
+  // ctx = {verb, restricted, accountId, name, walletMc, wallet, maxCents,
+  // back}. Every open gets a NEW ctx with every field set, and closing the
+  // pad drops it, so nothing (restricted least of all) carries over.
+  function giveHint() { return 'For ' + shortName(kpCtx.name); }
+  function openGivePad(ctx) {
+    kpMode = 'give'; kpPin = ''; kpCtx = ctx; kpCents = 0;
+    setText('kp-ttl', ctx.verb === 'plTake' ? 'TAKE BACK'
+      : ctx.restricted ? 'ADD FREE SLOT PLAY' : 'ADD TO WALLET');
+    setText('kp-msg', giveHint());
+    kpRepaint();
+    setCls($('kp-scrim'), 'give');
+    $('kp-scrim').style.display = 'block';
+  }
+  // OK, or a chip (the same as typing that amount and OK): the pad closes
+  // and the confirm opens. The request id is made here, with the dialog.
+  function giveOk(cents) {
+    var c = kpCtx;
+    if (!c || !sess) { return; }
+    if (cents < 1) { setText('kp-msg', 'Enter an amount'); return; }
+    if (cents > c.maxCents) {
+      setText('kp-msg', 'The most at once is ' + fmtCents(c.maxCents)); return;
+    }
+    var nm = shortName(c.name), take = (c.verb === 'plTake');
+    if (take && c.walletMc !== null && cents * 1000 > c.walletMc) {
+      setText('kp-msg', nm + ' only has ' + c.wallet); return;
+    }
+    var body = { action: c.verb, cents: cents, rid: newRid() };
+    if (c.accountId) { body.accountId = c.accountId; }
+    if (c.restricted) { body.restricted = true; }
+    closeKeypad();
+    askConfirm((take ? 'TAKE ' : 'ADD ') + fmtCents(cents) + '?',
+      take ? ('From ' + nm + '\'s wallet, back to the House.')
+        : c.restricted ? ('Free Slot Play for ' + nm + '. It has to be played.')
+        : ('To ' + nm + '\'s wallet, from the House.'),
+      body, c.back, true);
+  }
+  function giveChip(i) {
+    if (kpMode !== 'give' || !kpCtx) { return; }
+    kpCents = GIVE_CHIPS[i]; kpRepaint();
+    giveOk(kpCents);
+  }
+
+  // ---- SET PIN: the keypad overlay in mode 'newpin' ------------------------
+  // Typed twice, bullets only: the screen faces the room, and a hidden PIN
+  // typed once could be a mistyped one that nobody knows. The page compares
+  // the two entries and sends ONE pin when they match, to /api/glass/admin
+  // only. Both entries are forgotten when the pad closes, on a yes, on a
+  // no, and with the session. pinCtx = {action, accountId, back}.
+  function pinHint() {
+    return (kpStep === 2) ? 'Type it once more' : (pinMin + ' to 8 digits');
+  }
+  function newPinStep(step, msg) {
+    kpStep = step; kpPin = '';
+    if (step === 1) { kpPin1 = ''; }
+    setText('kp-ttl', (step === 2) ? 'NEW PIN AGAIN' : 'NEW PIN');
+    setText('kp-msg', msg || pinHint());
+    kpRepaint();
+  }
+  function openNewPin(ctx) {
+    kpMode = 'newpin'; pinCtx = ctx; pinBusy = false;
+    newPinStep(1, '');
+    setCls($('kp-scrim'), '');
+    $('kp-scrim').style.display = 'block';
+  }
+  function newPinOk() {
+    var ctx = pinCtx;
+    if (pinBusy || !ctx || !sess) { return; }
+    if (kpStep === 1) {
+      if (kpPin.length < pinMin) {
+        setText('kp-msg', 'Enter at least ' + pinMin + ' digits'); return;
+      }
+      var first = kpPin;
+      newPinStep(2, '');
+      kpPin1 = first;
+      return;
+    }
+    // The second entry is compared only when it is long enough to be a
+    // PIN. An OK tapped twice lands here with nothing typed: the step
+    // stays as it is.
+    if (kpPin.length < pinMin) {
+      setText('kp-msg', kpPin.length
+        ? ('Enter at least ' + pinMin + ' digits') : pinHint());
+      return;
+    }
+    if (kpPin !== kpPin1) {
+      newPinStep(1, 'Those did not match. Start again.'); return;
+    }
+    var body = { action: ctx.action, pin: kpPin };
+    if (ctx.accountId) { body.accountId = ctx.accountId; }
+    var tok = sess;
+    pinBusy = true;                 // keys are ignored until the hub answers
+    kpPin = ''; kpPin1 = '';        // the request has it; the page lets go
+    kpRepaint();
+    setText('kp-msg', 'Saving…');
+    postAdmin(body, function (status, data) {
+      // a pad that was closed (a new session, the admin right gone) made
+      // this ctx stale and already cleared the busy flag
+      if (sess !== tok || pinCtx !== ctx) { return; }
+      pinBusy = false;
+      if (status === 200 && data && data.ok !== false) {
+        closeKeypad();
+        adminDone(ctx.back, data, data.msg);
+      } else {
+        newPinStep(1, actionErr(status, data));
+      }
     });
   }
 
-  // ---- money confirm: arm {body, back}, YES posts it, then re-open the
-  //      originating view so its numbers repaint (the confirm pattern) ------
-  function askConfirm(q, sub, body, back) {
-    pendingConfirm = { body: body, back: back };
+  // ---- ADMIN menu ----------------------------------------------------------
+  // BACK from HANDPAY and PLAYERS: the menu they were opened from (or the
+  // home, should the admin right have gone since the last poll)
+  function backToAdmin() {
+    if (admin && !overlay) { openAdmin(); } else { show(home()); }
+  }
+  // One handpay read on opening fills the pending line; any failure leaves
+  // it hidden (HANDPAY itself says what went wrong).
+  function openAdmin() {
+    setStyle($('am-hp-l'), 'display', 'none');
+    setStyle($('am-hp-v'), 'display', 'none');
+    show('admin');
+    var tok = sess;
+    fetchData('handpay', function (status, d) {
+      if (sess !== tok || view !== 'admin') { return; }
+      var arr = (status === 200 && d && d.ok !== false && d.pending)
+        ? d.pending : [];
+      if (!arr.length) { return; }
+      // one record: its amount. More than one (a machine can hold one per
+      // credit type): how many, since no single amount is "the" handpay.
+      var amt = (arr.length === 1) ? hpAmount(arr[0]) : '';
+      setText('am-hp-v', amt || (arr.length + ' pending'));
+      setStyle($('am-hp-l'), 'display', 'block');
+      setStyle($('am-hp-v'), 'display', 'block');
+    });
+  }
+
+  // ---- PLAYERS: the list, a page at a time ---------------------------------
+  function plPerPage() { return isStrip() ? 5 : 7; }
+  function rowFobs(p) { return (p && p.fobs && p.fobs.length) ? p.fobs : []; }
+  function fobCount(n) {
+    return (n === 0) ? 'no fob' : (n === 1) ? '1 fob' : (n + ' fobs');
+  }
+  // A players reply the page can use. The hub turns a fault into 200 with
+  // ok:false, which is a failed read and never an empty list.
+  function takePlayers(status, d) {
+    if (status !== 200 || !d || d.ok === false || !d.players ||
+        typeof d.players.length !== 'number') { return false; }
+    plRows = d.players;
+    if (d.limits && d.limits.maxCents > 0) { plMax = d.limits.maxCents; }
+    if (d.limits) { takeQuick(d.limits.quickCents); }
+    return true;
+  }
+  // err = a failed read's words; '' paints the rows of the current page
+  function paintPlayers(err) {
+    var rows = plRows || [], per = plPerPage(), html = '', i, p, bits, w;
+    var pages = Math.max(1, Math.ceil(rows.length / per));
+    if (plPage > pages - 1) { plPage = pages - 1; }
+    if (plPage < 0) { plPage = 0; }
+    var from = plPage * per, to = Math.min(rows.length, from + per);
+    if (err) { rows = []; to = from; html = emptyRow(err); }
+    else if (!rows.length) {
+      html = emptyRow('No players yet. NEW PLAYER adds one.');
+    }
+    for (i = from; i < to; i++) {
+      p = rows[i]; bits = [];
+      if (p.hasPin === true) { bits.push('PIN'); }
+      bits.push(fobCount(rowFobs(p).length));
+      if (p.admin === true) { bits.push('admin'); }
+      w = figure(p.wallet, p.walletMc);
+      html += '<div class="pr" id="pl-r' + (i - from) + '">' +
+        '<div class="pr-n">' + esc(p.name) + '</div>' +
+        '<div class="pr-i">' + esc(bits.join(' · ')) + '</div>' +
+        '<div class="pr-w' + (p.walletMc < 0 ? ' pr-neg' : '') +
+        '">' + esc(w) + '</div>' +
+        (p.freePlayMc > 0 ? ('<div class="pr-f">Free Slot Play ' +
+          esc(figure(p.freePlay, p.freePlayMc)) + '</div>') : '') +
+        '</div>';
+    }
+    $('pl-list').innerHTML = html;
+    for (i = from; i < to; i++) { $('pl-r' + (i - from)).onclick = plOpenRow(i); }
+    setText('pl-count', rows.length
+      ? ((from + 1) + '–' + to + ' of ' + rows.length) : '');
+    setBtnOff('pl-prev', plPage <= 0);
+    setBtnOff('pl-next', plPage >= pages - 1);
+  }
+  function plOpenRow(i) {
+    return function () { if (plRows && plRows[i]) { openPlayer(plRows[i]); } };
+  }
+  function openPlayers(page) {
+    plPage = page || 0; plRows = null; ppRow = null;
+    fwOn = false; fwBusy = null; fwWait = null;
+    show('players');
+    $('pl-list').innerHTML = emptyRow('Loading…');
+    setText('pl-count', '');
+    setBtnOff('pl-prev', true); setBtnOff('pl-next', true);
+    var tok = sess;
+    fetchData('players', function (status, d) {
+      if (sess !== tok || view !== 'players') { return; }
+      paintPlayers(takePlayers(status, d) ? '' : dataErr(status));
+    });
+  }
+
+  // ---- one PLAYER ----------------------------------------------------------
+  // ppRow is the page's copy of that player's row; every action's reply
+  // brings a fresh one (takePlayer), so the figures never wait for a poll.
+  function takePlayer(p) {
+    var i;
+    ppRow = p;
+    if (!plRows) { return; }
+    for (i = 0; i < plRows.length; i++) {
+      if (plRows[i].id === p.id) { plRows[i] = p; return; }
+    }
+    plRows.push(p);
+  }
+  function openPlayer(p) {
+    ppRow = p; ppMsg = '';
+    fwOn = false; fwBusy = null; fwWait = null;
+    show('player');
+    paintPlayer();
+  }
+  function paintPlayer() {
+    var p = ppRow;
+    if (!p) { return; }
+    var nf = rowFobs(p).length, wait = fwOn || fwBusy, msg = ppMsg;
+    setText('pp-name', String(p.name || 'Player'));
+    fitPanel('pp-name', 30, 26);
+    setFigure('pp-wl-v', p.wallet, p.walletMc);
+    fitPanel('pp-wl-v', 40, 34);
+    setFigure('pp-fp-v', p.freePlay, p.freePlayMc);
+    fitPanel('pp-fp-v', 32, 26);
+    setText('pp-info', (p.hasPin === true ? 'PIN set' : 'No PIN') +
+      ' · ' + fobCount(nf));
+    // while ADD FOB waits for a tap, that button is CANCEL and the other
+    // seven rest
+    setBtnOff('pp-add', wait);
+    setBtnOff('pp-take', wait || !(p.walletMc > 0));
+    setBtnOff('pp-fsp', wait);
+    setBtnOff('pp-rename', wait);
+    setBtnOff('pp-setpin', wait);
+    setBtnOff('pp-clrpin', wait || p.hasPin !== true);
+    setBtnOff('pp-remfob', wait || nf === 0);
+    setText('pp-addfob', fwOn ? 'CANCEL' : 'ADD FOB');
+    if (fwOn && fwWait) {
+      msg = 'Tap the new fob on this machine\'s reader.\n' +
+        (typeof fwWait.secondsLeft === 'number' ? fwWait.secondsLeft : '') +
+        (fwWait.note ? ('\n' + fwWait.note) : '');
+    }
+    setText('pp-msg', msg);
+  }
+  function ppIdle() { return !!(sess && ppRow && !fwOn && !fwBusy); }
+  function ppGive(verb, restricted) {
+    var p = ppRow;
+    if (!ppIdle()) { return; }
+    if (verb === 'plTake' && !(p.walletMc > 0)) { return; }
+    openGivePad({ verb: verb, restricted: restricted, accountId: p.id,
+      name: String(p.name || 'Player'),
+      walletMc: (typeof p.walletMc === 'number') ? p.walletMc : null,
+      wallet: figure(p.wallet, p.walletMc), maxCents: plMax, back: 'player' });
+  }
+  function askRemoveFob(f) {
+    var p = ppRow, nm;
+    if (!sess || !p || !f) { return; }
+    nm = shortName(p.name);
+    askConfirm('REMOVE FOB?', nm + '\'s fob ending ' + f.tail +
+      ' will stop working for ' + nm + '.',
+      { action: 'plRemoveFob', accountId: p.id, fob: String(f.tail) },
+      'player', true);
+  }
+
+  // ---- ADD FOB: arm this machine's reader, then wait for a tap -------------
+  // The fob is never in a request: the hub links the next fob tapped on
+  // THIS machine's reader. The page shows the hub's own count (fobWait in
+  // each players read, once a second) and whatever the hub says about a
+  // fob it did not take; a refused fob does not end the wait.
+  function fobStop(msg) {
+    fwOn = false; fwBusy = null; fwWait = null;
+    stopDataPoll();
+    ppMsg = msg || '';
+    paintPlayer();
+  }
+  function fobArm() {
+    var p = ppRow;
+    if (!ppIdle()) { return; }
+    var tok = sess, arm = {};
+    fwBusy = arm; ppMsg = '';
+    paintPlayer();
+    postAdmin({ action: 'plAddFob', accountId: p.id }, function (status, d) {
+      var ok = (status === 200 && d && d.ok !== false && d.fobWait);
+      if (sess !== tok) { return; }
+      if (fwBusy !== arm) {
+        // the admin left this page while the reader was being armed
+        if (ok) { postAdmin({ action: 'plAddFobCancel' }, function () {}); }
+        return;
+      }
+      fwBusy = null;
+      if (!ok) { fobStop(actionErr(status, d)); return; }
+      fwOn = true; fwFails = 0; fwWait = d.fobWait;
+      fwSince = new Date().getTime();
+      paintPlayer();
+      fobPoll();
+    });
+  }
+  function fobPoll() {
+    stopDataPoll();
+    dataTimer = window.setTimeout(function () {
+      dataTimer = null;
+      var tok = sess;
+      fetchData('players', function (status, d) {
+        if (sess !== tok || view !== 'player' || !fwOn || !ppRow) { return; }
+        if (!takePlayers(status, d)) {
+          // a failed read is not "the wait is over": keep the screen and
+          // ask again (the count is the hub's, so it simply resumes)
+          fwFails++;
+          if (fwFails >= 5) { fobStop(dataErr(status)); } else { fobPoll(); }
+          return;
+        }
+        fwFails = 0;
+        var w = d.fobWait, i;
+        if (w && w.state === 'waiting') {
+          fwWait = w; paintPlayer(); fobPoll(); return;
+        }
+        // over (linked, ended, or gone from the hub): this player's row
+        // from the same reply shows the new fob
+        for (i = 0; i < plRows.length; i++) {
+          if (plRows[i].id === ppRow.id) { ppRow = plRows[i]; break; }
+        }
+        fobStop((w && w.msg) ? String(w.msg) : '');
+      });
+    }, 1000);
+  }
+  function fobCancel() {
+    if (!sess) { return; }
+    postAdmin({ action: 'plAddFobCancel' }, function () {});
+    fobStop('');
+  }
+
+  // ---- REMOVE FOB for a player with more than one fob: pick which ----------
+  function openFobs() {
+    var p = ppRow, fobs = rowFobs(p), cap = isStrip() ? 5 : 6;
+    var n = Math.min(fobs.length, cap), html = '', i, f;
+    show('fobs');
+    setText('fb-name', String(p.name || 'Player'));
+    for (i = 0; i < n; i++) {
+      f = fobs[i];
+      html += '<div class="pr" id="fb-r' + i + '">' +
+        '<div class="pr-n">' + esc(f.label || 'Fob') + '</div>' +
+        '<div class="pr-i">' + esc(f.lastSeen
+          ? ('last used ' + String(f.lastSeen).substr(0, 10)) : 'never used') +
+        '</div><div class="pr-t">ending ' + esc(f.tail) + '</div></div>';
+    }
+    $('fb-list').innerHTML = html;
+    for (i = 0; i < n; i++) { $('fb-r' + i).onclick = fbPick(i); }
+    setText('fb-more', (fobs.length > cap)
+      ? ('+' + (fobs.length - cap) + ' more on the Players web page') : '');
+  }
+  function fbPick(i) {
+    return function () { askRemoveFob(rowFobs(ppRow)[i]); };
+  }
+
+  // ---- the letter keyboard (NEW PLAYER, RENAME) ----------------------------
+  // kbCtx = {mode: 'new', rid} or {mode: 'rename', accountId}. The hub has
+  // the last word on a name; the keys simply cannot type anything it would
+  // refuse for its characters or its length.
+  var KB_MAX = 16;
+  var KB_KEYS = '1234567890QWERTYUIOPASDFGHJKLZXCVBNM';
+  function kbPaint() {
+    setText('kb-box', kbText);
+    setCls($('kb-shift'), kbShift ? 'kb-key kb-w kb-on' : 'kb-key kb-w');
+  }
+  // SHIFT turns itself on for the first letter of each word
+  function kbAutoShift() {
+    kbShift = (kbText === '' || kbText.charAt(kbText.length - 1) === ' ');
+  }
+  function openKeyboard(mode) {
+    var p = ppRow;
+    if (!sess) { return; }
+    if (mode === 'rename') {
+      if (!p) { return; }
+      kbCtx = { mode: 'rename', accountId: p.id };
+      // start from the name as it is, unless it is one these keys could
+      // not have typed (made on the web page): then start empty
+      kbText = /^[A-Za-z0-9 '\-]{1,16}$/.test(String(p.name))
+        ? String(p.name) : '';
+      setText('kb-ttl', 'RENAME · NAME');
+    } else {
+      kbCtx = { mode: 'new', rid: newRid() };
+      kbText = '';
+      setText('kb-ttl', 'NEW PLAYER · NAME');
+    }
+    kbBusy = false;
+    kbAutoShift();
+    setText('kb-msg', '');
+    kbPaint();
+    $('kb-scrim').style.display = 'block';
+  }
+  function closeKeyboard() {
+    setStyle($('kb-scrim'), 'display', 'none');
+    kbCtx = null; kbText = ''; kbBusy = false;
+  }
+  // ch = a capital letter, a digit, a space, a hyphen or an apostrophe
+  function kbType(ch) {
+    if (kbBusy || !kbCtx) { return; }
+    // no leading space, no two in a row
+    if (ch === ' ' && (kbText === '' ||
+                       kbText.charAt(kbText.length - 1) === ' ')) { return; }
+    if (kbText.length >= KB_MAX) {
+      setText('kb-msg', KB_MAX + ' letters at most'); return;
+    }
+    var letter = (ch >= 'A' && ch <= 'Z');
+    kbText += (letter && !kbShift) ? ch.toLowerCase() : ch;
+    if (letter) { kbShift = false; } else if (ch === ' ') { kbShift = true; }
+    setText('kb-msg', '');
+    kbPaint();
+  }
+  function kbDelete() {
+    if (kbBusy || !kbCtx) { return; }
+    kbText = kbText.substr(0, kbText.length - 1);
+    kbAutoShift();
+    setText('kb-msg', '');
+    kbPaint();
+  }
+  function kbOk() {
+    var ctx = kbCtx;
+    if (kbBusy || !ctx || !sess) { return; }
+    var name = kbText.replace(/ +$/, '');
+    if (!name) { setText('kb-msg', 'Type a name'); return; }
+    var body = (ctx.mode === 'rename')
+      ? { action: 'plRename', accountId: ctx.accountId, name: name }
+      : { action: 'plCreate', name: name, rid: ctx.rid };
+    var tok = sess;
+    kbBusy = true;                  // keys are ignored until the hub answers
+    setText('kb-msg', 'Saving…');
+    postAdmin(body, function (status, data) {
+      // a keyboard that was closed (a new session, the admin right gone)
+      // made this ctx stale and already cleared the busy flag
+      if (sess !== tok || kbCtx !== ctx) { return; }
+      kbBusy = false;
+      if (status === 200 && data && data.ok !== false) {
+        closeKeyboard();
+        if (ctx.mode === 'new') { plPage = 0; }
+        adminDone('player', data, data.msg);
+      } else {
+        // the hub's words; the text stays for editing
+        setText('kb-msg', actionErr(status, data));
+      }
+    });
+  }
+
+  // ---- money confirm: arm {body, back}, YES posts it, then return to the
+  //      view it came from so its numbers repaint (the confirm pattern).
+  //      viaAdmin = the request is an admin's action for a player and goes
+  //      to /api/glass/admin; without it, /api/glass/action as ever. --------
+  function askConfirm(q, sub, body, back, viaAdmin) {
+    pendingConfirm = { body: body, back: back, viaAdmin: (viaAdmin === true),
+                       busy: false };
     setText('cf-q', q); setText('cf-sub', sub); setText('cf-note', '');
     show('confirm');
   }
-  function returnFrom(back) {
+  // data = the hub's reply after a yes; null after CANCEL. msg = the
+  // sentence for the message line of a view that has one.
+  function returnFrom(back, data, msg) {
     if (back === 'cashout') { openCashout(); }
     else if (back === 'wallet') { openWallet(); }
     else if (back === 'handpay') { openHandpay(); }
+    else if (back === 'service' && overlay) {
+      if (data) { adminDone('service', data, msg); } else { show('service'); }
+    }
+    else if (back === 'player' && admin && !overlay && ppRow) {
+      if (data) { adminDone('player', data, msg); }
+      else { show('player'); paintPlayer(); }
+    }
     else { show(home()); }
   }
   function doConfirm() {
-    if (confirmBusy || !pendingConfirm) { return; }
-    confirmBusy = true;
+    var pc = pendingConfirm, tok = sess;
+    // one request per dialog at a time: a second CONFIRM while the first
+    // is in flight does nothing
+    if (!pc || pc.busy || !tok) { return; }
+    pc.busy = true;
     setText('cf-note', 'working…');
-    var pc = pendingConfirm;
-    postAction(pc.body, function (status, data) {
-      confirmBusy = false;
+    (pc.viaAdmin ? postAdmin : postAction)(pc.body, function (status, data) {
+      pc.busy = false;
+      // A reply that comes back to a different session, or after its
+      // dialog was taken down, changes nothing: the screen already shows
+      // what the session it has now should see.
+      if (sess !== tok || pendingConfirm !== pc) { return; }
       if (status === 200 && data && data.ok !== false) {
         pendingConfirm = null;
         // a cash-out to wallet is on its way from this tap; the next poll
         // carries the hub's own word on it
         if (pc.body && pc.body.action === 'cashOutNow') { coPending = true; }
-        returnFrom(pc.back);
+        // the hub has no sentence for a handpay clear: it only knows that
+        // it asked the machine. CLEAR goes when the machine reports it gone.
+        returnFrom(pc.back, data, data.msg ? data.msg
+          : (pc.body && pc.body.action === 'clearHandpay')
+            ? 'Handpay clear sent.' : '');
       } else {
         // money refusal: the hub's own wording VERBATIM when it gave any
         // (it names the numbers), else one honest retry line; 401 = the
@@ -1743,17 +2785,13 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   $('hb-wallet').onclick   = openWallet;                        // the money hub
   $('hb-cashout').onclick  = openCashout;
   $('hb-logout').onclick   = function () {
-    // OVERLAY mode -> this is "DONE": end the overlay directly (no confirm,
-    // no attract flash — the friend is not logging out).
-    if (overlay) { doOverlayDone(); return; }
     setText('lo-note', ''); show('logout');
   };
-  // admin backend column (whole column hidden by updateTexts unless admin)
-  $('hb-machine').onclick  = function () { show('machine'); };
-  $('hb-tickets').onclick  = openTickets;
-  $('hb-handpay').onclick  = openHandpay;
-  $('hb-games').onclick    = openGames;
-  $('hb-settings').onclick = openSettings;
+  // an admin's one extra button (column B is hidden by updateTexts unless
+  // admin); the hub re-checks the right on every request behind it
+  $('hb-admin').onclick    = function () {
+    if (admin && !overlay) { openAdmin(); }
+  };
 
   // CASH OUT: two controls. co-toggle sends the credits now; co-arm (below)
   // switches where the cabinet's own button sends them. Funding is in MY
@@ -1798,10 +2836,19 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   for (var kpi = 0; kpi <= 9; kpi++) {
     (function (dgt) { $('kp' + dgt).onclick = function () { kpDigit(dgt); }; })(kpi);
   }
-  $('kp-clr').onclick = function () { kpCents = 0; kpPin = ''; kpRepaint(); };
+  $('kp-clr').onclick = kpClear;
   $('at-pin').onclick = openPinKeypad;               // attract -> PIN pad
   $('kp-ok').onclick = kpOk;
-  $('kp-cancel').onclick = closeKeypad;
+  $('kp-cancel').onclick = function () {
+    // a new PIN that is on its way to the hub is answered before the pad
+    // closes, so its result is always seen
+    if (kpMode === 'newpin' && pinBusy) { return; }
+    closeKeypad();
+  };
+  // the admin amount pad's quick amounts
+  $('kp-chip0').onclick = function () { giveChip(0); };
+  $('kp-chip1').onclick = function () { giveChip(1); };
+  $('kp-chip2').onclick = function () { giveChip(2); };
   $('wl-add').onclick = function () {
     if (!coCanFund) { return; }
     if (coUseRestr) {
@@ -1841,35 +2888,123 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
       'Resets the pending handpay to credits on this machine.',
       { action: 'clearHandpay' }, 'handpay');
   };
-  // GAMES REFRESH: status-only, no confirm; re-open to repaint the list
-  $('gm-refresh').onclick = function () {
-    if (gmBusy) { return; }
-    gmBusy = true;
-    setText('gm-asof', 'refreshing…');
-    postAction({ action: 'refreshGames' }, function () {
-      gmBusy = false;
-      if (view === 'games') { openGames(); }
-    });
+
+  // SERVICE (a tap-over)
+  $('sv-clear').onclick = function () {
+    var hp = svcHandpay(), amt;
+    if (!svIdle() || !hp) { return; }
+    if (hp.canClear !== true) {
+      svMsg = 'The machine is not answering. Try again in a moment.';
+      paintService();
+      return;
+    }
+    amt = hpAmount(hp);
+    askConfirm('CLEAR HANDPAY?', amt
+      ? (amt + ' handpay. Resets it to credits on this machine.')
+      : 'Resets the pending handpay to credits on this machine.',
+      { action: 'clearHandpay' }, 'service');
   };
-  // money confirm dialog (shared by ADD-from-wallet + CLEAR-handpay)
+  $('sv-add').onclick  = function () { svcGive(false); };
+  $('sv-fsp').onclick  = function () { svcGive(true); };
+  $('sv-pin').onclick  = function () {
+    if (!svIdle() || !svc || svc.hasWallet !== true) { return; }
+    openNewPin({ action: 'svcSetPin', accountId: null, back: 'service' });
+  };
+  $('sv-done').onclick = doOverlayDone;
+
+  // ADMIN menu
+  $('am-handpay').onclick = openHandpay;
+  $('am-players').onclick = function () { openPlayers(0); };
+  $('am-new').onclick     = function () { openKeyboard('new'); };
+  $('am-back').onclick    = function () { show(home()); };
+
+  // PLAYERS: PREV / NEXT turn the page of the copy already read
+  $('pl-prev').onclick = function () {
+    if (plRows && plPage > 0) { plPage--; paintPlayers(''); }
+  };
+  $('pl-next').onclick = function () {
+    if (plRows && (plPage + 1) * plPerPage() < plRows.length) {
+      plPage++; paintPlayers('');
+    }
+  };
+  $('pl-back').onclick = backToAdmin;
+
+  // PLAYER: the eight actions. A greyed button's handler tests the state,
+  // never the class.
+  $('pp-add').onclick    = function () { ppGive('plFund', false); };
+  $('pp-take').onclick   = function () { ppGive('plTake', false); };
+  $('pp-fsp').onclick    = function () { ppGive('plFund', true); };
+  $('pp-rename').onclick = function () {
+    if (ppIdle()) { openKeyboard('rename'); }
+  };
+  $('pp-setpin').onclick = function () {
+    if (!ppIdle()) { return; }
+    openNewPin({ action: 'plSetPin', accountId: ppRow.id, back: 'player' });
+  };
+  $('pp-clrpin').onclick = function () {
+    if (!ppIdle() || ppRow.hasPin !== true) { return; }
+    askConfirm('CLEAR PIN?', shortName(ppRow.name) +
+      ' will need a fob, or a new PIN, to card in.',
+      { action: 'plClearPin', accountId: ppRow.id }, 'player', true);
+  };
+  $('pp-addfob').onclick = function () {
+    if (!fwOn) { fobArm(); return; }
+    // It reads CANCEL now. For the first half second it takes no tap: the
+    // second tap of a double tap on ADD FOB lands here.
+    var ms = new Date().getTime() - fwSince;
+    if (ms >= 0 && ms < 500) { return; }
+    fobCancel();
+  };
+  $('pp-remfob').onclick = function () {
+    var fobs = rowFobs(ppRow);
+    if (!ppIdle() || !fobs.length) { return; }
+    if (fobs.length === 1) { askRemoveFob(fobs[0]); } else { openFobs(); }
+  };
+  $('pp-back').onclick = function () {
+    // leaving while ADD FOB waits: tell the hub, so the reader goes back
+    // to carding people in at once
+    if (fwOn && sess) { postAdmin({ action: 'plAddFobCancel' }, function () {}); }
+    openPlayers(plPage);     // the list it came from, read again
+  };
+  $('fb-back').onclick = function () { show('player'); paintPlayer(); };
+
+  // the letter keyboard
+  for (var kbi = 0; kbi < KB_KEYS.length; kbi++) {
+    (function (ch) {
+      $('kb-k' + ch).onclick = function () { kbType(ch); };
+    })(KB_KEYS.charAt(kbi));
+  }
+  $('kb-space').onclick  = function () { kbType(' '); };
+  $('kb-hyph').onclick   = function () { kbType('-'); };
+  $('kb-apos').onclick   = function () { kbType('\''); };
+  $('kb-shift').onclick  = function () {
+    if (kbBusy || !kbCtx) { return; }
+    kbShift = !kbShift; kbPaint();
+  };
+  $('kb-del').onclick    = kbDelete;
+  $('kb-ok').onclick     = kbOk;
+  $('kb-cancel').onclick = function () {
+    if (kbBusy) { return; }     // a name on its way to the hub is answered first
+    closeKeyboard();
+  };
+
+  // money confirm dialog (shared by every confirm but LOG OUT)
   $('cf-yes').onclick = doConfirm;
   $('cf-no').onclick  = function () {
+    // a CONFIRM on its way to the hub is answered before the dialog
+    // closes, so what it did is always seen
+    if (pendingConfirm && pendingConfirm.busy) { return; }
     var b = pendingConfirm ? pendingConfirm.back : null;
     pendingConfirm = null;
-    returnFrom(b);
+    returnFrom(b, null, '');
   };
 
   // BACK routes to home() (not a remembered origin) so a hub-side access
-  // flip mid-sub-view still lands the user on the menu matching their fob
-  $('tk-back').onclick = function () { show(home()); };
-  $('hp-back').onclick = function () { show(home()); };
-  // GAMES back walks the levels: paytables -> game list -> home
-  $('gm-back').onclick = function () {
-    if (gmGame >= 0 && gmData) { paintGameList(); } else { show(home()); }
-  };
-  $('se-back').onclick = function () { show(home()); };
+  // flip mid-sub-view still lands the user on the menu matching their fob.
+  // HANDPAY (like PLAYERS above) was opened from the ADMIN menu and goes
+  // back to it, for as long as the admin right holds.
+  $('hp-back').onclick = backToAdmin;
   $('wl-back').onclick = function () { show(home()); };
-  $('mi-back').onclick = function () { show(home()); };
   $('lo-yes').onclick  = doLogout;
   $('lo-no').onclick   = function () { show(home()); };
 

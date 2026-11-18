@@ -436,6 +436,52 @@ def main():
           len(rows) == 2 and all("restricted promotional" in e["note"]
                                  for e in rows))
 
+    print("— a fund from a machine's screen says who did it, and where")
+    # player_action(req, by=...): the admin menus pass which admin asked
+    # and at which machine; the Players web page passes nothing.
+    def notes(n):
+        return [e["note"] for e in store.state["ledger"][-n:]]
+
+    class OpenStub(PlayerStub):
+        def house_allow_negative(self):
+            return True             # the bank covers a cash gift
+
+    ps = OpenStub()
+    who = " — by AJ at Bluebird 2 (service)"
+    ps.player_action({"action": "fund", "accountId": fid, "cents": 300},
+                     by="AJ at Bluebird 2 (service)")
+    check("both ledger notes of a fund end with who did it",
+          notes(2) == ["house fund" + who, f"fund {fid}" + who])
+    ps.player_action({"action": "fund", "accountId": fid, "cents": 300,
+                      "restricted": True}, by="AJ at Bluebird 2 (service)")
+    check("a restricted fund's notes still say restricted promotional, "
+          "then who",
+          notes(2) == ["house fund (restricted promotional)" + who,
+                       f"fund {fid} (restricted promotional)" + who])
+    ps.player_action({"action": "fund", "accountId": fid, "cents": -100},
+                     by="AJ at Bluebird 2 (admin menu)")
+    check("a take-back's notes too",
+          notes(2) == ["pull back to house — by AJ at Bluebird 2 (admin "
+                       "menu)",
+                       f"pull back {fid} — by AJ at Bluebird 2 (admin menu)"])
+    ps.player_action({"action": "fund", "accountId": fid, "cents": 100,
+                      "by": "somebody on the web"})
+    check("who did it is never read from the request: a web caller cannot "
+          "set it, and the web page's notes are as they were",
+          notes(2) == ["house fund", f"fund {fid}"])
+    real_adjust = store.adjust
+    store.adjust = lambda aid, *a, **k: (None, "locked") \
+        if aid == "house" else real_adjust(aid, *a, **k)
+    r = ps.player_action({"action": "fund", "accountId": fid, "cents": 100})
+    store.adjust = real_adjust
+    check("the one refusal that comes after money moved is marked partial "
+          "(the player was credited, the House leg failed)",
+          r.get("ok") is False and r.get("partial") is True)
+    r = ps.player_action({"action": "fund", "accountId": fid,
+                          "cents": -99_000_000})
+    check("a refusal before anything moved is not marked",
+          r.get("ok") is False and "partial" not in r)
+
     print("— the machine's CASH OUT button: armed on the right status byte")
     # SAS 6.02 Table 8.2b. Until v0.3.14 the arm gate read "available
     # transfers" bit 1 (a transfer from the machine might be accepted) as
