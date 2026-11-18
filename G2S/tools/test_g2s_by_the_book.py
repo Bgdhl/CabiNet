@@ -292,7 +292,7 @@ class Egm:
             return attrs, ids
         return None, []
 
-    def issue_voucher(self, amount, txn=None):
+    def issue_voucher(self, amount, txn=None, extra=""):
         """Print a ticket with the next id in the buffer (§21.16: "MUST be
         used in the order provided")."""
         vid = self.val_ids.pop(0)
@@ -303,7 +303,8 @@ class Egm:
             f'g2s:validationId="{vid}" g2s:voucherAmt="{amount}" '
             f'g2s:creditType="G2S_cashable" '
             f'g2s:transferDateTime="{self.stamp()}" '
-            f'g2s:egmAction="G2S_issued" g2s:voucherSequence="{txn}"/>')
+            f'g2s:egmAction="G2S_issued" g2s:voucherSequence="{txn}"'
+            f'{extra}/>')
         return vid, txn, self.answer(got, "issueVoucherAck")
 
     def redeem_voucher(self, vid, txn=None):
@@ -2845,6 +2846,632 @@ def item_16_a_currency_without_two_decimal_places():
         gh._MONEY["symbol"], gh._MONEY["source"] = "$", "default"
 
 
+# ---------------------------------------------------------------------------
+# Batch 5: vouchers, the remainder
+
+def voucher_status(enabled, list_id):
+    return (f'<g2s:voucherStatus g2s:hostEnabled="{enabled}" '
+            f'g2s:egmEnabled="true" g2s:validationListId="{list_id}"/>')
+
+
+def states_sent(cmds):
+    """The enable value of each setVoucherState the host sent, in order."""
+    return [a.get("enable") for _c, n, a, _e in cmds
+            if n == "setVoucherState"]
+
+
+def a_stale_list(host, egm):
+    """The machine reports a ticket-number list this hub did not issue:
+    the hub starts its refresh."""
+    a = egm.assoc
+    host.enqueue_get_voucher_status(a)
+    drain(host, a)
+    mark = len(host.sent)
+    answer_to(egm, "voucher", "getVoucherStatus", voucher_status("true", 77))
+    return mark
+
+
+def item_28_ticket_printing_switched_back_on():
+    print("— audit item 28: the hub switches ticket printing off and on to "
+          "refresh a machine's ticket numbers (§21.9); it is not left off")
+    host = make_host()
+    egm = online(joined(host, "BTB_reconcile"))
+    a = egm.assoc
+    store = host.voucher_store
+    mark = a_stale_list(host, egm)
+    check("a list this hub did not issue: off, then on, and the hub notes "
+          "on disk that the device is off by its hand",
+          states_sent(sent_since(host, mark)) == ["false", "true"]
+          and store.reconcile_open_since(egm.egm_id) > 0
+          and gh.VoucherStore(store.path).reconcile_open_since(egm.egm_id) > 0,
+          states_sent(sent_since(host, mark)))
+    mark = len(host.sent)
+    answer_to(egm, "voucher", "setVoucherState", voucher_status("false", 77))
+    check("the answer to the disable says off: the enable is already on "
+          "its way and is not sent twice",
+          states_sent(sent_since(host, mark)) == [])
+    answer_to(egm, "voucher", "setVoucherState", voucher_status("1", 77))
+    check("the answer to the enable says on (written \"1\"): the note is "
+          "closed", store.reconcile_open_since(egm.egm_id) == 0)
+
+    print("— the enable is lost (the machine signs on again between the two)")
+    host = make_host()
+    egm = online(joined(host, "BTB_reconcile_lost"))
+    a = egm.assoc
+    store = host.voucher_store
+    a_stale_list(host, egm)
+    egm.comms_online()
+    online(egm)
+    a.voucher_enable_at -= gh.VOUCHER_ENABLE_RESEND_SEC + 1
+    host.enqueue_get_voucher_status(a)
+    drain(host, a)
+    mark = len(host.sent)
+    answer_to(egm, "voucher", "getVoucherStatus", voucher_status("false", 0))
+    check("at the next join the device still says off: it is switched on "
+          "(nothing was sent: ticket printing stayed off, and the whole "
+          "machine where the voucher device is requiredForPlay)",
+          states_sent(sent_since(host, mark)) == ["true"],
+          names(sent_since(host, mark)))
+    mark = len(host.sent)
+    answer_to(egm, "voucher", "setVoucherState", voucher_status("false", 0))
+    check("still off a moment later: not sent again inside "
+          f"{gh.VOUCHER_ENABLE_RESEND_SEC} seconds",
+          states_sent(sent_since(host, mark)) == [])
+    answer_to(egm, "voucher", "setVoucherState", voucher_status("true", 0))
+    check("on: closed", store.reconcile_open_since(egm.egm_id) == 0)
+
+    print("— the hub restarted between the two commands")
+    host = make_host()
+    egm = online(joined(host, "BTB_reconcile_restart"))
+    a = egm.assoc
+    host.voucher_store.set_reconcile_open(egm.egm_id, True)   # from disk
+    host.enqueue_get_voucher_status(a)
+    drain(host, a)
+    mark = len(host.sent)
+    answer_to(egm, "voucher", "getVoucherStatus", voucher_status("false", 77))
+    check("it knows from disk that the device is off by its hand and "
+          "switches it on, without a second off",
+          states_sent(sent_since(host, mark)) == ["true"],
+          states_sent(sent_since(host, mark)))
+
+    print("— a device switched off by hand")
+    host = make_host()
+    egm = online(joined(host, "BTB_reconcile_manual"))
+    a = egm.assoc
+    host.enqueue_get_voucher_status(a)
+    drain(host, a)
+    mark = len(host.sent)
+    answer_to(egm, "voucher", "getVoucherStatus", voucher_status("false", 0))
+    check("with no refresh of the hub's own open, it is left as it is",
+          states_sent(sent_since(host, mark)) == [])
+
+    print("— nothing comes back at all")
+    host = make_host()
+    egm = online(joined(host, "BTB_reconcile_silent"))
+    a = egm.assoc
+    store = host.voucher_store
+    store.set_reconcile_open(egm.egm_id, True)
+    mark = len(host.sent)
+    host.sweep_voucher_reconciles()
+    drain(host, a)
+    check("a refresh begun a moment ago is given time",
+          "getVoucherStatus" not in names(sent_since(host, mark)))
+    store.state["egms"][egm.egm_id]["reconcileOpenAt"] -= 60
+    asked = 0
+    for n in range(gh.VOUCHER_RECHECK_TRIES + 4):
+        mark = len(host.sent)
+        host.sweep_voucher_reconciles()
+        drain(host, a)
+        asked += names(sent_since(host, mark)).count("getVoucherStatus")
+        if n == 0:
+            mark = len(host.sent)
+            host.sweep_voucher_reconciles()
+            drain(host, a)
+            check("the device is asked for its status, not twice in "
+                  f"{gh.VOUCHER_ENABLE_RESEND_SEC} seconds",
+                  asked == 1 and "getVoucherStatus"
+                  not in names(sent_since(host, mark)), asked)
+        a.voucher_recheck_at -= gh.VOUCHER_ENABLE_RESEND_SEC + 1
+    check(f"and no more than {gh.VOUCHER_RECHECK_TRIES} times before the "
+          "hub says it cannot tell", asked == gh.VOUCHER_RECHECK_TRIES,
+          asked)
+    said, real = [], gh.log.error
+    gh.log.error = lambda *args, **kw: said.append(args)
+    try:
+        a.voucher_rechecks = gh.VOUCHER_RECHECK_TRIES
+        for _n in range(5):
+            a.voucher_recheck_at -= gh.VOUCHER_ENABLE_RESEND_SEC + 1
+            host.sweep_voucher_reconciles()
+    finally:
+        gh.log.error = real
+    check("which it says once, not every 20 seconds from then on",
+          len(said) == 1, len(said))
+
+
+def voucher_log(*entries, extra=""):
+    """A voucherLogList. Each entry: (sequence, action, state, txn, last
+    four digits or the whole number, amount, egmAction)."""
+    rows = "".join(
+        f'<g2s:voucherLog g2s:logSequence="{seq}" g2s:deviceId="1" '
+        f'g2s:transactionId="{txn}" g2s:voucherState="{state}" '
+        f'g2s:validationId="{str(tail).rjust(18, "0")}" '
+        f'g2s:voucherAmt="{amt}" '
+        f'g2s:creditType="G2S_cashable" g2s:voucherAction="{action}" '
+        f'g2s:egmAction="{act}" g2s:transferAmt="{amt}" '
+        f'g2s:transferDateTime="2026-11-17T10:00:00.000-05:00"{extra}/>'
+        for seq, action, state, txn, tail, amt, act in entries)
+    return f"<g2s:voucherLogList>{rows}</g2s:voucherLogList>"
+
+
+def read_voucher_log(host, egm, body):
+    host.enqueue_get_voucher_log(egm.assoc)
+    drain(host, egm.assoc)
+    return answer_to(egm, "voucher", "getVoucherLog", body)
+
+
+def item_29_a_log_entry_the_machine_is_still_waiting_on():
+    print("— audit item 29: a log entry in G2S_issueSent or G2S_commitSent "
+          "is \"waiting for acknowledgement\" (Table 21.38): the command "
+          "itself is still to come")
+    host = make_host()
+    egm = joined(host, "BTB_log")
+    ids = host.voucher_store.state["issuedIds"]
+    egm.get_validation_data(5)
+    # a ticket printed while the hub was away: the machine holds the
+    # issueVoucher and will go on sending it. The log is read first.
+    vid = egm.val_ids[0]
+    txn = egm.next_txn()
+    read_voucher_log(host, egm, voucher_log(
+        (1, "G2S_issue", "G2S_issueSent", txn, vid[-4:], 2_500_000,
+         "G2S_issued")))
+    _vid, _txn, ack = egm.issue_voucher(2_500_000, txn=txn)
+
+    def held(kind, t):
+        return sum(1 for v in host.voucher_store.state["vouchers"]
+                   if v.get("kind") == kind and v.get("transactionId") == t)
+    check("the issueVoucher that follows is recorded", ack is not None
+          and ids[vid].get("state") == "issued"
+          and ids[vid].get("voucherAmt") == "2500000", ids[vid])
+    check("and the ticket is in the history once (the log entry, with only "
+          "the last four digits of its number, was put there beside it)",
+          held("issue", txn) == 1, held("issue", txn))
+    rtxn, auth = egm.redeem_voucher(vid)
+    check("the ticket can be redeemed", auth is not None
+          and auth.get("voucherAmt") == "2500000"
+          and "hostException" not in auth, auth)
+    # the redemption is done at the machine and its commit not yet
+    # acknowledged when the log is read again
+    read_voucher_log(host, egm, voucher_log(
+        (1, "G2S_issue", "G2S_issueAcked", txn, vid[-4:], 2_500_000,
+         "G2S_issued"),
+        (2, "G2S_redeem", "G2S_commitSent", rtxn, vid[-4:], 2_500_000,
+         "G2S_redeemed")))
+    egm.commit_voucher(rtxn, vid, 2_500_000)
+    check("the commitVoucher that follows closes the redemption, and it is "
+          "in the history once", ids[vid].get("state") == "redeemed"
+          and held("commit", rtxn) == 1, (ids[vid], held("commit", rtxn)))
+
+    print("— entries the machine has closed are still merged")
+    host = make_host()
+    egm = joined(host, "BTB_log_acked")
+    egm.get_validation_data(5)
+    host.enqueue_get_voucher_log(egm.assoc)
+    drain(host, egm.assoc)
+    before = len(host.voucher_store.state["vouchers"])
+    answer_to(egm, "voucher", "getVoucherLog", voucher_log(
+        (1, "G2S_issue", "G2S_issueAcked", 7, "1234", 100_000, "G2S_issued"),
+        (2, "G2S_issue", "G2S_issueSent", 8, "5678", 100_000, "G2S_issued")))
+    ring = host.voucher_store.state["vouchers"]
+    check("the acknowledged one is kept as history, the one still waiting "
+          "is not", len(ring) == before + 1
+          and ring[-1].get("transactionId") == "7", ring[before:])
+
+
+
+def item_30_a_date_that_means_nothing():
+    print("— audit item 30: expireDateTime is \"only valid if expireCredits "
+          "is set to true\" (Table 21.17)")
+    host = make_host()
+    egm = joined(host, "BTB_expiry")
+    ids = host.voucher_store.state["issuedIds"]
+    egm.get_validation_data(5)
+    past = "2026-01-01T00:00:00.000-05:00"
+    vid, _t, _a = egm.issue_voucher(
+        700_000, extra=f' g2s:expireDateTime="{past}"')
+    _r, auth = egm.redeem_voucher(vid)
+    check("expireCredits left at its default of false, with a date filled "
+          "in all the same: the ticket is redeemed (it was refused as "
+          "expired)", auth is not None and auth.get("voucherAmt") == "700000"
+          and "hostException" not in auth and "expireDateTime" not in ids[vid],
+          auth)
+    vid, _t, _a = egm.issue_voucher(
+        700_000, extra=f' g2s:expireCredits="true" '
+        f'g2s:expireDateTime="{past}"')
+    _r, auth = egm.redeem_voucher(vid)
+    check("expireCredits true and the date passed: refused as expired",
+          auth is not None and auth.get("hostException") == "3"
+          and auth.get("voucherAmt") == "0", auth)
+    vid, _t, _a = egm.issue_voucher(
+        700_000, extra=' g2s:expireCredits="1" '
+        'g2s:expireDateTime="2099-01-01T00:00:00.000-05:00"')
+    _r, auth = egm.redeem_voucher(vid)
+    check("expireCredits true and the date still ahead: redeemed, and the "
+          "date is kept", auth is not None and "hostException" not in auth
+          and ids[vid].get("expireDateTime", "").startswith("2099"), auth)
+    # the same ticket facts arriving by way of the machine's log (a
+    # machine that reports the whole number there)
+    vid = egm.val_ids[0]
+    read_voucher_log(host, egm, voucher_log(
+        (1, "G2S_issue", "G2S_issueAcked", 90, vid, 300_000, "G2S_issued"),
+        extra=f' g2s:expireDateTime="{past}"'))
+    check("a ticket learned of from the machine's log is held to the same "
+          "rule", ids[vid].get("state") == "issued"
+          and "expireDateTime" not in ids[vid], ids[vid])
+
+
+def item_56_what_a_print_result_says():
+    print("— audit item 56: printComplete (Table 16.13: transferState "
+          "defaults to 1, printComplete to true)")
+    host = make_host()
+    egm = joined(host, "BTB_print")
+    a = egm.assoc
+
+    def result(attrs):
+        egm.send("printer", f'<g2s:printComplete g2s:transactionId="9"'
+                            f'{attrs}/>', stype="G2S_response")
+        return (a.printer.get("lastPrint") or {}).get("result")
+    check("the data reached the printer and the print failed "
+          "(G2S_PTE103): not shown as printed (it was)",
+          result(' g2s:transferState="1" g2s:printComplete="false"')
+          == "print failed")
+    check("both attributes left at their defaults: printed (it read as "
+          "not printed)", result("") == "printed")
+    check("both stated", result(' g2s:transferState="1" '
+                                'g2s:printComplete="true"') == "printed"
+          and result(' g2s:transferState="1" g2s:printComplete="0"')
+          == "print failed")
+    check("a transfer that did not succeed is shown with its code",
+          result(' g2s:transferState="3" g2s:printComplete="false"')
+          == "transferState=3")
+
+
+def item_57_why_a_ticket_was_refused():
+    print("— audit item 57: hostException \"MUST indicate the reason for "
+          "rejection\" (§21.20; Table 21.35: 4 is \"Voucher not found\", "
+          "99 \"Redemption denied\")")
+    adapt = gh.TitoAuthority._adapt
+    codes = [adapt({"authorized": False, "reason": "x", "why": w})["exc"]
+             for w in ("notFound", "inProcess", "redeemed", "denied")]
+    check("each kind of refusal by the hub's ledger has its own code",
+          codes == [4, 1, 2, 99], codes)
+    host = make_host()
+    egm = joined(host, "BTB_refused")
+    _t, auth = egm.redeem_voucher("123456789012345678")
+    check("a number the ledger has never heard of: 4",
+          auth is not None and auth.get("hostException") == "4", auth)
+
+    def broken(*_a, **_k):
+        raise OSError("disk I/O error")
+    host.hub_store.tito_authorize = broken
+    _t, auth = egm.redeem_voucher("223456789012345678")
+    check("the ledger cannot be read: 99, the ticket is not reported as "
+          "one that does not exist (it was 4)",
+          auth is not None and auth.get("hostException") == "99"
+          and auth.get("voucherAmt") == "0", auth)
+    store = gh.HubStore(os.path.join(tempfile.mkdtemp(), "hub.db"))
+    whys = [store.tito_authorize("m", "1", "323456789012345678").get("why"),
+            store._tito_reject("ticket voided").get("why"),
+            store._tito_reject("issued amount unknown/invalid").get("why")]
+    check("the ledger says which kind: an unknown number is not found, a "
+          "voided ticket and an amount it cannot pay from are denied",
+          whys == ["notFound", "denied", "denied"], whys)
+
+
+def voucher_options(text, days, text_len=None, days_max=None,
+                    definitions=True):
+    """An optionList for G2S_voucher/1 with both of its options: the text
+    fields {paramId: value} and the settings {paramId: value}. text_len
+    and days_max give the maxLen / maxIncl the machine states for a
+    parameter ({paramId: n}); definitions=False leaves them out, as the
+    list a machine sends unasked does."""
+    def option(option_id, group, complex_id, kind, values, limit, attr_name):
+        defs = ""
+        if definitions:
+            defs = (f'<g2s:optionParameters><g2s:complexParameter '
+                    f'g2s:paramId="{complex_id}">' + "".join(
+                        f'<g2s:{kind}Parameter g2s:paramId="{pid}" '
+                        'g2s:canModRemote="true"'
+                        + (f' g2s:{attr_name}="{limit[pid]}"'
+                           if pid in (limit or {}) else "") + "/>"
+                        for pid in values)
+                    + "</g2s:complexParameter></g2s:optionParameters>")
+        vals = (f'<g2s:optionCurrentValues><g2s:complexValue '
+                f'g2s:paramId="{complex_id}">' + "".join(
+                    f'<g2s:{kind}Value g2s:paramId="{pid}">{v}'
+                    f"</g2s:{kind}Value>" for pid, v in values.items())
+                + "</g2s:complexValue></g2s:optionCurrentValues>")
+        return (f'<g2s:optionGroup g2s:optionGroupId="{group}">'
+                f'<g2s:optionItem g2s:optionId="{option_id}">{defs}{vals}'
+                "</g2s:optionItem></g2s:optionGroup>")
+    return ('<g2s:optionList><g2s:deviceOptions g2s:deviceClass='
+            '"G2S_voucher" g2s:deviceId="1">'
+            + option("G2S_voucherTextFields", "G2S_voucherOptions",
+                     "G2S_voucherTextFields", "string", text, text_len,
+                     "maxLen")
+            + option("G2S_voucherOptions", "G2S_voucherOptions",
+                     "G2S_voucherOptions", "integer", days, days_max,
+                     "maxIncl")
+            + "</g2s:deviceOptions></g2s:optionList>")
+
+
+FACTORY_TEXT = {"G2S_propName": "YOUR ESTABLISHMENT",
+                "G2S_propLine1": "YOUR CITY, STATE ZIP",
+                "G2S_propLine2": "", "G2S_titleCash": "CASHOUT VOUCHER"}
+THIRTY_DAYS = {"G2S_expireCashPromo": "30", "G2S_expireNonCash": "30"}
+
+
+def item_23_a_header_longer_than_a_ticket_takes():
+    print("— audit item 23: the ticket text fields hold 40 characters, the "
+          "title 16 (the voucherTitle40 and voucherTitle16 data types, "
+          "Table 21.31)")
+    long_header = {"propName": "P" * 50, "line1": "L" * 64, "line2": None,
+                   "titleCash": "T" * 20, "expireDays": 30, "rev": 1}
+    host = make_host()
+    host.ticket_header = lambda: dict(long_header)
+    egm = online(joined(host, "BTB_header"))
+    a = egm.assoc
+    egm.send("optionConfig", voucher_options(FACTORY_TEXT, THIRTY_DAYS,
+                                             definitions=False))
+    mark = len(host.sent)
+    verdicts = host.push_ticket_header_g2s(only=a)
+    drain(host, a)
+    sent = values_sent(sent_since(host, mark)) or {}
+    check("a header saved under the old 64-character limit is sent as far "
+          "as each field holds (sent whole, a strict machine refuses the "
+          "set, and with it every other field)",
+          [len(sent.get(p, "")) for p in ("G2S_propName", "G2S_propLine1",
+                                         "G2S_titleCash")] == [40, 40, 16],
+          {k: len(v) for k, v in sent.items()})
+    check("and the push says which fields it shortened",
+          verdicts and verdicts[0].get("shortened") == {
+              "G2S_propName": [50, 40], "G2S_propLine1": [64, 40],
+              "G2S_titleCash": [20, 16]}, verdicts)
+
+    host = make_host()
+    host.ticket_header = lambda: dict(long_header)
+    egm = online(joined(host, "BTB_header_own"))
+    a = egm.assoc
+    host._maybe_push_ticket_header_on_join(a)
+    drain(host, a)
+    mark = len(host.sent)
+    answer_to(egm, "optionConfig", "getOptionList", voucher_options(
+        FACTORY_TEXT, THIRTY_DAYS, text_len={"G2S_propName": 30}))
+    sent = values_sent(sent_since(host, mark)) or {}
+    check("a machine that states its own room for a field is held to "
+          "that", len(sent.get("G2S_propName", "")) == 30
+          and len(sent.get("G2S_propLine1", "")) == 40,
+          {k: len(v) for k, v in sent.items()})
+    host = make_host()
+    host.ticket_header = lambda: {"propName": "The Den", "line1": "Here",
+                                  "line2": None, "titleCash": None,
+                                  "expireDays": 30, "rev": 1}
+    egm = online(joined(host, "BTB_header_fits"))
+    egm.send("optionConfig", voucher_options(FACTORY_TEXT, THIRTY_DAYS,
+                                             definitions=False))
+    verdicts = host.push_ticket_header_g2s(only=egm.assoc)
+    check("a header that fits is sent as it is",
+          verdicts and "shortened" not in verdicts[0], verdicts)
+
+
+def item_54_never_expires():
+    print("— audit item 54: the expiry settings are a number of days, "
+          "minimum 0 (Table 21.12); the document gives 0 no meaning of "
+          "\"never\"")
+    never = {"propName": "The Den", "line1": None, "line2": None,
+             "titleCash": None, "expireDays": 0, "rev": 1}
+    host = make_host()
+    host.ticket_header = lambda: dict(never)
+    egm = online(joined(host, "BTB_never"))
+    a = egm.assoc
+    egm.send("optionConfig", voucher_options(
+        {"G2S_propName": "The Den"}, THIRTY_DAYS, definitions=False))
+    mark = len(host.sent)
+    verdicts = host.push_ticket_expiration_g2s()
+    drain(host, a)
+    check("\"never\", to a machine that has not said how many days it "
+          "allows: its setting is left as it is, and the push says so (0 "
+          "was written, which read literally is \"expires the day it is "
+          "printed\")", values_sent(sent_since(host, mark)) is None
+          and verdicts and verdicts[0].get("ok") is True
+          and verdicts[0].get("leftAlone") == [
+              "G2S_expireCashPromo", "G2S_expireNonCash"], verdicts)
+
+    host = make_host()
+    host.ticket_header = lambda: dict(never)
+    egm = online(joined(host, "BTB_never_max"))
+    a = egm.assoc
+    host._maybe_push_ticket_header_on_join(a)
+    drain(host, a)
+    answer_to(egm, "optionConfig", "getOptionList", voucher_options(
+        {"G2S_propName": "The Den"}, THIRTY_DAYS,
+        days_max={"G2S_expireCashPromo": 9999}))
+    mark = len(host.sent)
+    verdicts = host.push_ticket_expiration_g2s()
+    drain(host, a)
+    sent = values_sent(sent_since(host, mark)) or {}
+    check("to a machine that allows up to 9999 days for one of the two: "
+          "that one is set to 9999, the other left as it is",
+          sent.get("G2S_expireCashPromo") == "9999"
+          and sent.get("G2S_expireNonCash") == "30"
+          and verdicts[0].get("leftAlone") == ["G2S_expireNonCash"],
+          (sent, verdicts))
+
+    host = make_host()
+    host.ticket_header = lambda: dict(never, expireDays=180)
+    egm = online(joined(host, "BTB_days"))
+    a = egm.assoc
+    egm.send("optionConfig", voucher_options(
+        {"G2S_propName": "The Den"}, THIRTY_DAYS, definitions=False))
+    mark = len(host.sent)
+    host.push_ticket_expiration_g2s()
+    drain(host, a)
+    sent = values_sent(sent_since(host, mark)) or {}
+    check("a number of days is written as that number, as before",
+          sent.get("G2S_expireCashPromo") == "180"
+          and sent.get("G2S_expireNonCash") == "180", sent)
+
+
+
+def apply_change(host, egm, txn, then):
+    """The machine validates, is authorized, and applies the option change
+    the host last sent; `then` is the optionList it answers the host's
+    read-back with."""
+    cfg = [r["attrs"].get("configurationId")
+           for r in egm.assoc.sent_requests.values()
+           if r["command"] == "setOptionChange"][-1]
+    answer_to(egm, "optionConfig", "setOptionChange",
+              change_status(cfg, txn, "G2S_pending"))
+    answer_to(egm, "optionConfig", "authorizeOptionChange",
+              change_status(cfg, txn, "G2S_applied"))
+    return answer_to(egm, "optionConfig", "getOptionList", then)
+
+
+def changed_options(cmds):
+    """The optionId of every setOptionChange in there."""
+    return [o.get(f"{{{gh.SCHEMA_NS}}}optionId")
+            for _c, name, _a, el in cmds if name == "setOptionChange"
+            for o in el.iter() if gh.localname(o.tag) == "option"]
+
+
+def the_expiry_follows_the_machine():
+    print("— the ticket expiry is re-applied when a machine joins, as the "
+          "header is (a machine that has been memory-cleared is back on "
+          "its own number of days)")
+    set_text = {"G2S_propName": "The Den"}
+    days180 = {"propName": "The Den", "line1": None, "line2": None,
+               "titleCash": None, "expireDays": 180, "rev": 1}
+    host = make_host()
+    host.ticket_header = lambda: dict(days180)
+    egm = online(joined(host, "BTB_expiry_join"))
+    a = egm.assoc
+    other = online(joined(host, "BTB_expiry_other"))   # on 30 days too
+    other.send("optionConfig", voucher_options(set_text, THIRTY_DAYS,
+                                               definitions=False))
+    host._maybe_push_ticket_header_on_join(a)
+    drain(host, a)
+    mark = len(host.sent)
+    answer_to(egm, "optionConfig", "getOptionList",
+              voucher_options(set_text, THIRTY_DAYS))
+    drain(host, other.assoc)
+    sent = values_sent(sent_since(host, mark)) or {}
+    check("the hub is set to 180 days and the machine holds 30: 180 is "
+          "sent at the join (it went only when the setting was saved), to "
+          "the machine that joined and no other",
+          changed_options(sent_since(host, mark)) == ["G2S_voucherOptions"]
+          and sent.get("G2S_expireCashPromo") == "180"
+          and sent.get("G2S_expireNonCash") == "180", sent)
+
+    host = make_host()
+    host.ticket_header = lambda: dict(days180)
+    egm = online(joined(host, "BTB_expiry_same"))
+    a = egm.assoc
+    host._maybe_push_ticket_header_on_join(a)
+    drain(host, a)
+    mark = len(host.sent)
+    answer_to(egm, "optionConfig", "getOptionList", voucher_options(
+        set_text, {"G2S_expireCashPromo": "180", "G2S_expireNonCash": "180"}))
+    check("a machine already on the hub's days: nothing is sent",
+          changed_options(sent_since(host, mark)) == [])
+
+    print("— header and expiry both differ: one change at a time")
+    host = make_host()
+    host.ticket_header = lambda: dict(days180)
+    egm = online(joined(host, "BTB_expiry_both"))
+    a = egm.assoc
+    host._maybe_push_ticket_header_on_join(a)
+    drain(host, a)
+    mark = len(host.sent)
+    answer_to(egm, "optionConfig", "getOptionList",
+              voucher_options(FACTORY_TEXT, THIRTY_DAYS))
+    check("the header goes first and the expiry is held (the second "
+          "change was refused and never sent)",
+          changed_options(sent_since(host, mark))
+          == ["G2S_voucherTextFields"] and a.ticket_expiry_pending is True,
+          changed_options(sent_since(host, mark)))
+    mark = len(host.sent)
+    apply_change(host, egm, "41", voucher_options(
+        dict(FACTORY_TEXT, G2S_propName="The Den", G2S_propLine1="",
+             G2S_titleCash="CASHOUT VOUCHER"), THIRTY_DAYS))
+    sent = values_sent(sent_since(host, mark)) or {}
+    check("once the header change has applied, the expiry follows",
+          changed_options(sent_since(host, mark)) == ["G2S_voucherOptions"]
+          and sent.get("G2S_expireCashPromo") == "180"
+          and a.ticket_expiry_pending is False, sent)
+
+    print("— saved together from the Settings page")
+    host = make_host()
+    host.ticket_header = lambda: dict(days180)
+    egm = online(joined(host, "BTB_expiry_save"))
+    a = egm.assoc
+    egm.send("optionConfig", voucher_options(FACTORY_TEXT, THIRTY_DAYS,
+                                             definitions=False))
+    mark = len(host.sent)
+    host.push_ticket_header_g2s()
+    verdicts = host.push_ticket_expiration_g2s()
+    drain(host, a)
+    check("the expiry is held behind the header, and said so",
+          changed_options(sent_since(host, mark))
+          == ["G2S_voucherTextFields"] and verdicts
+          and verdicts[0].get("deferred") is True, verdicts)
+    mark = len(host.sent)
+    apply_change(host, egm, "42", voucher_options(
+        dict(FACTORY_TEXT, G2S_propName="The Den", G2S_propLine1="",
+             G2S_titleCash="CASHOUT VOUCHER"), THIRTY_DAYS,
+        definitions=False))
+    check("and sent when the header is done",
+          changed_options(sent_since(host, mark)) == ["G2S_voucherOptions"],
+          changed_options(sent_since(host, mark)))
+
+    print("— a hub with days set and no header, and a hub set to \"never\"")
+    host = make_host()
+    host.ticket_header = lambda: dict(days180, propName=None)
+    egm = online(joined(host, "BTB_expiry_nohdr"))
+    a = egm.assoc
+    mark = len(host.sent)
+    host._maybe_push_ticket_header_on_join(a)
+    drain(host, a)
+    check("days set, no name: the machine's ticket options are still read "
+          "at the join", reads(sent_since(host, mark))
+          == [("G2S_voucher", "true")], reads(sent_since(host, mark)))
+    mark = len(host.sent)
+    answer_to(egm, "optionConfig", "getOptionList",
+              voucher_options(FACTORY_TEXT, THIRTY_DAYS))
+    check("and the days are sent, the text left alone",
+          changed_options(sent_since(host, mark)) == ["G2S_voucherOptions"],
+          changed_options(sent_since(host, mark)))
+    host = make_host()
+    host.ticket_header = lambda: dict(days180, propName=None, expireDays=0)
+    egm = online(joined(host, "BTB_expiry_never"))
+    mark = len(host.sent)
+    host._maybe_push_ticket_header_on_join(egm.assoc)
+    drain(host, egm.assoc)
+    check("no name and \"never\" (what a hub nobody has configured "
+          "holds): nothing is read and nothing is changed at a join",
+          sent_since(host, mark) == [], names(sent_since(host, mark)))
+    host = make_host()
+    host.ticket_header = lambda: dict(days180, expireDays=0)
+    egm = online(joined(host, "BTB_expiry_never_hdr"))
+    a = egm.assoc
+    host._maybe_push_ticket_header_on_join(a)
+    drain(host, a)
+    mark = len(host.sent)
+    answer_to(egm, "optionConfig", "getOptionList", voucher_options(
+        set_text, THIRTY_DAYS, days_max={"G2S_expireCashPromo": 9999,
+                                         "G2S_expireNonCash": 9999}))
+    check("a name and \"never\": the header is checked, the days are left "
+          "to the Save", changed_options(sent_since(host, mark)) == [],
+          changed_options(sent_since(host, mark)))
+
 
 def main():
     logging.basicConfig(level=logging.CRITICAL + 1)
@@ -2879,6 +3506,14 @@ def main():
     item_52_a_game_the_machine_needs()
     item_27_booleans_written_as_1_and_0()
     item_16_a_currency_without_two_decimal_places()
+    item_28_ticket_printing_switched_back_on()
+    item_29_a_log_entry_the_machine_is_still_waiting_on()
+    item_30_a_date_that_means_nothing()
+    item_56_what_a_print_result_says()
+    item_57_why_a_ticket_was_refused()
+    item_23_a_header_longer_than_a_ticket_takes()
+    item_54_never_expires()
+    the_expiry_follows_the_machine()
     print("=" * 50)
     print(f"RESULT: {_p} passed, {_f} failed")
     return 1 if _f else 0

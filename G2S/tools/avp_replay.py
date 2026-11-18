@@ -8221,8 +8221,11 @@ def main():
     st, body = _post_settings({"ticketPropName": 123})
     check("non-string ticketPropName -> 400", st == 400
           and body.get("ok") is False, f"{st} {body}")
-    st, body = _post_settings({"ticketPropName": "x" * 65})
-    check("65-char ticketPropName -> 400 (the 64-char printed-line bound)",
+    st, body = _post_settings({"ticketPropName": "x" * 41})
+    check("41-char ticketPropName -> 400 (a ticket line holds 40)",
+          st == 400 and body.get("ok") is False, f"{st} {body}")
+    st, body = _post_settings({"ticketTitleCash": "x" * 17})
+    check("17-char ticketTitleCash -> 400 (the title holds 16)",
           st == 400 and body.get("ok") is False, f"{st} {body}")
     st, body = _post_settings({"ticketPropName": "FUNCINO",
                                "ticketLine2": 123})

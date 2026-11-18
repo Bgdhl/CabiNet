@@ -666,17 +666,29 @@ def main():
           and h7.set_host_setting("ticket_title_cash", "CASH TICKET")
           == "CASH TICKET"
           and h7.host_setting("ticket_prop_name") == "FUNCINO")
-    check("64-char ticket value accepted AT the bound",
-          h7.set_host_setting("ticket_line2", "x" * MAX_TICKET_FIELD_LEN)
+    check("a 40-character ticket line is accepted AT the bound (what a "
+          "ticket has room for and both protocols carry)",
+          MAX_TICKET_FIELD_LEN == 40
+          and h7.set_host_setting("ticket_line2", "x" * MAX_TICKET_FIELD_LEN)
           == "x" * MAX_TICKET_FIELD_LEN)
     try:
         h7.set_host_setting("ticket_prop_name",
                             "x" * (MAX_TICKET_FIELD_LEN + 1))
-        check("65-char ticket value rejected (the 64-char printed-line "
-              "bound, not the generic 256)", False)
+        check("a 41-character ticket line is rejected (it was 64, the "
+              "printed-line width, and a strict machine refused the "
+              "whole header)", False)
     except ValueError:
-        check("65-char ticket value rejected (the 64-char printed-line "
-              "bound, not the generic 256)", True)
+        check("a 41-character ticket line is rejected (it was 64, the "
+              "printed-line width, and a strict machine refused the "
+              "whole header)", True)
+    check("the ticket title has 16 characters, accepted AT the bound",
+          h7.set_host_setting("ticket_title_cash", "T" * 16) == "T" * 16)
+    try:
+        h7.set_host_setting("ticket_title_cash", "T" * 17)
+        check("a 17-character ticket title is rejected", False)
+    except ValueError:
+        check("a 17-character ticket title is rejected", True)
+    h7.set_host_setting("ticket_title_cash", "CASH TICKET")
     check("oversize write left the stored value untouched",
           h7.host_setting("ticket_prop_name") == "FUNCINO")
     h7.set_host_setting("ticket_line2", "")

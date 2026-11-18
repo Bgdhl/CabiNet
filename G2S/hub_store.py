@@ -163,7 +163,19 @@ HOST_SETTING_KEYS = ("sysval_fallback", "house_allow_negative",
                      "ui_debug_tab")
 TICKET_TEXT_KEYS = ("ticket_prop_name", "ticket_line1", "ticket_line2",
                     "ticket_title_cash")
-MAX_TICKET_FIELD_LEN = 64
+# What a ticket has room for, and what both protocols will carry: 40
+# characters for the property name and each address line, 16 for the
+# title (G2S: the voucherTitle40 and voucherTitle16 data types of the
+# voucher options, 21.27 Table 21.31; SAS: 40 per text field in long poll
+# 7D, Table 15.4a). The bound was 64 for all four until v0.3.22, "the
+# printed-line width": a longer line was refused whole by a strict G2S
+# machine, with every other header field in the same set.
+MAX_TICKET_FIELD_LEN = 40
+MAX_TICKET_TITLE_LEN = 16
+TICKET_FIELD_MAX = {"ticket_prop_name": MAX_TICKET_FIELD_LEN,
+                    "ticket_line1": MAX_TICKET_FIELD_LEN,
+                    "ticket_line2": MAX_TICKET_FIELD_LEN,
+                    "ticket_title_cash": MAX_TICKET_TITLE_LEN}
 MAX_SETTING_KEY_LEN = 64
 MAX_SETTING_VAL_LEN = 256
 
@@ -1149,13 +1161,14 @@ class HubStore:
         if not isinstance(value, str):
             raise ValueError("value must be a string")
         if key in TICKET_TEXT_KEYS:
-            # Ticket-header tenants (C1): a printed-ticket line is 64 chars
-            # at most, and an EMPTY write means "unset" — DELETE the row so
-            # ticket_header() reads None and the hub never pushes a blank
-            # over a machine's existing on-glass text.
-            if len(value) > MAX_TICKET_FIELD_LEN:
+            # Ticket-header tenants (C1): each has the room the ticket and
+            # both protocols give it (TICKET_FIELD_MAX), and an EMPTY write
+            # means "unset" — DELETE the row so ticket_header() reads None
+            # and the hub never pushes a blank over a machine's existing
+            # on-glass text.
+            if len(value) > TICKET_FIELD_MAX[key]:
                 raise ValueError(
-                    f"{key} must be <= {MAX_TICKET_FIELD_LEN} characters")
+                    f"{key} must be <= {TICKET_FIELD_MAX[key]} characters")
             if not value:
                 with self.lock:
                     self._conn.execute(
@@ -2054,9 +2067,14 @@ class HubStore:
     # amount is authoritative. Amounts in MILLICENTS everywhere here.
 
     @staticmethod
-    def _tito_reject(reason):
+    def _tito_reject(reason, why="denied"):
+        """A refusal. `why` says which kind for whoever must put it into
+        a protocol's own code: "notFound" (a number this ledger does not
+        hold as a printed ticket), "inProcess", "redeemed", or "denied"
+        (everything else: voided, a state or an amount the ledger cannot
+        pay from, the ledger itself failing)."""
         return {"authorized": False, "amountMc": 0,
-                "reason": reason, "retry": False}
+                "reason": reason, "retry": False, "why": why}
 
     def _refuse_ephemeral(self, op):
         """An in-memory-degraded ledger must refuse EVERY money write, not
@@ -2412,7 +2430,8 @@ class HubStore:
             c.commit()               # persist a learned canonical either way
             if row is None:
                 return self._tito_reject(
-                    "unknown validation number (never issued here)")
+                    "unknown validation number (never issued here)",
+                    why="notFound")
             state = row["state"]
             pend = self._tito_pending(row)
             if state == "redeemPending":
@@ -2427,15 +2446,16 @@ class HubStore:
                                 row["extra_json"]) in RESTRICTED_PROMO_TYPES}
                 return self._tito_reject(
                     "redemption already in process at %s"
-                    % pend.get("machine"))
+                    % pend.get("machine"), why="inProcess")
             if state == "redeemed":
-                return self._tito_reject("ticket already redeemed")
+                return self._tito_reject("ticket already redeemed",
+                                         why="redeemed")
             if state == "void":
                 return self._tito_reject("ticket voided")
             if state == "minted":
                 return self._tito_reject(
                     "validation number minted but no ticket was ever "
-                    "printed against it")
+                    "printed against it", why="notFound")
             if state != "issued":
                 return self._tito_reject(f"unredeemable state {state!r}")
             amount = int(row["amount_mc"] or 0)
