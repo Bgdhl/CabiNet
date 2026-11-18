@@ -2436,6 +2436,15 @@ def admin_menu_logs():
         h7 = c.getresponse()
         h7 = h7.status, json.loads(h7.read().decode())
         c.close()
+        # a body nested deeper than the parser will follow
+        deep = b'{"sess": ' + b"[" * 100000 + b"]" * 100000 + b"}"
+        c = http.client.HTTPConnection("127.0.0.1", srv.server_address[1],
+                                       timeout=10)
+        c.request("POST", "/api/glass/admin", body=deep,
+                  headers={"Content-Type": "application/json"})
+        h9 = c.getresponse()
+        h9 = h9.status, json.loads(h9.read().decode())
+        c.close()
         real_action = eng.glass_admin_action
         eng.glass_admin_action = lambda req: (_ for _ in ()).throw(
             RuntimeError("could not read " + str(req)))
@@ -2463,6 +2472,9 @@ def admin_menu_logs():
           and h6[0] == 200 and h7 == (400, {"ok": False,
                                             "error": "invalid JSON"}),
           (h1, h2, h3, h4, h5, h6, h7))
+    check("a body nested too deep to read is answered as invalid JSON "
+          "(it used to end the request with no reply at all)",
+          h9 == (400, {"ok": False, "error": "invalid JSON"}), h9)
     check("a fault the engine did not catch still answers the screen in "
           "words, never a 500",
           h8 == (200, {"ok": False,
@@ -2485,7 +2497,7 @@ def admin_menu_logs():
     check("the wire log names the three kinds of PIN-carrying request "
           "and withholds their bodies",
           sum("/api/glass/admin" in ln and "body withheld" in ln
-              and "\n" not in ln for ln in wire) == 4
+              and "\n" not in ln for ln in wire) == 5   # h1 h5 h7 h9 h8
           and sum("/api/glass/pinlogin" in ln and "body withheld" in ln
                   and "\n" not in ln for ln in wire) == 1
           and sum("/api/players" in ln and "body withheld" in ln

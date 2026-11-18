@@ -125,7 +125,7 @@ if "tournament_names" not in _hub_store_mod.HOST_SETTING_KEYS:
 # the MINOR bump per the repo's version rule). Surfaced in engine_meta() ->
 # /api/status ["_engine"]["version"]; bump this and add a CHANGELOG.md
 # section on every commit with a user-visible change.
-CABINET_VERSION = "0.3.29"
+CABINET_VERSION = "0.3.30"
 
 WSDL_NS = "http://www.gamingstandards.com/wsdl/g2s/v1.0"
 SCHEMA_NS = "http://www.gamingstandards.com/g2s/schemas/v1.0.3"
@@ -28557,7 +28557,9 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
         it is never written to any log."""
         try:
             req = json.loads(raw) if raw.strip() else {}
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, RecursionError):
+            # RecursionError: a body nested thousands deep. It is not a
+            # ValueError, and uncaught it ended the request with no reply.
             req = None
         if not isinstance(req, dict):
             return self._send(400, '{"ok": false, "error": "invalid JSON"}',
