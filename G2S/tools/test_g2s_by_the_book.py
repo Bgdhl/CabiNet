@@ -3656,8 +3656,7 @@ def item_46_which_device():
     drain(host, a)
     mark = len(host.sent)
     host.enqueue_get_cabinet_status(a)
-    host.enqueue_set_cabinet_state(a, enable=False, disable_text="x",
-                                   remember=False)
+    host.enqueue_set_cabinet_state(a, enable=False, disable_text="x")
     host.enqueue_get_handpay_log(a)
     drain(host, a)
     check("cabinet commands go to the cabinet device the machine marks "
@@ -3716,8 +3715,7 @@ def item_48_a_text_no_longer_than_its_type():
     a = egm.assoc
     long_text = "L" * 300
     mark = len(host.sent)
-    host.enqueue_set_cabinet_state(a, enable=False, disable_text=long_text,
-                                   remember=False)
+    host.enqueue_set_cabinet_state(a, enable=False, disable_text=long_text)
     host.enqueue_set_game_play_state(a, enable=False, disable_text=long_text)
     host.enqueue_set_voucher_state(a, enable=False, disable_text=long_text)
     host.enqueue_set_note_acceptor_state(a, enable=False,
@@ -3747,7 +3745,7 @@ def item_44_cabinet_status_defaults():
           and a.cabinet.get("hardMetersDisconnected") == "false",
           {k: a.cabinet.get(k) for k in ("enableGamePlay", "enableMoneyIn")})
     host.enqueue_set_cabinet_state(a, enable=False, disable_text="x",
-                                   enable_game_play=False, remember=False)
+                                   enable_game_play=False)
     drain(host, a)
     answer_to(egm, "cabinet", "setCabinetState",
               cabinet_status(hostEnabled="false"))
@@ -3755,7 +3753,7 @@ def item_44_cabinet_status_defaults():
           a.cabinet_state_change.get("result") == "disagree",
           a.cabinet_state_change)
     host.enqueue_set_cabinet_state(a, enable=False, disable_text="x",
-                                   enable_game_play=False, remember=False)
+                                   enable_game_play=False)
     drain(host, a)
     answer_to(egm, "cabinet", "setCabinetState", cabinet_status(
         hostEnabled="false", enableGamePlay="false"))
@@ -3873,10 +3871,11 @@ def item_45_a_button_press_delivered_late():
           pressed(30) is True and pressed(120) is False)
 
 
-def item_15_a_lock_that_outlives_a_restart():
-    print("— audit item 15: at a restart \"the hostEnabled attribute of a "
-          "device MUST be set based on the restartStatus\" (§1.20.3), "
-          "whose default is true: a host disable does not survive one")
+def item_15_a_lock_and_a_machine_restart():
+    print("— audit item 15, decided: the document has a machine set "
+          "hostEnabled at restart from its restartStatus (§1.20.3); the "
+          "machines on the owner's floor keep a host lock until the host "
+          "lifts it. The hub sends no lock or unlock by itself")
     host = make_host()
     egm = online(joined(host, "BTB_lock"))
     a = egm.assoc
@@ -3885,37 +3884,14 @@ def item_15_a_lock_that_outlives_a_restart():
     drain(host, a)
     answer_to(egm, "cabinet", "setCabinetState",
               cabinet_status(hostEnabled="false"))
-    check("the hub notes, on disk, the state it asked for",
-          (a.cabinet_wanted or {}).get("enable") is False
-          and (host.config_store.get(egm.egm_id) or {}).get(
-              "cabinetWanted", {}).get("disableText")
-          == "Floor locked by the hub", a.cabinet_wanted)
     egm.comms_online(reset=True)                    # the machine restarts
     online(egm)
     got = status_read(host, egm, hostEnabled="true")
-    locks = asks(got, "setCabinetState")
-    check("the machine comes back enabled: the lock is sent again, with "
-          "its text (nothing re-sent it: a locked floor came back "
-          "playable after a power cycle)", len(locks) == 1
-          and locks[0].get("enable") == "false"
-          and locks[0].get("disableText") == "Floor locked by the hub",
-          locks)
-    answer_to(egm, "cabinet", "setCabinetState",
-              cabinet_status(hostEnabled="false"))
-    got = status_read(host, egm, hostEnabled="true")
-    check("once per sign-on: enabled again later the same sign-on (by "
-          "something else), it is not locked a second time",
-          asks(got, "setCabinetState") == [])
-    egm.comms_online(reset=True)
-    online(egm)
+    check("a machine locked from the hub that comes back enabled is left "
+          "as it comes back", asks(got, "setCabinetState") == [], got)
     got = status_read(host, egm, hostEnabled="false")
-    check("a machine that comes back still locked is left as it is",
-          asks(got, "setCabinetState") == [])
-
-    print("— the other way round, and the cases the hub leaves alone")
-    host = make_host()
-    egm = online(joined(host, "BTB_unlock"))
-    a = egm.assoc
+    check("and one that comes back still locked is left locked",
+          asks(got, "setCabinetState") == [], got)
     host.enqueue_set_cabinet_state(a, enable=True)
     drain(host, a)
     answer_to(egm, "cabinet", "setCabinetState",
@@ -3923,58 +3899,12 @@ def item_15_a_lock_that_outlives_a_restart():
     egm.comms_online(reset=True)
     online(egm)
     got = status_read(host, egm, hostEnabled="false")
-    enables = asks(got, "setCabinetState")
-    check("a machine last asked to be enabled that comes back disabled "
-          "(restartStatus false) is enabled again (it stayed disabled "
-          "until someone pressed unlock)", len(enables) == 1
-          and enables[0].get("enable") == "true", enables)
-    host = make_host()
-    egm = online(joined(host, "BTB_never_told"))
-    got = status_read(host, egm, hostEnabled="false")
-    check("a machine the hub never told anything is left as it comes "
-          "back", asks(got, "setCabinetState") == []
-          and egm.assoc.cabinet_wanted is None)
-
-    def locked_then_back(name, prepare):
-        host = make_host()
-        egm = online(joined(host, name))
-        host.enqueue_set_cabinet_state(egm.assoc, enable=False,
-                                       disable_text="locked")
-        drain(host, egm.assoc)
-        answer_to(egm, "cabinet", "setCabinetState",
-                  cabinet_status(hostEnabled="false"))
-        egm.comms_online(reset=True)
-        online(egm)
-        prepare(host, egm)
-        return asks(status_read(host, egm, hostEnabled="true"),
-                    "setCabinetState")
-    check("a machine with a SAS link is not touched: it is locked over "
-          "SAS", locked_then_back(
-              "BTB_lock_linked",
-              lambda h, e: h.sas_links.__setitem__(e.egm_id, "smib-x/1"))
-          == [])
-    check("nor is any machine while a tournament has the floor",
-          locked_then_back(
-              "BTB_lock_tournament",
-              lambda h, e: h.tournament.__setitem__("phase", "armed"))
-          == [])
-    host = make_host()
-    egm = online(joined(host, "BTB_lock_tour_own"))
-    a = egm.assoc
-    host.enqueue_set_cabinet_state(a, enable=False, disable_text="take "
-                                   "your seats", remember=False)
-    drain(host, a)
-    check("a tournament's own lock is not noted as the state the machine "
-          "is wanted in", a.cabinet_wanted is None)
-    host = make_host()
-    host.config_store.save_cabinet_wanted("BTB_lock_restart", {
-        "enable": False, "disableText": "kept", "enableGamePlay": True,
-        "enableMoneyIn": True, "enableMoneyOut": True, "at": "x"})
-    egm = online(joined(host, "BTB_lock_restart"))
-    locks = asks(status_read(host, egm, hostEnabled="true"),
-                 "setCabinetState")
-    check("a hub that has itself restarted since still knows",
-          len(locks) == 1 and locks[0].get("disableText") == "kept", locks)
+    check("a machine last enabled from the hub that comes back disabled "
+          "is not enabled by the hub", asks(got, "setCabinetState") == [],
+          got)
+    check("nothing about a lock is kept in the machine's stored facts",
+          "cabinetWanted" not in (host.config_store.get(egm.egm_id) or {})
+          and "cabinetWanted" not in a.snapshot())
 
 
 def supported(*pairs):
@@ -4209,7 +4139,7 @@ def main():
     item_47_a_door_opened_with_the_power_off()
     item_50_an_event_the_machine_is_still_sending()
     item_45_a_button_press_delivered_late()
-    item_15_a_lock_that_outlives_a_restart()
+    item_15_a_lock_and_a_machine_restart()
     items_17_and_49_event_subscriptions()
     items_43_and_53_restarting_a_machine()
     print("=" * 50)

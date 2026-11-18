@@ -2036,23 +2036,19 @@ class EgmAssociation:
         # sessionId gives EXACT response/error attribution (unlike the
         # best-effort clock_sync window). Accumulated knowledge — NOT cleared
         # in new_epoch; snapshot() derives a lazy 30s timeout.
+        # A LOCK AND A MACHINE RESTART (audit item 15, decided 2026-11-17:
+        # nothing is sent at a join). The document has a machine set
+        # hostEnabled at restart from the device's restartStatus (§1.20.3,
+        # default true; both floor machines report true for the cabinet),
+        # which read to the letter brings a locked machine back enabled.
+        # The owner's experience is the other way: "an egm locked by host
+        # wont unlock until its unlocked by host", and the Bluebird's G2S
+        # lock of 2026-07-21 stayed until it was lifted. The hub's log
+        # holds no join from a machine last known locked, so neither has
+        # been recorded. Until a machine is seen to come back in another
+        # state than it was left in, the hub does not send a lock or an
+        # unlock by itself.
         self.cabinet_state_change = {}
-        # The cabinet state the operator last asked this machine to be in
-        # (the tile's Disable/Enable, the floor lock, the command API):
-        # {enable, disableText, enableGamePlay, enableMoneyIn,
-        # enableMoneyOut, at}, or None for a machine never told. Kept on
-        # disk with the machine's other facts, and sent again when the
-        # machine comes back saying otherwise. A host disable does NOT
-        # survive a machine restart by itself: "upon restart, the
-        # hostEnabled attribute of a device MUST be set based on the
-        # restartStatus for the device" (§1.20.3), and restartStatus
-        # defaults to true, so a locked machine that follows the document
-        # comes back enabled; one set to restartStatus=false comes back
-        # disabled whatever it was told. The comments here said for years
-        # that a disable "persists across an EGM restart", and nothing
-        # re-sent it.
-        self.cabinet_wanted = None
-        self.cabinet_reassert_epoch = -1
         # voucher tier-1 (G2S-26): the validation list we most recently sent
         # this EGM (id/size/timestamp) + a bounded ring of issued/committed
         # voucher records. Backed by the engine's durable VoucherStore.
@@ -2605,10 +2601,6 @@ class EgmAssociation:
             # and since when it has said the log is full (None = it is not)
             "eventHandler": dict(self.event_handler),
             "eventQueueFullAt": self.event_queue_full_at,
-            # the cabinet state this machine was last asked to be in (None
-            # = never told); sent again if it rejoins in another one
-            "cabinetWanted": dict(self.cabinet_wanted)
-            if self.cabinet_wanted else None,
             "supportedEventCount": len(self.supported_events),
             "eventCount": self.event_count,
             "recentEvents": recent_events,
@@ -3769,20 +3761,6 @@ class ConfigInventoryStore:
             rec["configDevices"] = config_devices
             rec["configOptions"] = config_options
             rec["at"] = now_iso()
-            self._write_locked(data)
-
-    def save_cabinet_wanted(self, egm_id, wanted):
-        """Read-modify-write the cabinet state the operator last asked this
-        machine to be in (EgmAssociation.cabinet_wanted); None removes it."""
-        with self.lock:
-            data = self._read_locked()
-            rec = data["egms"].setdefault(egm_id, {})
-            if wanted:
-                rec["cabinetWanted"] = wanted
-            elif "cabinetWanted" in rec:
-                del rec["cabinetWanted"]
-            else:
-                return
             self._write_locked(data)
 
     def save_game_play(self, egm_id, game_play, as_of=None):
@@ -5206,8 +5184,6 @@ class G2SHost:
                 # EGM while the host was down would otherwise be presented
                 # indefinitely as current.
                 saved = self.config_store.get(egm_id)
-                if saved and isinstance(saved.get("cabinetWanted"), dict):
-                    a.cabinet_wanted = dict(saved["cabinetWanted"])
                 if saved and (saved.get("configDevices")
                               or saved.get("configOptions")):
                     a.config_devices = dict(saved.get("configDevices") or {})
@@ -11035,8 +11011,7 @@ class G2SHost:
                 seat["locked"] = False
             else:
                 self.enqueue_set_cabinet_state(assoc, enable=enable,
-                                               disable_text=text,
-                                               remember=False)
+                                               disable_text=text)
                 seat["locked"] = not enable
                 # the epoch this send was queued under: the FIFO worker
                 # silently drops jobs whose epoch a rejoin superseded, so
@@ -11515,8 +11490,7 @@ class G2SHost:
         2026-07-21: "lock/unlock all machines… the tournament already
         does it"). EXACTLY the tournament's per-seat lock rules, minus
         the tournament: pure-G2S cabinets over setCabinetState (full-flag
-        builder; the state is remembered and sent again if a machine comes
-        back from a restart in another one), LINKED cabinets
+        builder), LINKED cabinets
         over their SAS leg ONLY (one lock one owner — never a G2S
         setCabinetState that would strand a second host-disable latch,
         [[the ⭐ note in _tournament_lock_seat]]), unlinked live SAS
@@ -14184,23 +14158,18 @@ class G2SHost:
 
     def enqueue_set_cabinet_state(self, assoc, enable=True, disable_text="",
                                   enable_game_play=True, enable_money_in=True,
-                                  enable_money_out=True, remember=True):
+                                  enable_money_out=True):
         """cabinet.setCabinetState (spec §3.7, Table 3.2) — enable/disable the
-        WHOLE machine. Owner-only. Sent when someone asks (the tile, the
-        floor lock, a tournament, the command API), and once more at a join
-        when the machine comes back in another state than it was last asked
-        to be in (_reassert_cabinet_state). Every
+        WHOLE machine. Owner-only. Sent only when someone asks (the tile,
+        the floor lock, a tournament, the command API). Every
         attribute defaults TRUE, so a partial send implicitly resets omitted
         flags — we therefore always send the FULL intended state: enable plus
         explicit enableGamePlay/enableMoneyIn/enableMoneyOut="true" (this
         surface never granularly disables), disableText only on a disable.
         THE RESTORE PATH IS SACRED: enable=true with all flags true is the
         clean full restore (§3.7 p.101 — a disable lasts until exactly
-        that; across a machine restart it lasts only if the machine's
-        restartStatus says so, see EgmAssociation.cabinet_wanted).
-        `remember` records the state as the one this machine is wanted in;
-        a tournament's lock and unlock are its own business and are not
-        recorded, and neither is the re-assert itself.
+        that; for a machine restart see the note at
+        EgmAssociation.cabinet_state_change).
         The application response is cabinetStatus (§3.9) echoing hostEnabled;
         the dispatch handler confirms via the sessionId recorded here (result:
         sent -> acked -> confirmed / disagree / error:*). A getCabinetStatus
@@ -14209,20 +14178,6 @@ class G2SHost:
         g2sAcks then stays silent — record parks at sent/acked, snapshot()
         derives a lazy 30s timeout, no retry storms. Events on the EGM:
         G2S_CBE003/CBE004 (+ CBE204/CBE205 when play is affected)."""
-        if remember:
-            wanted = {"enable": bool(enable),
-                      "disableText": text_message(disable_text)
-                      if not enable else "",
-                      "enableGamePlay": bool(enable_game_play),
-                      "enableMoneyIn": bool(enable_money_in),
-                      "enableMoneyOut": bool(enable_money_out),
-                      "at": now_iso()}
-            with assoc.lock:
-                assoc.cabinet_wanted = wanted
-            store = getattr(self, "config_store", None)
-            if store is not None:
-                store.save_cabinet_wanted(assoc.egm_id, wanted)
-
         def build(a):
             sid = a.next_session_id()
             on = str(bool(enable)).lower()
@@ -15287,10 +15242,9 @@ class G2SHost:
         disable). Owner-only; always point-to-point here so the EGM MUST
         answer noteAcceptorStatus (§13.8 — a multicast delivery would draw
         no response) and fires NAE003/NAE004. This is a DELIBERATE bench/
-        test-panel action: it changes machine behavior; after a machine
-        restart the device is on or off as the machine's own restartStatus
-        says, not as it was last told (§1.20.3; Table 13.4: default true,
-        so a disable is undone by a restart), and with
+        test-panel action: it changes machine behavior (what a machine
+        restart does to it has not been tried here: the document says the
+        device's restartStatus decides, §1.20.3, Table 13.4), and with
         requiredForPlay=true a disable takes the
         WHOLE EGM down via evaluate(cabinet.egmState) (§13.19.1).
         Pre-ownership the AVP just g2sAcks then stays silent — no pending
@@ -15533,52 +15487,6 @@ class G2SHost:
                  "denominations again", assoc.egm_id, dev, why)
         self.enqueue_get_game_play_profile(assoc, dev)
         self.enqueue_get_game_denoms(assoc, dev)
-        return True
-
-    def _reassert_cabinet_state(self, assoc, data):
-        """A cabinetStatus that is not the answer to a command of ours, the
-        first of this join: if the machine is not in the state it was last
-        asked to be in (cabinet_wanted), ask again. Once per join. A
-        machine that was never told anything is left as it is, a machine
-        with a SAS link is locked over SAS and is not touched here, and
-        while a tournament has the floor its own locks stand. Returns True
-        if a setCabinetState was sent."""
-        with assoc.lock:
-            first = assoc.cabinet_reassert_epoch != assoc.epoch
-            assoc.cabinet_reassert_epoch = assoc.epoch
-            wanted = dict(assoc.cabinet_wanted) if assoc.cabinet_wanted \
-                else None
-            csc = assoc.cabinet_state_change
-            busy = csc.get("result") in ("sent", "acked") and \
-                time.time() - (csc.get("sentTs") or 0) < 30
-            restart = (assoc.cabinet.get("profile") or {}).get(
-                "restartStatus")
-        if not first or not wanted or busy:
-            return False
-        if self.sas_links.get(assoc.egm_id):
-            return False
-        with self.tournament_lock:
-            if self.tournament.get("phase") != "idle":
-                return False
-        want = "true" if wanted.get("enable") else "false"
-        if data.get("hostEnabled") == want:
-            return False
-        log.warning("🖥️ [%s] the machine came back %s; it was last asked to "
-                    "be %s (%s) — asking again (a restart sets hostEnabled "
-                    "from the machine's restartStatus%s, §1.20.3)",
-                    assoc.egm_id,
-                    "enabled" if data.get("hostEnabled") == "true"
-                    else "disabled",
-                    "enabled" if wanted.get("enable") else "disabled",
-                    wanted.get("at"),
-                    f", which is {restart} here" if restart else "")
-        self.enqueue_set_cabinet_state(
-            assoc, enable=bool(wanted.get("enable")),
-            disable_text=wanted.get("disableText") or "",
-            enable_game_play=bool(wanted.get("enableGamePlay", True)),
-            enable_money_in=bool(wanted.get("enableMoneyIn", True)),
-            enable_money_out=bool(wanted.get("enableMoneyOut", True)),
-            remember=False)
         return True
 
     def _fold_cabinet_status(self, assoc, el, source):
@@ -21804,11 +21712,6 @@ class G2SHost:
                             data.get("enableGamePlay"),
                             data.get("enableMoneyIn"),
                             data.get("enableMoneyOut"))
-            if verdict is None:
-                # not the answer to a command of ours: at a join, this is
-                # where a machine that restarted shows the state it came
-                # back in
-                self._reassert_cabinet_state(assoc, data)
             log.info("=" * 64)
             log.info("🖥️  [%s] CABINET STATUS egmState=%s", assoc.egm_id,
                      data.get("egmState"))
@@ -25713,9 +25616,8 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
             "setDateTime": engine.enqueue_set_date_time,
             # cabinet control (G2S-20 rest): {"enable": false, "disableText":
             # "..."} disables the WHOLE machine (in-flight game completes,
-            # then money+play stop; a machine restart sets it back to what
-            # the machine's restartStatus says, and the hub then sends the
-            # remembered state again); enable omitted/true is the sacred
+            # then money+play stop; it stays until the host enables it
+            # again); enable omitted/true is the sacred
             # full restore (all Table 3.2 flags explicit true). Deliberate
             # bench action; a getCabinetStatus refresh rides behind the set.
             "setCabinetState": engine.enqueue_set_cabinet_state,
@@ -25788,9 +25690,7 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
             # noteAcceptor acceptance toggle (G2S-23): {"enable": false,
             # "disableText": "..."} disables bill acceptance, enable omitted/
             # true re-enables. Deliberate bench action — changes machine
-            # behavior (until the machine restarts: it then follows its own
-            # restartStatus, default enabled); the EGM answers
-            # noteAcceptorStatus + NAE003/004.
+            # behavior; the EGM answers noteAcceptorStatus + NAE003/004.
             "setNoteAcceptorState": engine.enqueue_set_note_acceptor_state,
             # meters read (G2S-15)
             "getMeterInfo": engine.enqueue_get_meter_info,

@@ -428,7 +428,7 @@ const GROUPS = [
     ["setWatCashOut","Cash-out → WAT off","watCoOff",1],
   ]},
   {name:"Note acceptor", danger:true,
-   note:"changes machine behavior — toggles bill acceptance (a machine restart puts it back to the machine's own setting)",
+   note:"changes machine behavior — toggles bill acceptance (persists across EGM restart)",
    cmds:[
     // setNoteAcceptorState (G2S-23): owner-only, point-to-point so the
     // noteAcceptorStatus response confirms. Two-step confirm like the
@@ -448,7 +448,7 @@ const GROUPS = [
     ["setGamePlayState","Enable game","gpOn",1],
   ]},
   {name:"Cabinet control", danger:true,
-   note:"disables the WHOLE machine — the hub sends it again if the machine restarts",
+   note:"disables the WHOLE machine — persists across EGM restart",
    cmds:[
     // setCabinetState (rest of G2S-20): DISABLE gets the two-step confirm;
     // the ENABLE restore path (4th tuple slot truthy = safe) fires

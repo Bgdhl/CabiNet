@@ -1,16 +1,10 @@
 # Changelog
 
 ## v0.3.24
-Sixth batch from the G2S audit: the cabinet and events. Eleven items.
-- **A locked machine stays locked through a restart.** A machine sets
-  itself enabled or disabled at restart from its own setting, so a
-  machine the hub had locked could come back playable, and one the hub
-  had enabled could come back locked. The hub now remembers, on disk,
-  the state it last asked each machine to be in and asks again at the
-  next sign-on if the machine comes back otherwise. A machine the hub
-  never told anything is left alone, as is a machine with a SAS link
-  (its lock goes over SAS) and any machine while a tournament has the
-  floor.
+Sixth batch from the G2S audit: the cabinet and events. Eleven items,
+one of them (a lock and a machine restart) settled with no change: a
+machine locked from the hub stays locked until the hub unlocks it, and
+the hub sends no lock or unlock by itself.
 - **The hub is not left with no event subscription.** At each sign-on
   it clears its subscriptions and sets the list it wants. If the
   machine refused that list, or never acknowledged it, the hub held
