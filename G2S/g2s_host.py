@@ -125,7 +125,7 @@ if "tournament_names" not in _hub_store_mod.HOST_SETTING_KEYS:
 # the MINOR bump per the repo's version rule). Surfaced in engine_meta() ->
 # /api/status ["_engine"]["version"]; bump this and add a CHANGELOG.md
 # section on every commit with a user-visible change.
-CABINET_VERSION = "0.3.27"
+CABINET_VERSION = "0.3.28"
 
 WSDL_NS = "http://www.gamingstandards.com/wsdl/g2s/v1.0"
 SCHEMA_NS = "http://www.gamingstandards.com/g2s/schemas/v1.0.3"
@@ -6813,10 +6813,22 @@ class G2SHost:
         # pending handpay.
         ph = payload.get("pendingHandpay")
         if isinstance(ph, dict):
-            entry["pendingHandpay"] = {"since": _s(ph.get("since"), 32),
-                                       "code": _s(ph.get("code"), 8)}
+            entry["pendingHandpay"] = dict(
+                {"since": _s(ph.get("since"), 32),
+                 "code": _s(ph.get("code"), 8)},
+                **self.sas_handpay_record(ph))
         else:
             entry["pendingHandpay"] = None
+        # lastHandpay (v0.3.28): the handpay that ended last and how; the
+        # key is absent from a satellite older than that. It is what a
+        # win paid by hand is booked from (_sas_handpay_ended).
+        lh = payload.get("lastHandpay")
+        entry["handpayRecords"] = "lastHandpay" in payload
+        entry["lastHandpay"] = (dict(
+            {"since": _s(lh.get("since"), 32),
+             "clearedAt": _s(lh.get("clearedAt"), 32),
+             "how": _s(lh.get("how"), 16), "by": _s(lh.get("by"), 60)},
+            **self.sas_handpay_record(lh)) if isinstance(lh, dict) else None)
         # ticketData (C2/C4): the satellite's ticket-header applied-state —
         # {"appliedRev": int|null, "detail": str}. Rides the entry into
         # /api/status so the UI can flag "ticket header pending" when
@@ -6903,6 +6915,9 @@ class G2SHost:
         # AJ's penny BB2 is correctly valued at 1¢ either way; setting its denom
         # in Options clears the flag.
         entry["denomAssumed"] = self._sas_denom_cents(entry)[1]
+        for hp in (entry.get("pendingHandpay"), entry.get("lastHandpay")):
+            if hp and hp.get("amount") is not None:
+                hp["amountMc"] = self.sas_handpay_mc(hp, entry)
         # denomSuggest: the satellite's 0x1F denom code held up against the
         # operator-set denomCents — {code, cents, state, since} (see
         # _sas_denom_suggest for the states). Computed fresh per report so it
@@ -7051,6 +7066,8 @@ class G2SHost:
         # sas_lock (account_store has its own lock; idempotent on txnId).
         # Uses the RAW commandResults, not the stringified entry copy.
         self._settle_aft_credit_pushes(cr, key)
+        # A SAS handpay that ended paid by hand is booked here (v0.3.28).
+        self._sas_handpay_ended(key, entry)
         # Credit-on-confirm for any button-driven AFT host-cashout (EGM_TO_HOST)
         # this report confirmed — the machine->wallet RETURN leg, crediting the
         # echoed destination wallet (NO House fallback — an uncreditable home
@@ -7571,6 +7588,49 @@ class G2SHost:
         except Exception:  # noqa: BLE001 — best-effort, never fatal
             log.exception("boot cash-out disarm (%s) failed (ignored)", key)
 
+    #: how long a failed cash-out to wallet stays on the player's screen
+    CASH_OUT_ERROR_SEC = 30
+
+    def _cash_out_pull_failed(self, key, r):
+        """A cash-out to wallet the player asked for from the screen and
+        the machine did not make. The answer to the tap was "pending", so
+        without this the screen went back to the menu and said nothing.
+        Kept for CASH_OUT_ERROR_SEC against the machine (and the G2S
+        machine linked to it) and handed to its screen in the cash-out
+        data. Each result is taken once: the satellite repeats its last
+        results in every report."""
+        cid = str(r.get("id") or "")
+        if not cid.startswith("copull"):
+            return                      # not a pull asked from a screen
+        seen = getattr(self, "_cash_out_pulls_seen", None)
+        if seen is None:
+            seen = self._cash_out_pulls_seen = set()
+            self._cash_out_errors = {}
+        if cid in seen:
+            return
+        seen.add(cid)
+        if len(seen) > 512:
+            seen.clear()
+            seen.add(cid)
+        outcome = str(r.get("outcome") or "")
+        msg = {
+            "no_credits": "This machine has no cashable credits to send "
+                          "to your wallet.",
+            "not_registered": "This machine is not set up for transfers "
+                              "yet. Its CASH OUT button still works.",
+            "asset_unknown": "This machine is not set up for transfers "
+                             "yet. Its CASH OUT button still works.",
+        }.get(outcome, "The machine did not send its credits to your "
+                       "wallet just now. Try again, or use its CASH OUT "
+                       "button.")
+        log.warning("🏦 [sas:%s] cash-out to wallet %s did not happen: %s "
+                    "(%s)", key, cid, outcome or "failed",
+                    str(r.get("detail") or "")[:160])
+        note = {"ts": time.time(), "msg": msg}
+        for owner in [m for m, sk in self.sas_links.items()
+                      if sk == key] + [key]:
+            self._cash_out_errors[owner] = note
+
     def _settle_aft_cashouts(self, command_results, key):
         """Credit-on-confirm the hub-pinned wallet for a button-driven SAS
         AFT host-cashout (EGM_TO_HOST) — the machine->wallet RETURN leg, the
@@ -7617,6 +7677,8 @@ class G2SHost:
                 continue
             if not r.get("ok") or r.get("outcome") not in ("completed",
                                                            "partial"):
+                if not r.get("ok"):
+                    self._cash_out_pull_failed(key, r)
                 continue
             txn = r.get("txnId")
             cents = r.get("amountCents")
@@ -8813,6 +8875,8 @@ class G2SHost:
         tabs)."""
         why = self.LINKED_REFUSED.get(action)
         if why:
+            log.info("🔗 [%s] %s refused: this machine has a SAS link (%s)",
+                     egm_id, action, why)
             return 409, {"ok": False, "via": "sas", "egmId": egm_id,
                          "error": "this machine has a SAS link: " + why}
         if action not in ("resetHandpay", "clearHandpay", "setCabinetState",
@@ -8868,14 +8932,11 @@ class G2SHost:
         # bonusAward: a SAS bonus is a number of credits
         try:
             amount_mc = int(req.get("amountMillicents") or 0)
-            denom_c = int(entry.get("denomCents") or 0)
         except (TypeError, ValueError):
-            amount_mc, denom_c = 0, 0
-        if denom_c <= 0:
-            return 409, {"ok": False, "via": "sas", "egmId": egm_id,
-                         "error": "this machine has a SAS link and its SAS "
-                                  "side has not reported its denomination "
-                                  "yet, so a bonus cannot be sized"}
+            amount_mc = 0
+        # valued as its credit meter is: the denomination set for the
+        # machine in the hub, a cent while none is (_sas_denom_cents)
+        denom_c = self._sas_denom_cents(entry)[0]
         credits, rest = divmod(amount_mc, denom_c * 1000)
         if amount_mc <= 0 or rest or not \
                 1 <= credits <= self.SAS_BONUS_MAX_CREDITS:
@@ -10156,6 +10217,114 @@ class G2SHost:
         return 400, {"ok": False, "error": "unknown view", "egmId": egm_id}
 
     @staticmethod
+    def sas_handpay_record(rec):
+        """The machine's handpay record as the satellite reports it
+        (SAS 6.02 Table 7.8), taken off the wire into a small fixed shape;
+        {} when the satellite sent none (an older one, or a record it
+        could not read)."""
+        amount = rec.get("amount")
+        if isinstance(amount, bool) or not isinstance(amount, int) \
+                or not 0 <= amount <= 9_999_999_999:
+            return {}
+        level = rec.get("level")
+        return {"amount": amount,
+                "inCents": rec.get("inCents") is True,
+                "kind": str(rec.get("kind") or "win")[:20],
+                "level": level if isinstance(level, int)
+                and not isinstance(level, bool) else None,
+                "resetId": 1 if rec.get("resetId") == 1 else 0}
+
+    def sas_handpay_mc(self, rec, entry):
+        """A SAS handpay amount in millicents. A record with a
+        progressive part is in cents; any other is in the machine's
+        accounting denomination units, valued as the credit meter is
+        (_sas_denom_cents: the denomination set for the machine in the
+        hub, a cent while none is)."""
+        amount = int(rec.get("amount") or 0)
+        if rec.get("inCents"):
+            return amount * 1000
+        return amount * self._sas_denom_cents(entry)[0] * 1000
+
+    def _sas_handpay_ended(self, key, entry):
+        """Book a SAS handpay that ended PAID BY HAND: the win goes to
+        the wallet of whoever is carded in at the machine, the House when
+        nobody is. The same rule as a G2S machine's hand-paid key-off
+        (the keyedOff handler): the hub is the attendant, and money paid
+        by hand must land somewhere it can be seen. One that went to the
+        credit meter, was cancelled, or was never there books nothing.
+
+        TO LOOK AT AGAIN (the owner, 2026-11-18, on being told that the
+        handpay key at the machine ends up in the player's wallet: "okay
+        thats fine. i may revisit that in the future. leave a note for me
+        to look at it again"). The machines have two keys: one puts the
+        win on the credit meter, the other "usually clears it off to
+        nothing". The question to revisit is whether the second should
+        book to a wallet at all, go to the House always, or book nothing.
+        The G2S twin of this rule is in the keyedOff handler.
+
+        Until v0.3.28 the satellite said only that a handpay was pending:
+        a machine with no G2S side showed no amount and booked nothing.
+        Booked once: the key is the machine, the moment the lockup began
+        and the amount, which a satellite or hub restart does not
+        change."""
+        rec = entry.get("lastHandpay")
+        if not rec or rec.get("how") not in ("hand", "unknown"):
+            return
+        mc = int(rec.get("amountMc") or 0)
+        if mc <= 0 or not rec.get("since"):
+            return
+        ref = f"hp:sas:{key}:{rec['since']}:{rec.get('amount')}"
+        if rec["how"] == "unknown":
+            # Keyed off at the machine, and neither its jackpot meter nor
+            # its credit meter moved by the win: the satellite cannot say
+            # which key it was. Booking it could put a win in a wallet
+            # that is also on the machine, so it is not booked. Said once.
+            said = getattr(self, "_sas_handpays_unknown", None)
+            if said is None:
+                said = self._sas_handpays_unknown = set()
+            if ref not in said:
+                said.add(ref)
+                log.warning("💰 [sas:%s] a %s handpay was keyed off at the "
+                            "machine and its meters do not say whether it "
+                            "went to the credit meter or was paid by hand "
+                            "— NOT booked. If it was paid by hand, add it "
+                            "to the wallet by hand.", key, denom_dollars(mc))
+            return
+        sess = {}
+        with self.companion_lock:
+            for owner in [m for m, sk in self.sas_links.items()
+                          if sk == key] + [key]:
+                sess = self.card_sessions.get(owner) or {}
+                if sess:
+                    break
+        dest = sess.get("accountId") or "house"
+        who = sess.get("name") or "the House"
+        acct, err = self.account_store.adjust(
+            dest, mc, 0, 0, note=f"handpay paid by hand (SAS {key})",
+            ref=ref, once=True)
+        if err:
+            _, err2 = self.account_store.adjust(
+                "house", mc, 0, 0,
+                note=(f"handpay paid by hand (SAS {key}) — {dest!r} "
+                      f"refused ({err}), folded to House"),
+                ref=ref, once=True)
+            log.warning("💰 [sas:%s] handpay payout: %r refused (%s) — %s "
+                        "to the HOUSE instead%s", key, dest, err,
+                        denom_dollars(mc),
+                        f" (AND THAT FAILED: {err2})" if err2 else "")
+            return
+        booked = getattr(self, "_sas_handpays_booked", None)
+        if booked is None:
+            booked = self._sas_handpays_booked = set()
+        if ref not in booked:               # said once, not at every report
+            booked.add(ref)
+            log.info("=" * 64)
+            log.info("💰 [sas:%s] HANDPAY PAID BY HAND — %s → %s's wallet "
+                     "(%s, ref %s)", key, denom_dollars(mc), who,
+                     rec.get("kind"), ref)
+            log.info("=" * 64)
+
+    @staticmethod
     def _sas_denom_cents(entry):
         """The money-scale for a linked SAS leg: CENTS per RAW 0x1A credit
         unit, plus whether that scale is an ASSUMPTION rather than a known
@@ -10375,6 +10544,10 @@ class G2SHost:
         # it, and a cash-out with no wallet behind it is refused and
         # prints a ticket. The hub's note alone is not enough either: a
         # machine that did not take the arm prints a ticket too.
+        # a cash-out to wallet that was asked for here and did not happen
+        note = (getattr(self, "_cash_out_errors", None) or {}).get(egm_id)
+        if note and time.time() - note["ts"] <= self.CASH_OUT_ERROR_SEC:
+            out["cashOutError"] = note["msg"]
         try:
             if (getattr(self, "sas_links", None) or {}).get(egm_id):
                 who = self._cash_out_armed().get(egm_id)
@@ -10433,10 +10606,58 @@ class G2SHost:
         return {"ok": True, "view": "tickets", "egmId": egm_id,
                 "tickets": tickets[:12]}
 
+    #: what a SAS handpay record's kind reads as in the admin view
+    SAS_HANDPAY_KIND = {"win": "Game win", "topWin": "Top win",
+                        "progressive": "Progressive win",
+                        "cancelledCredits": "Cancelled credits"}
+
     def _glass_data_handpay(self, egm_id, assoc):
         """handpay view: the machine's pending lockups + whether the reset
-        path is available (a pending one, machine onLine). Read from
-        assoc.handpays_pending (the same source the Home tile uses)."""
+        path is available.
+
+        A machine with a SAS side (a SAS link, or a SAS machine with no
+        G2S at all) is listed from its SAS handpay: the amount the machine
+        itself gave in its handpay record, and CLEAR goes over SAS. Until
+        v0.3.28 this view read the G2S record only (the owner, 2026-11-18,
+        at the Bluebird: "the admin menu on the smib might be using g2s
+        because it listed the g2s jackpot info"), so a SAS-only machine's
+        admin view listed nothing. A satellite older than that reports no
+        amount: the G2S record's is shown, when there is one.
+
+        Any other machine is read from assoc.handpays_pending (the same
+        source the Home tile uses)."""
+        leg = self.linked_leg(egm_id)
+        if not leg:
+            with self.sas_lock:
+                leg = egm_id if egm_id in self.sas_machines else None
+        if leg:
+            with self.sas_lock:
+                entry = dict(self.sas_machines.get(leg) or {})
+            hp = entry.get("pendingHandpay")
+            live = entry.get("online") is not False and time.time() \
+                - (entry.get("receivedAt") or 0) <= self.SAS_STALE_SEC
+            pending = []
+            if hp:
+                amount = None
+                if hp.get("amountMc"):
+                    amount = int(hp["amountMc"])
+                elif assoc is not None:         # an older satellite
+                    with assoc.lock:
+                        recs = list(assoc.handpays_pending.values())
+                    if recs:
+                        r = recs[-1]
+                        amount = (int(r.get("pendingCashableAmt") or 0)
+                                  + int(r.get("pendingPromoAmt") or 0)
+                                  + int(r.get("pendingNonCashAmt") or 0))
+                pending.append({
+                    "amount": (f"{money_symbol()}{amount / 100000:,.2f}"
+                               if amount else "Handpay"),
+                    "type": self.SAS_HANDPAY_KIND.get(hp.get("kind"),
+                                                      "Handpay"),
+                    "when": hp.get("since")})
+            return {"ok": True, "view": "handpay", "egmId": egm_id,
+                    "via": "sas", "pending": pending,
+                    "canClear": bool(pending) and live}
         pending, can_clear = [], False
         if assoc is not None:
             try:
@@ -10852,14 +11073,24 @@ class G2SHost:
                                   "on this machine — use the cash-out button"}
         with self.sas_lock:
             entry = self.sas_machines.get(leg) or {}
-        if not self.sas_from_egm_ready(entry):
-            # The machine's last status did not say a transfer from it is
-            # possible. (This used to advise turning on "soft cash-out to
-            # host", which a pull does not need and which makes every
-            # CASH OUT press ask the host first.)
+        # Refused only when the SAS side is not reporting: a pull sent
+        # blind would sit in a queue nobody is reading. NOT refused on the
+        # machine's cached "transfer from the machine OK" bit, as it was
+        # until v0.3.28: that bit is a snapshot from the satellite's last
+        # status read, up to 30 s old, and one taken at a bad moment said
+        # "can't send its credits to the wallet right now" about a machine
+        # that could (the owner at the Bluebird, 2026-11-18: "all it said
+        # was that it wasnt available but the cashout button always
+        # works!!"). The tournament pull dropped the same check on
+        # 2026-07-21 for the same reason. The satellite reads the
+        # machine's status LIVE when it makes the pull and says why if it
+        # cannot; that answer is shown to the player (cashOutError).
+        if not entry or entry.get("online") is False \
+                or time.time() - (entry.get("receivedAt") or 0) \
+                > self.SAS_STALE_SEC:
             return 400, {"ok": False, "egmId": egm_id, "path": "sas",
-                         "error": "This machine can't send its credits to "
-                                  "the wallet right now. Its CASH OUT button "
+                         "error": "This machine is not reporting to the "
+                                  "hub right now. Its CASH OUT button "
                                   "still works."}
         smib = entry.get("smibId") or str(leg).split("/", 1)[0]
         # Pin the destination FIRST (TOCTOU-guarded) so the pull never fires
@@ -23818,8 +24049,34 @@ class G2SHost:
                 # (belt to the dup re-ack's braces). An unknown/refused
                 # destination folds to the House LOUDLY — hand-paid money
                 # must land somewhere auditable, never vanish.
-                if ko_type in ("G2S_remoteHandpay", "G2S_localHandpay") \
-                        and (kcash + kpromo + knon) > 0:
+                # A machine with a SAS link books its handpays from the
+                # SAS side (the owner's rule: with a link, the accounting
+                # is SAS's), once its satellite reports handpay records
+                # (v0.3.28). This message is then information only. A
+                # satellite older than that reports none, and the booking
+                # stays here.
+                sas_books, sas_quiet = False, False
+                leg = self.linked_leg(assoc)
+                if leg:
+                    with self.sas_lock:
+                        le = dict(self.sas_machines.get(leg) or {})
+                    sas_books = bool(le.get("handpayRecords"))
+                    sas_quiet = sas_books and (
+                        le.get("online") is False or time.time()
+                        - (le.get("receivedAt") or 0) > self.SAS_STALE_SEC)
+                hand_paid = ko_type in ("G2S_remoteHandpay",
+                                        "G2S_localHandpay") \
+                    and (kcash + kpromo + knon) > 0
+                if hand_paid and sas_books:
+                    log.log(logging.WARNING if sas_quiet else logging.INFO,
+                            "💰 [%s] paid by hand, %s: booked from the SAS "
+                            "side (%s)%s", assoc.egm_id,
+                            "${:,.2f}".format(
+                                (kcash + kpromo + knon) / 100000), leg,
+                            " — which is NOT REPORTING just now; if it "
+                            "does not book this one, add it by hand"
+                            if sas_quiet else "")
+                elif hand_paid:
                     with self.companion_lock:
                         sess = self.card_sessions.get(assoc.egm_id) or {}
                         hp_dest = sess.get("accountId") or "house"
@@ -27054,6 +27311,13 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
             payload.setdefault("ok", status == 200)
             payload.setdefault("action", action)
             payload.setdefault("egmId", egm_id)
+            if status != 200 or payload.get("ok") is False:
+                # What the player was told. A refusal used to leave no
+                # line at all: on 2026-11-18 a CASH OUT TO WALLET that
+                # "failed" at the Bluebird's screen could not be traced.
+                log.info("🪟 [glass:%s] %s refused (%s): %s", egm_id,
+                         action or "(no action)", status,
+                         str(payload.get("error") or "")[:200])
             return self._send(status, json.dumps(payload),
                               "application/json", soap=False)
 
@@ -27127,6 +27391,19 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
         if action in GLASS_ADMIN_ACTIONS:
             if not admin:
                 return done(403, {"ok": False, "error": "not authorized"})
+            if action == "clearHandpay":
+                # A machine with a SAS side is reset over SAS (the
+                # linked-machine rule), whether or not it has a G2S side
+                # and whether or not that side is up.
+                _leg = engine.linked_leg(egm_id)
+                if not _leg:
+                    with engine.sas_lock:
+                        _leg = egm_id if egm_id in engine.sas_machines \
+                            else None
+                if _leg:
+                    code, payload = engine.linked_command(
+                        "clearHandpay", egm_id, _leg, req)
+                    return done(code, payload)
             with engine.assoc_lock:
                 assoc = engine.associations.get(egm_id)
             if assoc is None:
@@ -27136,13 +27413,6 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                 # reset the pending lockup to credits — the SAME reset a
                 # reset-fob fires. A specific transactionId keys THAT lockup
                 # off; omitted keys the NEWEST (the one the operator just saw).
-                # A machine with a SAS link is reset over SAS (the
-                # linked-machine rule).
-                _leg = engine.linked_leg(egm_id)
-                if _leg:
-                    code, payload = engine.linked_command(
-                        "clearHandpay", egm_id, _leg, req)
-                    return done(code, payload)
                 txn = req.get("transactionId")
                 if txn is not None:
                     txn = str(txn)

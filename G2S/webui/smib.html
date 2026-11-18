@@ -1270,7 +1270,13 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   }
 
   // ---- CASH OUT view: render + chip pad + funding gate --------------------
+  // A cash-out to wallet that was asked for and that the machine did not
+  // make: the hub's words, shown under the button in both menus for as
+  // long as the hub sends them (v0.3.28; the tap itself only ever
+  // answered "pending").
+  var coPullMsg = '';
   function renderCashout(d) {
+    coPullMsg = d.cashOutError ? String(d.cashOutError) : '';
     coMachineMc = (d.machineCreditsMc === undefined || d.machineCreditsMc === null)
       ? 0 : d.machineCreditsMc;
     coWalletMc = (d.walletMc === undefined || d.walletMc === null)
@@ -1307,7 +1313,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     var canCashOut = coHasWallet && coMachineMc > 0;
     setText('co-toggle', 'CASH OUT TO WALLET');
     $('co-toggle').className = 'nb' + (canCashOut ? ' nb-gold' : ' nb-off');
-    setText('co-toggle-hint', !coHasWallet ? ''
+    setText('co-toggle-hint', !coHasWallet ? '' : coPullMsg ? coPullMsg
       : (coMachineMc > 0
          ? 'Sends the ' + fmtMc(coMachineMc) + ' on this machine to your wallet now.'
          : 'No credits on this machine to cash out.'));
@@ -1340,6 +1346,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   //      arm state); wl-bal is painted by updateTexts from the state poll's
   //      "credits". Reuses walletFund + cashOutToWallet verbatim. -----------
   function renderWallet(d) {
+    coPullMsg = d.cashOutError ? String(d.cashOutError) : '';
     coMachineMc = (d.machineCreditsMc === undefined || d.machineCreditsMc === null)
       ? 0 : d.machineCreditsMc;
     coWalletMc = (d.walletMc === undefined || d.walletMc === null)
@@ -1421,7 +1428,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     var canCashOut = coHasWallet && coMachineMc > 0;
     setText('wl-toggle', 'CASH OUT TO WALLET');
     $('wl-toggle').className = 'nb' + (canCashOut ? ' nb-gold' : ' nb-off');
-    setText('wl-toggle-hint', !coHasWallet ? ''
+    setText('wl-toggle-hint', !coHasWallet ? '' : coPullMsg ? coPullMsg
       : (coMachineMc > 0
          ? 'Sends the ' + fmtMc(coMachineMc) + ' on this machine to your wallet now.'
          : 'No credits on this machine to cash out.'));

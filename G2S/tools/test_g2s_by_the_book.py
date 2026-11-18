@@ -4688,9 +4688,9 @@ def linked_machines_use_sas():
         host.sas_machines[LEG]["denomCents"] = None
     code, reply = host.linked_command(
         "bonusAward", egm.egm_id, LEG, {"amountMillicents": 500_000})
-    check("and so is any bonus while the SAS side has not given its "
-          "denomination", reply.get("ok") is False
-          and len(over_sas(host)) == 1, reply)
+    check("with no denomination set for the machine a credit is a cent, "
+          "as for its credit meter: $5.00 is 500 credits",
+          reply.get("ok") is True and reply.get("credits") == 500, reply)
 
     print("— a G2S command on a subject SAS owns there is refused; what "
           "only G2S can do stays")
@@ -4723,6 +4723,248 @@ def linked_machines_use_sas():
           g2s_since(host, mark) == ["setIdValidation", "getOptionList"]
           and host.linked_leg(a) is None and over_sas(host) == [],
           g2s_since(host, mark))
+
+
+# ---------------------------------------------------------------------------
+# A handpay on a SAS machine (v0.3.28)
+
+def sas_handpays_have_an_amount_and_are_booked():
+    print("— a handpay on a SAS machine: the satellite reports the "
+          "machine's own record (long poll 1B) and how the handpay ended. "
+          "It used to say only that one was pending: no amount on the "
+          "hub, nothing booked when it was paid by hand")
+    WIN = {"since": "2026-11-16T16:41:56", "code": "0x51", "group": 0,
+           "level": 0, "amount": 1_075_000, "partial": 0, "resetId": 1,
+           "kind": "win", "inCents": False}
+
+    def report(host, pending=None, last=None, old_satellite=False,
+               smib="smib-x", **more):
+        payload = {"smibId": smib, "address": "1", "online": True,
+                   "meters": {"0x1A": 0}, "pendingHandpay": pending}
+        if not old_satellite:
+            payload["lastHandpay"] = last
+        payload.update(more)
+        host.sas_report(payload, "192.168.50.102" if smib == "smib-x"
+                        else "192.168.50.109")
+        with host.sas_lock:
+            return dict(host.sas_machines[smib + "/1"])
+
+    def ended(how, rec=WIN, **more):
+        out = dict(rec, how=how, by="test", seq=1,
+                   clearedAt="2026-11-16T16:42:15")
+        out.update(more)
+        return out
+
+    host = make_host()
+    start = cash(host, "house")
+    entry = report(host, pending=WIN)
+    hp = entry["pendingHandpay"]
+    check("a pending handpay carries its amount in money: 1,075,000 "
+          "credits on a machine with no denomination set is $10,750.00 "
+          "(the record a Bluebird 2 gave for that win)",
+          hp.get("amountMc") == 1_075_000_000 and hp.get("kind") == "win"
+          and hp.get("resetId") == 1 and hp.get("since") == WIN["since"],
+          hp)
+    host.hub_store.set_denom("smib-x/1", 25)
+    hp = report(host, pending=WIN)["pendingHandpay"]
+    check("valued at the denomination set for the machine, as its credit "
+          "meter is", hp.get("amountMc") == 1_075_000 * 25 * 1000, hp)
+    prog = dict(WIN, level=4, kind="progressive", inCents=True,
+                amount=1_220_000)
+    hp = report(host, pending=prog)["pendingHandpay"]
+    check("a progressive is given in cents whatever the denomination",
+          hp.get("amountMc") == 1_220_000_000, hp)
+    host.hub_store.set_denom("smib-x/1", None)
+    check("nothing is booked while it is pending",
+          cash(host, "house") == start)
+
+    print("— how it ended decides the booking")
+    report(host, last=ended("credit"))
+    report(host, last=ended("cancelled"))
+    report(host, last=ended("gone"))
+    check("put on the credit meter, cancelled, or never there: nothing "
+          "is booked", cash(host, "house") == start,
+          cash(host, "house") - start)
+    told = said(lambda: [report(host, last=ended("unknown"))
+                         for _ in range(3)])
+    check("keyed off at the machine with neither meter saying which key: "
+          "not booked, and said once so it can be added by hand",
+          cash(host, "house") == start and told.count("NOT booked") == 1,
+          (cash(host, "house") - start, told))
+    entry = report(host, last=ended("hand"))
+    check("paid by hand with nobody carded in: the House is credited the "
+          "$10,750.00", cash(host, "house") == start + 1_075_000_000
+          and entry["lastHandpay"].get("how") == "hand",
+          cash(host, "house") - start)
+    for _ in range(3):
+        report(host, last=ended("hand", seq=7))
+    check("the same handpay reported again, at every report and after a "
+          "satellite restart renumbers it, is booked once",
+          cash(host, "house") == start + 1_075_000_000,
+          cash(host, "house") - start)
+    again = dict(WIN, since="2026-11-16T19:00:00")
+    report(host, last=ended("hand", rec=again))
+    check("another handpay of the same amount, later, is another booking",
+          cash(host, "house") == start + 2 * 1_075_000_000,
+          cash(host, "house") - start)
+    start = cash(host, "house")
+    report(host, last=ended("hand"), smib="smib-y")
+    check("and one on another machine at the same second is its own",
+          cash(host, "house") == start + 1_075_000_000,
+          cash(host, "house") - start)
+    start = cash(host, "house")
+    later = dict(WIN, since="2026-11-17T22:12:50", amount=2_250_000)
+    acct, _ = host.account_store.create("Player One")
+    with host.companion_lock:
+        host.card_sessions["smib-x/1"] = {"accountId": acct["id"],
+                                          "name": "Player One"}
+    report(host, last=ended("hand", rec=later))
+    check("with a player carded in at the machine the win goes to their "
+          "wallet, not the House", cash(host, acct["id"]) == 2_250_000_000
+          and cash(host, "house") == start,
+          (cash(host, acct["id"]), cash(host, "house") - start))
+
+    print("— a machine with both sides")
+    host = make_host()
+    egm = joined(host, "BTB_hp_linked")
+    a = egm.assoc
+    host.sas_links[egm.egm_id] = "smib-x/1"
+    acct, _ = host.account_store.create("Player Two")
+    with host.companion_lock:
+        host.card_sessions[egm.egm_id] = {"accountId": acct["id"],
+                                          "name": "Player Two"}
+    start = cash(host, "house")
+    report(host, pending=WIN)
+    txn, _ = egm.handpay_request(request=1_075_000_000)
+    egm.keyed_off(txn, 1_075_000_000, how="G2S_localHandpay")
+    check("its G2S key-off, paid by hand, books nothing once the "
+          "satellite reports handpay records (it was the one place a "
+          "linked machine's books came from G2S)",
+          cash(host, acct["id"]) == 0 and cash(host, "house") == start,
+          (cash(host, acct["id"]), cash(host, "house") - start))
+    report(host, last=ended("hand"))
+    check("the SAS side books it, to the player carded in on the linked "
+          "machine", cash(host, acct["id"]) == 1_075_000_000
+          and cash(host, "house") == start, cash(host, acct["id"]))
+    host = make_host()
+    egm = joined(host, "BTB_hp_linked_old")
+    host.sas_links[egm.egm_id] = "smib-x/1"
+    start = cash(host, "house")
+    report(host, pending={"since": WIN["since"], "code": "0x51"},
+           old_satellite=True)
+    txn, _ = egm.handpay_request(request=1_075_000_000)
+    egm.keyed_off(txn, 1_075_000_000, how="G2S_localHandpay")
+    check("with a satellite older than this, which reports no records, "
+          "the G2S key-off still books it",
+          cash(host, "house") == start + 1_075_000_000,
+          cash(host, "house") - start)
+    entry = report(host, pending={"since": WIN["since"], "code": "0x51"},
+                   old_satellite=True)
+    check("and its pending handpay is shown without an amount, as before",
+          entry["pendingHandpay"] == {"since": WIN["since"],
+                                      "code": "0x51"}
+          and entry["lastHandpay"] is None
+          and entry["handpayRecords"] is False, entry["pendingHandpay"])
+
+    print("— the admin handpay view on the machine's own screen (the "
+          "owner, at the Bluebird: \"the admin menu on the smib might be "
+          "using g2s because it listed the g2s jackpot info\")")
+    host = make_host()
+    report(host, pending=WIN)
+    view = host._glass_data_handpay("smib-x/1", None)
+    check("a SAS machine with no G2S side lists its handpay, with the "
+          "amount from its own record, and can clear it (it listed "
+          "nothing: the view read the G2S record only)",
+          view["pending"] == [{"amount": "$10,750.00", "type": "Game win",
+                               "when": WIN["since"]}]
+          and view["canClear"] is True and view.get("via") == "sas", view)
+    egm = online(joined(host, "BTB_hp_view"))
+    host.sas_links[egm.egm_id] = "smib-x/1"
+    egm.handpay_request(request=999_000)        # what G2S says: $9.99
+    view = host._glass_data_handpay(egm.egm_id, egm.assoc)
+    check("a machine with both sides is listed from the SAS record too, "
+          "once, not from the G2S one",
+          [p["amount"] for p in view["pending"]] == ["$10,750.00"], view)
+    report(host, pending={"since": WIN["since"], "code": "0x51"},
+           old_satellite=True)
+    view = host._glass_data_handpay(egm.egm_id, egm.assoc)
+    check("with a satellite that reports no amount, the G2S record's is "
+          "shown", [p["amount"] for p in view["pending"]] == ["$9.99"],
+          view)
+    report(host)
+    view = host._glass_data_handpay(egm.egm_id, egm.assoc)
+    check("nothing pending on the SAS side: nothing listed, nothing to "
+          "clear (the G2S record does not decide it)",
+          view["pending"] == [] and view["canClear"] is False, view)
+    host2 = make_host()
+    egm2 = online(joined(host2, "BTB_hp_view_g2s"))
+    egm2.handpay_request(request=999_000)
+    view = host2._glass_data_handpay(egm2.egm_id, egm2.assoc)
+    check("a machine with no SAS side is listed from G2S as before",
+          [p["amount"] for p in view["pending"]] == ["$9.99"]
+          and view["canClear"] is True and "via" not in view, view)
+
+    print("— CASH OUT TO WALLET from the machine's screen (the owner, at "
+          "the Bluebird: \"all it said was that it wasnt available but the "
+          "cashout button always works!!\")")
+    host = make_host()
+    egm = online(joined(host, "BTB_pull"))
+    host.sas_links[egm.egm_id] = "smib-x/1"
+    acct, _ = host.account_store.create("Player Three")
+    uid = gh.PIN_UID_PREFIX + acct["id"]
+    # the machine's last status read: no transfer from it possible (0x15)
+    report(host, aft={"registered": True, "availXfers": 0x15,
+                      "aftStatus": 0xFF, "hostCashoutStatus": 0})
+    code, reply = host.glass_cash_out_now(egm.egm_id, acct["id"])
+    pulls = [c for c in host.sas_commands.get("smib-x", ())
+             if c["type"] == "aft_cashout_pull"]
+    check("a status read that said \"no transfer from the machine\" does "
+          "not refuse it: the pull is sent and the satellite reads the "
+          "machine live (the read is up to 30 s old; the player was "
+          "refused on it)", code == 200 and len(pulls) == 1, (code, reply))
+    shown = host._glass_data_cashout(egm.egm_id, egm.assoc, uid)
+    check("nothing to say while it is on its way",
+          "cashOutError" not in shown, shown)
+    failed = {"id": pulls[0]["id"], "type": "aft_cashout", "ok": False,
+              "outcome": "no_credits", "amountCents": 0,
+              "detail": "machine reports no cashable credits"}
+    for _ in range(3):
+        report(host, commandResults=[failed])
+    shown = host._glass_data_cashout(egm.egm_id, egm.assoc, uid)
+    check("when the machine does not make it, the screen is told why "
+          "(the tap had only ever answered \"pending\")",
+          "no cashable credits" in shown.get("cashOutError", ""), shown)
+    host._cash_out_errors[egm.egm_id]["ts"] -= host.CASH_OUT_ERROR_SEC + 1
+    for _ in range(2):
+        report(host, commandResults=[failed])     # the satellite repeats it
+    shown = host._glass_data_cashout(egm.egm_id, egm.assoc, uid)
+    check("for half a minute, and a result the satellite repeats does not "
+          "bring it back", "cashOutError" not in shown, shown)
+    report(host, commandResults=[dict(failed, id="cmd9-1", outcome="x")])
+    check("a failed transfer that no screen asked for says nothing there",
+          "cashOutError" not in host._glass_data_cashout(
+              egm.egm_id, egm.assoc, uid))
+    with host.sas_lock:
+        host.sas_machines["smib-x/1"]["receivedAt"] -= 120
+    queued = len(host.sas_commands.get("smib-x", ()))
+    code, reply = host.glass_cash_out_now(egm.egm_id, acct["id"])
+    check("a SAS side that is not reporting is the one thing it is "
+          "refused for at once", code == 400
+          and "not reporting" in reply["error"]
+          and len(host.sas_commands.get("smib-x", ())) == queued, reply)
+
+    print("— what comes off the wire is held to its shape")
+    host = make_host()
+    start = cash(host, "house")
+    junk = dict(WIN, amount="1075000", kind="x" * 400, level="4",
+                resetId=7)
+    entry = report(host, pending=junk, last=ended("hand", rec=junk))
+    check("an amount that is not a number is no amount, and books "
+          "nothing", "amount" not in entry["pendingHandpay"]
+          and cash(host, "house") == start, entry["pendingHandpay"])
+    entry = report(host, last=ended("hand", rec=dict(WIN, amount=-5)))
+    check("nor is a negative one", cash(host, "house") == start
+          and "amount" not in entry["lastHandpay"], entry["lastHandpay"])
 
 
 def main():
@@ -4782,6 +5024,7 @@ def main():
     batch_7_transfers()
     batch_7_handpays()
     linked_machines_use_sas()
+    sas_handpays_have_an_amount_and_are_booked()
     print("=" * 50)
     print(f"RESULT: {_p} passed, {_f} failed")
     return 1 if _f else 0

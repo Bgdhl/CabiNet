@@ -455,6 +455,7 @@ def main():
     class ArmStub:
         glass_cash_out_to_wallet = G.G2SHost.glass_cash_out_to_wallet
         glass_cash_out_now = G.G2SHost.glass_cash_out_now
+        SAS_STALE_SEC = G.G2SHost.SAS_STALE_SEC
         sas_host_cashout = staticmethod(G.G2SHost.sas_host_cashout)
         sas_from_egm_ready = staticmethod(G.G2SHost.sas_from_egm_ready)
         _drop_refused_cashout_arms = G.G2SHost._drop_refused_cashout_arms
@@ -471,10 +472,12 @@ def main():
             return self._glass_data_cashout("EGM1", None, "u1")["cashOutToWat"]
 
         def __init__(self, aft):
-            import itertools, threading
+            import itertools, threading, time
             self.sas_links = {"EGM1": "bb2/1"}
             self.sas_lock = threading.Lock()
-            self.sas_machines = {"bb2/1": {"smibId": "smib-bb2", "aft": aft}}
+            self.sas_machines = {"bb2/1": {"smibId": "smib-bb2", "aft": aft,
+                                           "online": True,
+                                           "receivedAt": time.time()}}
             self._glass_pin_lock = threading.Lock()
             self._glass_cash_out_pin = {}
             self._fob_seq = itertools.count(1)
@@ -561,11 +564,23 @@ def main():
     a.glass_cash_out_to_wallet("EGM1", "p1", False)
     check("disarmed: OFF", a.shows_on() is False)
 
-    print("— the hub's own pull keeps its gate, with honest words")
+    print("— the hub's own pull is refused only when the SAS side is not "
+          "reporting (v0.3.28)")
     a = ArmStub({"registered": True, "availXfers": 0x15,
                  "hostCashoutStatus": 0x02})
+    a.glass_sessions = None
     code, body = a.glass_cash_out_now("EGM1", "p1")
-    check("no transfer from the machine possible: the pull is refused",
+    check("the machine's last status read said no transfer from it was "
+          "possible: the pull is sent all the same, and the satellite "
+          "reads the status live (that read is up to 30 s old, and a "
+          "player was told \"can't send its credits to the wallet right "
+          "now\" about a machine that could)",
+          code == 200 and a.sent[-1][1]["type"] == "aft_cashout_pull")
+    a = ArmStub({"registered": True, "availXfers": 0x17,
+                 "hostCashoutStatus": 0x02})
+    a.sas_machines["bb2/1"]["receivedAt"] -= 120
+    code, body = a.glass_cash_out_now("EGM1", "p1")
+    check("a SAS side that is not reporting: the pull is refused",
           code == 400 and not a.sent)
     check("...without telling the owner to turn on cash-out to host",
           "operator menu" not in body["error"]

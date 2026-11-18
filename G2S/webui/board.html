@@ -905,10 +905,13 @@ function checkJackpots(){
       // (celebrate() headlines "JACKPOT!" when amt is unknown, and
       // nightSave keeps the record honest by storing null, not 0).
       const leg=key.slice(4), owner=legOwner[leg];
-      if(owner){
-        egm=owner;
-        amt=hpAmt(((S.status[owner]||{}).pendingHandpays||[])[0]);
-      }else egm=leg;
+      egm=owner||leg;
+      // v0.3.28: the machine's own SAS handpay record carries the amount
+      // (millicents); an older satellite sends none, and a linked
+      // cabinet then lends its G2S record as before.
+      const own=Number(((sas[leg]||{}).pendingHandpay||{}).amountMc)||0;
+      if(own>0) amt=own;
+      else if(owner) amt=hpAmt(((S.status[owner]||{}).pendingHandpays||[])[0]);
     }
     celebrate(egm,amt);
   }

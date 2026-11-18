@@ -1,5 +1,49 @@
 # Changelog
 
+## v0.3.28
+A handpay on a SAS machine has an amount, and is booked when it is paid
+by hand. Until now a SAS machine told the hub only that a handpay was
+pending: a machine with no G2S side showed no amount and booked nothing.
+- **The satellite reads the machine's handpay record** (what it was
+  for, the amount, whether the machine can put it on the credit meter)
+  and reports it with the pending handpay. The Floor's HANDPAY banner
+  and the Gameroom Board show the amount on a SAS machine.
+- **How a handpay ended is reported**: put on the credit meter (by the
+  hub's reset or the machine's reset-to-credit key), paid by hand (the
+  handpay key), cancelled by the player, or never there. SAS does not
+  name the key; the machine says it by where it counts the win: a
+  reset to the credit meter is not added to its jackpot meter, a
+  handpay paid by the attendant is. The satellite reads both meters a
+  few seconds after the reset. If neither moved by the win it says so
+  and nothing is booked.
+- **A handpay paid by hand is booked**: to the wallet of whoever is
+  carded in at the machine, the House when nobody is. Once, however
+  many times it is reported. The same rule a G2S machine's hand-paid
+  key-off already had.
+- **A machine with both sides is booked from its SAS side.** Its G2S
+  key-off is then information only. With a satellite older than this,
+  which reports no record, the G2S key-off books it as before.
+- A handpay too large for the machine's credit meter says so on the
+  banner.
+- **The admin handpay view on the machine's own screen lists a SAS
+  machine's handpay from its SAS record**, and its CLEAR goes over SAS
+  whether or not the machine has a G2S side. It read the G2S record
+  only, so a SAS-only machine listed nothing there.
+- A bonus sent to a linked machine is sized by the same denomination
+  as its credit meter (a cent while none is set for it).
+- **CASH OUT TO WALLET on a machine's screen is no longer refused on an
+  old status read.** The hub went by the machine's last "can a transfer
+  come off it" reading, up to 30 seconds old, and a reading from a bad
+  moment answered "can't send its credits to the wallet right now"
+  about a machine that could. The pull is now sent whenever the SAS
+  side is reporting, and the satellite reads the machine live. If the
+  machine does not make it, the reason shows under the button in both
+  menus for half a minute; before, the tap answered "pending" and a
+  failure said nothing.
+- A refused action from a machine's screen is logged with what the
+  player was told.
+Needs the satellite's own update, which the hub sends after its own.
+
 ## v0.3.27
 A machine with a SAS companion takes its commands over SAS. G2S on it is
 for reading: events, meters, status, the handpay record.
