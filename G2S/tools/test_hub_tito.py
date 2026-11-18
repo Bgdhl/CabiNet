@@ -893,15 +893,23 @@ def main():
     # -- v12 expired-ticket reaper: stamps, immortality, grace, display ----
     print("\n— v12 expired-ticket reaper")
     import sqlite3 as _sql
-    import time as _time
     hs, d = fresh()
+
+    import datetime as _dtm
+
+    def _days_back(days_ago, fmt="%Y-%m-%dT%H:%M:%S"):
+        # the same time of day, that many DATES back. Not seconds: across
+        # a clock change "30 x 86400 s ago" is an hour off, and from 11 pm
+        # to midnight that lands on the wrong date (seen 2026-11-17, with
+        # the clocks having gone back on Nov 1: this gate failed on the
+        # hub at 23:05 and stopped an update).
+        return (_dtm.datetime.now()
+                - _dtm.timedelta(days=days_ago)).strftime(fmt)
 
     def _issue(days_ago, expire_days, amt=10_000):
         m = hs.tito_mint("sas:smib-bb2", 1, amt)
         hs.tito_record_issued(m["validationNumber"], amt, "sas:smib-bb2", 1)
-        back = _time.strftime("%Y-%m-%dT%H:%M:%S",
-                              _time.localtime(_time.time()
-                                              - days_ago * 86400))
+        back = _days_back(days_ago)
         with hs.lock:
             hs._conn.execute(
                 "UPDATE tito_tickets SET issued_at=?, expire_days=? "
@@ -934,8 +942,7 @@ def main():
     # and another such, printed one second after midnight that day: by the
     # hour its 30 days are up; by the date on it, it is good all of today
     early = _issue(days_ago=30, expire_days=30)
-    first_second = _time.strftime(
-        "%Y-%m-%dT00:00:01", _time.localtime(_time.time() - 30 * 86400))
+    first_second = _days_back(30, "%Y-%m-%dT00:00:01")
     with hs.lock:
         hs._conn.execute("UPDATE tito_tickets SET issued_at=? "
                          "WHERE canonical=?", (first_second, early))

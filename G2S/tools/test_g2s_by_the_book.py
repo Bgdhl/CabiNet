@@ -3492,7 +3492,12 @@ def ticket_expiry_by_the_hub():
 
     def printed(days_ago):
         vid, _t, _a = egm.issue_voucher(400_000)
-        when = datetime.now().astimezone() - timedelta(days=days_ago)
+        # the same time of day, that many DATES back, with the offset
+        # that date had. Subtracting from an aware "now" keeps today's
+        # offset, which is an hour off across a clock change: from 11 pm
+        # to midnight the ticket then carried the next day's date (this
+        # gate failed at 23:06 on 2026-11-17, after the Nov 1 change).
+        when = (datetime.now() - timedelta(days=days_ago)).astimezone()
         with store.lock:
             ids[vid]["issuedAt"] = when.isoformat(timespec="milliseconds")
         return vid
@@ -3560,8 +3565,8 @@ def ticket_expiry_by_the_hub():
     hs = host.hub_store
     m = hs.tito_mint("sas:smib-x", 1, 10_000)
     hs.tito_record_issued(m["validationNumber"], 10_000, "sas:smib-x", 1)
-    back = time.strftime("%Y-%m-%dT%H:%M:%S",
-                         time.localtime(time.time() - 40 * 86400))
+    back = (datetime.now() - timedelta(days=40)).strftime(
+        "%Y-%m-%dT%H:%M:%S")
     with hs.lock:
         hs._conn.execute("UPDATE tito_tickets SET issued_at=?, "
                          "expire_days=30 WHERE canonical=?",
@@ -4091,6 +4096,113 @@ def items_43_and_53_restarting_a_machine():
           (r1, r2))
 
 
+def to_wallet_says_what_it_does():
+    print("— the player's TO WALLET switch on a plain G2S machine: ON means "
+          "this player's wallet is set to receive the machine's CASH OUT. "
+          "(Seen 2026-11-17: the machine was armed at 14:16, the hub "
+          "restarted at 14:49 and forgot whose wallet it was, the machine "
+          "kept its setting; the screen read ON and CASH OUT printed a "
+          "ticket)")
+
+    def wat_says(host, egm, flag, to="getWatStatus", dev="1"):
+        """The machine's watStatus, to a read the host makes or to the
+        newest setWatCashOut. Returns what the host sent on the strength
+        of it."""
+        if to == "getWatStatus":
+            host.enqueue_get_wat_status(egm.assoc, dev)
+        drain(host, egm.assoc)
+        mark = len(host.sent)
+        answer_to(egm, "wat", to,
+                  f'<g2s:watStatus g2s:cashOutToWat="{flag}"/>', device=dev)
+        drain(host, egm.assoc)
+        return asks(sent_since(host, mark), "setWatCashOut")
+
+    def shows(host, egm, acct):
+        return host._glass_data_cashout(
+            egm.egm_id, egm.assoc, gh.PIN_UID_PREFIX + acct["id"]
+        )["cashOutToWat"]
+
+    host = make_host()
+    egm = online(joined(host, "BTB_towallet"))
+    a = egm.assoc
+    acct, _ = host.account_store.create("Player One")
+    other, _ = host.account_store.create("Player Two")
+
+    sent = wat_says(host, egm, "true")
+    check("a machine that says its CASH OUT goes to the hub, with no "
+          "wallet set to receive it, is put back to a ticket (it stayed "
+          "that way for eight hours, asking the hub at every cash-out)",
+          len(sent) == 1 and sent[0].get("cashOutToWat") == "false", sent)
+    check("and the screen reads OFF in the meantime (it read ON from the "
+          "machine's word alone)", shows(host, egm, acct) is False)
+    sent = wat_says(host, egm, "true", to="setWatCashOut")
+    check("a machine that keeps saying so is asked once per sign-on, not "
+          "at every status", sent == []
+          and wat_says(host, egm, "true") == [])
+    egm.comms_online(reset=True)
+    online(egm)
+    check("it is asked again at the next sign-on",
+          len(wat_says(host, egm, "true")) == 1)
+    wat_says(host, egm, "false", to="setWatCashOut")
+    egm.comms_online(reset=True)
+    online(egm)
+    check("a machine that says its CASH OUT prints a ticket is left alone",
+          wat_says(host, egm, "false") == [])
+
+    print("— a player turns it on")
+    code, body = host.glass_cash_out_to_wallet(egm.egm_id, acct["id"], True)
+    check("the arm is sent and the wallet noted",
+          code == 200 and host._glass_cash_out_pin.get(egm.egm_id)
+          == acct["id"], (code, body))
+    check("until the machine says it took the arm the screen reads OFF "
+          "(a machine that refuses it prints a ticket)",
+          shows(host, egm, acct) is False)
+    sent = wat_says(host, egm, "true", to="setWatCashOut")
+    check("the machine's answer is not taken for a leftover", sent == [])
+    check("and the screen reads ON", shows(host, egm, acct) is True)
+    a.wat_arm_at["1"] -= 60
+    check("nor is a later status, while the wallet is noted",
+          wat_says(host, egm, "true") == []
+          and host._glass_cash_out_pin.get(egm.egm_id) == acct["id"])
+    check("another player's screen does not read ON for it (nor a "
+          "player's during a sweep to the House)",
+          shows(host, egm, other) is False)
+
+    print("— the hub restarts while it is on")
+    with host._glass_pin_lock:
+        host._glass_cash_out_pin.clear()
+    check("the screen reads OFF at once", shows(host, egm, acct) is False)
+    egm.comms_online(reset=True)
+    online(egm)
+    sent = wat_says(host, egm, "true")
+    check("and the machine is put back to a ticket at its sign-on",
+          len(sent) == 1 and sent[0].get("cashOutToWat") == "false", sent)
+
+    print("— what is left alone")
+    host = make_host()
+    egm = online(joined(host, "BTB_towallet_byhand"))
+    host.enqueue_set_wat_cash_out(egm.assoc, enable=True)
+    check("an enable just sent (the wallet is noted a moment after the "
+          "command is queued) is not undone by its own answer",
+          wat_says(host, egm, "true", to="setWatCashOut") == [])
+    host = make_host()
+    egm = online(joined(host, "BTB_towallet_guest"))
+    with egm.assoc.lock:
+        egm.assoc.config_devices["G2S_wat/1"] = {"deviceClass": "G2S_wat",
+                                                 "deviceId": "1"}
+    check("a transfer device the hub does not own (the AVP's third one) "
+          "is not the hub's to set, and it does not say it did",
+          host._clear_leftover_wat_cash_out(
+              egm.assoc, "3", {"cashOutToWat": "true"}) is False
+          and wat_says(host, egm, "true", dev="3") == []
+          and len(wat_says(host, egm, "true")) == 1)
+    host = make_host()
+    egm = online(joined(host, "BTB_towallet_linked"))
+    host.sas_links[egm.egm_id] = "smib-x/1"
+    check("a machine with a SAS link is not touched: its cash-out is "
+          "armed over SAS", wat_says(host, egm, "true") == [])
+
+
 def main():
     logging.basicConfig(level=logging.CRITICAL + 1)
     logging.getLogger("g2s_host").setLevel(logging.CRITICAL + 1)
@@ -4142,6 +4254,7 @@ def main():
     item_15_a_lock_and_a_machine_restart()
     items_17_and_49_event_subscriptions()
     items_43_and_53_restarting_a_machine()
+    to_wallet_says_what_it_does()
     print("=" * 50)
     print(f"RESULT: {_p} passed, {_f} failed")
     return 1 if _f else 0

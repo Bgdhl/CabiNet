@@ -125,7 +125,7 @@ if "tournament_names" not in _hub_store_mod.HOST_SETTING_KEYS:
 # the MINOR bump per the repo's version rule). Surfaced in engine_meta() ->
 # /api/status ["_engine"]["version"]; bump this and add a CHANGELOG.md
 # section on every commit with a user-visible change.
-CABINET_VERSION = "0.3.24"
+CABINET_VERSION = "0.3.25"
 
 WSDL_NS = "http://www.gamingstandards.com/wsdl/g2s/v1.0"
 SCHEMA_NS = "http://www.gamingstandards.com/g2s/schemas/v1.0.3"
@@ -2191,6 +2191,11 @@ class EgmAssociation:
         # watLogStatus/watLogList read. Accumulated knowledge — NOT cleared
         # in new_epoch (a re-handshake does not unwind a transfer).
         self.wat_devices = {}
+        # for _clear_leftover_wat_cash_out: when an enable of setWatCashOut
+        # was last queued per wat device, and the sign-on (epoch) in which
+        # a leftover arm was last cleared per device
+        self.wat_arm_at = {}
+        self.wat_leftover_cleared = {}
         self.wat_transfers = []
         self.wat_transfer_count = 0
         self.wat_to_egm_ok = 0
@@ -10118,8 +10123,9 @@ class G2SHost:
                "machineCreditsMc": self._machine_credits_mc(assoc),
                "walletMc": None, "walletCredits": None, "canFund": False,
                "cashOutToWat": False}
+        aid = None
         try:
-            _aid, acct = self._session_account(uid)
+            aid, acct = self._session_account(uid)
             if acct is not None:
                 mc = int(acct.get("cashableMillicents") or 0)
                 out["walletMc"] = mc
@@ -10131,24 +10137,28 @@ class G2SHost:
                     acct.get("nonCashMillicents") or 0)
         except Exception:  # noqa: BLE001 — no wallet, not a fault
             pass
-        # cashOutToWat: is this machine's own CASH OUT button going to the
-        # wallet? A SAS-linked machine: only while a player ARMED it and
-        # the pin still names them (the pin alone is also set by a pull).
-        # Otherwise: this session's own pin (armed here) OR the wat device
-        # state the machine reported — either proves cash-outs route to WAT.
+        # cashOutToWat: is this machine's own CASH OUT button going to THIS
+        # player's wallet? A SAS-linked machine: only while a player ARMED
+        # it and the pin still names them (the pin alone is also set by a
+        # pull). A plain G2S machine: only while the hub holds this
+        # player's wallet as the destination AND the machine says its CASH
+        # OUT goes to the host. Until v0.3.25 the machine's word alone
+        # read as ON; it stays set after the hub has forgotten who armed
+        # it, and a cash-out with no wallet behind it is refused and
+        # prints a ticket. The hub's note alone is not enough either: a
+        # machine that did not take the arm prints a ticket too.
         try:
             if (getattr(self, "sas_links", None) or {}).get(egm_id):
                 who = self._cash_out_armed().get(egm_id)
                 out["cashOutToWat"] = bool(
                     who and self._glass_cash_out_pin.get(egm_id) == who)
-            elif egm_id in self._glass_cash_out_pin:
-                out["cashOutToWat"] = True
-            elif assoc is not None:
+            elif assoc is not None and aid \
+                    and self._glass_cash_out_pin.get(egm_id) == aid:
                 with assoc.lock:
                     devs = [dict(v) for v in assoc.wat_devices.values()]
                 out["cashOutToWat"] = any(
                     d.get("cashOutToWat") == "true" for d in devs)
-        except Exception:  # noqa: BLE001 — decorative flag
+        except Exception:  # noqa: BLE001 — a fault reads as OFF
             pass
         return out
 
@@ -15743,6 +15753,10 @@ class G2SHost:
         self._enqueue(assoc, build)
 
     def _enqueue_one_wat_cash_out(self, assoc, enable, device_id):
+        if enable:
+            with assoc.lock:
+                assoc.wat_arm_at[str(device_id)] = time.time()
+
         def build(a):
             dev = str(device_id)
             sid = a.next_session_id()
@@ -15753,6 +15767,47 @@ class G2SHost:
                 str(sid), "30000")
             return inner, f"setWatCashOut(on={on},dev={dev},cid={cid})"
         self._enqueue(assoc, build)
+
+    # an enable of ours is followed, a moment later, by the note of whose
+    # wallet it is for: a watStatus inside this window is not a leftover
+    WAT_ARM_SETTLE_SEC = 10.0
+
+    def _clear_leftover_wat_cash_out(self, assoc, dev, data):
+        """A plain G2S machine says its CASH OUT goes to the host
+        (cashOutToWat) while the hub holds no wallet to receive it: an arm
+        that outlived whoever made it. The hub keeps the wallet in memory
+        and forgets it at a restart; the machine keeps its setting. Seen on
+        the AVP on 2026-11-17: armed at 14:16, hub restarted at 14:49,
+        still set at 22:17. Every CASH OUT then asked the hub, was refused
+        for want of a wallet and printed a ticket five seconds later, with
+        the player's screen reading TO WALLET ON. Put the machine back to
+        its default, a ticket. Once per sign-on per device, never on a
+        machine with a SAS link, and not within WAT_ARM_SETTLE_SEC of an
+        enable of ours. Returns True if a disable was sent."""
+        if data.get("cashOutToWat") != "true":
+            return False
+        egm_id = assoc.egm_id
+        if (getattr(self, "sas_links", None) or {}).get(egm_id):
+            return False
+        if self._glass_cash_out_pin.get(egm_id):
+            return False
+        dev = str(dev)
+        owned = self.owned_wat_devices(assoc)
+        if owned and dev not in owned:
+            return False                # a guest device is not ours to set
+        with assoc.lock:
+            if time.time() - (assoc.wat_arm_at.get(dev) or 0) \
+                    < self.WAT_ARM_SETTLE_SEC:
+                return False
+            if assoc.wat_leftover_cleared.get(dev) == assoc.epoch:
+                return False
+            assoc.wat_leftover_cleared[dev] = assoc.epoch
+        log.warning("🏦 [%s] wat dev=%s sends CASH OUT to the hub but no "
+                    "wallet is set to receive it (left from before a hub "
+                    "restart, or set by hand) — setting it back to a "
+                    "ticket", egm_id, dev)
+        self.enqueue_set_wat_cash_out(assoc, enable=False, device_id=dev)
+        return True
 
     def enqueue_set_wat_cash_out(self, assoc, enable=True, device_id="1"):
         """wat.setWatCashOut (spec §22.24) — route EGM-initiated cash-outs
@@ -23710,6 +23765,7 @@ class G2SHost:
                      assoc.egm_id, req["deviceId"], data["hostEnabled"],
                      data["egmEnabled"], data["hostLocked"],
                      data["cashOutToWat"])
+            self._clear_leftover_wat_cash_out(assoc, req["deviceId"], data)
 
         elif cmd == "watProfile" and stype == "G2S_response":
             # wat (G2S-39, §22.17) — every attribute captured verbatim, with

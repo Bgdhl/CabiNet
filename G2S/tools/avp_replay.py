@@ -3624,6 +3624,18 @@ def main():
         'g2s:hostEnabled="true" g2s:hostLocked="false" '
         'g2s:cashOutToWat="true"/>',
         "500", ws_sid, "G2S_response", device_id="2")))
+    # v0.3.25: a device that sends its cash-out to the hub while no wallet
+    # is set to receive it is put back to a ticket, once per sign-on. Left
+    # unanswered here, so dev 2 still reads true and the one-device assist
+    # below has something to release.
+    m = expect_host_post("setWatCashOut (leftover arm on dev 2)")
+    if m:
+        check("a leftover cash-out arm is cleared: setWatCashOut "
+              "cashOutToWat=false to dev 2",
+              m["command"] == "setWatCashOut" and m["deviceId"] == "2"
+              and m.get("commandAttrs", {}).get("cashOutToWat") == "false",
+              f"got {m.get('command')}/dev={m.get('deviceId')}/"
+              f"{m.get('commandAttrs')}")
     cs, cbody = post_command({"action": "watProfile", "deviceId": "1"})
     check("watProfile command accepted", cs == 200 and bool(cbody.get("ok")))
     m = expect_host_post("getWatProfile (on demand)")

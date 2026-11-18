@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.3.25
+Two things seen on the floor.
+- **TO WALLET reads ON only when it is on.** On a G2S machine the
+  player's screen took the machine's own setting as the answer. The
+  machine keeps that setting; the hub keeps whose wallet it is for only
+  until it restarts. After a hub restart the screen read TO WALLET ON
+  with no wallet behind it, and CASH OUT asked the hub, was refused and
+  printed a ticket a few seconds later. The screen now reads ON only
+  while this player's wallet is set to receive the cash-out and the
+  machine has taken the setting. A machine found sending its cash-out
+  to the hub with no wallet set is put back to printing a ticket, once
+  per sign-on. A machine with a SAS link is not touched.
+- **Amounts stay on the player's screen.** On the digital glass the
+  keypad figure, the wallet balance, the amount button and the two
+  credit lines are measured and scaled to their space, so a long amount
+  gets smaller as it grows where before it ran off the edge (the keypad
+  from about $1,000 up on the AVP). On the Bluebird's screen the keypad
+  figure steps down from $100,000.
+
 ## v0.3.24
 Sixth batch from the G2S audit: the cabinet and events. Eleven items,
 one of them (a lock and a machine restart) settled with no change: a
@@ -12,9 +31,10 @@ the hub sends no lock or unlock by itself.
   instead, and shows "not subscribed" in between.
 - **Game started and game ended are no longer kept by the machine until
   acknowledged.** A machine holds only so many unsent events for the
-  hub (35 by default). With the hub off and a machine being played,
-  those two filled it in about seventeen games, and the machine then
-  dropped events or switched its event handler off. The hub also now
+  hub (the document's minimum is 35; the AVP and the Bluebird 2 both
+  say 100). With the hub off and a machine being played, those two
+  filled it in about fifty games, and the machine then dropped events
+  or switched its event handler off. The hub also now
   says when a machine reports that its event log is full, and reads the
   log back when it clears.
 - **An event first seen in the machine's log is still handled when the
