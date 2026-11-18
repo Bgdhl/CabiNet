@@ -125,7 +125,7 @@ if "tournament_names" not in _hub_store_mod.HOST_SETTING_KEYS:
 # the MINOR bump per the repo's version rule). Surfaced in engine_meta() ->
 # /api/status ["_engine"]["version"]; bump this and add a CHANGELOG.md
 # section on every commit with a user-visible change.
-CABINET_VERSION = "0.3.28"
+CABINET_VERSION = "0.3.29"
 
 WSDL_NS = "http://www.gamingstandards.com/wsdl/g2s/v1.0"
 SCHEMA_NS = "http://www.gamingstandards.com/g2s/schemas/v1.0.3"
@@ -7400,7 +7400,7 @@ class G2SHost:
             log.exception("cash-out arm result handling (%s) failed "
                           "(ignored)", key)
 
-    def _sas_cashout_pin(self, key):
+    def _sas_cashout_pin(self, key, asker=None):
         """The hub's OWN armed cash-out destination for a reporting SAS machine
         (the credit authority for the RETURN leg), or None. A LIVE tournament
         sweep pin outranks the glass pins: while a tournament pull is
@@ -7424,6 +7424,11 @@ class G2SHost:
                 and time.time() - (ent.get("ts") or 0) \
                 <= self.TOURNAMENT_SWEEP_PIN_TTL_SEC:
             return ent["acct"]
+        if asker:
+            # the result being settled answers a pull this account asked
+            # for from the screen (_cash_out_pull_asker): theirs, ahead of
+            # whatever the machine's pin says by now
+            return asker
         for owner in [m for m, sk in self.sas_links.items()
                       if sk == key] + [key]:
             acct = self._glass_cash_out_pin.get(owner)
@@ -7515,7 +7520,8 @@ class G2SHost:
                 return
             self.sas_enqueue_command(smib, {
                 "id": f"codis{next(self._fob_seq)}-{int(time.time())}",
-                "type": "aft_set_host_cashout", "enable": False})
+                "type": "aft_set_host_cashout", "enable": False,
+                "dropPull": True})
         except Exception:  # noqa: BLE001 — best-effort disarm, never fatal
             log.exception("SAS cash-out disarm (%s) failed (ignored)", key)
 
@@ -7590,6 +7596,131 @@ class G2SHost:
 
     #: how long a failed cash-out to wallet stays on the player's screen
     CASH_OUT_ERROR_SEC = 30
+    #: how long the satellite is asked to keep trying a cash-out pull the
+    #: machine cannot make at the moment it is asked: its retry queue
+    #: (PullRetry in SAS/sas_host.py). The owner, 2026-11-18: "why doesnt
+    #: the hub hold it for up to 15 seconds and retry when available",
+    #: and "a retry queue.. it shouldnt be paused".
+    CASH_OUT_RETRY_SEC = 15
+    #: how long a pull with no answer still counts as on its way: the
+    #: retry time, the wait to be collected, and the length of a last try
+    CASH_OUT_PULL_OPEN_SEC = 30
+
+    def _cash_out_pulls(self):
+        """{SAS leg: {"id", "acct", "egmId", "ts"}}: the cash-out pull a
+        machine's screen asked for and its satellite has not answered
+        yet. It may be waiting in the satellite's retry queue for up to
+        CASH_OUT_RETRY_SEC. While it is there:
+
+          * the screen says so (cashOutPending) and a second tap sends
+            nothing more;
+          * when it lands it is credited to the account that asked
+            (_cash_out_pull_asker), whatever has happened to the machine's
+            pin meanwhile;
+          * a card-out takes it out of here (_cash_out_pull_left): the
+            satellite is told to drop it, and the next player's tap starts
+            a pull of its own.
+
+        In memory only. A hub restart forgets it and tells every satellite
+        to disarm, which drops a waiting pull there too."""
+        pulls = getattr(self, "_cash_out_pull_open", None)
+        if pulls is None:
+            pulls = self._cash_out_pull_open = {}
+        return pulls
+
+    def _cash_out_pulls_gone(self):
+        """{command id: {"acct", "ts"}}: pulls whose player carded out
+        before the satellite answered. Nobody waits for these; they are
+        kept for CASH_OUT_PULL_OPEN_SEC only so that a try that was
+        already under way when the card came out is credited to the
+        player who asked, not left without a home."""
+        gone = getattr(self, "_cash_out_pull_gone", None)
+        if gone is None:
+            gone = self._cash_out_pull_gone = {}
+        return gone
+
+    def _cash_out_pull_waiting(self, leg):
+        """The unanswered screen pull for this SAS leg, or None. One with
+        no answer after CASH_OUT_PULL_OPEN_SEC is forgotten here (the
+        command was lost, or the satellite restarted while it waited) and
+        the player who asked is told, once."""
+        pulls = self._cash_out_pulls()
+        ent = pulls.get(leg)
+        if ent is None:
+            return None
+        if time.time() - ent["ts"] <= self.CASH_OUT_PULL_OPEN_SEC:
+            return ent
+        if pulls.pop(leg, None) is not None:
+            log.warning("🏦 [sas:%s] cash-out to wallet %s had no answer "
+                        "from the satellite in %d s", leg, ent.get("id"),
+                        self.CASH_OUT_PULL_OPEN_SEC)
+            self._cash_out_note(
+                leg, ent.get("acct"),
+                "The machine did not answer, so nothing was sent to your "
+                "wallet. Try again, or use its CASH OUT button.")
+        return None
+
+    def _cash_out_pull_asker(self, key, r):
+        """The account that asked, from the screen, for the pull this
+        satellite result answers; None when the result is not that
+        pull's. The hub's own note of who asked, matched on the command id
+        the hub made up (a late end carries it as lateFor): never an
+        account named on the wire."""
+        ids = [i for i in (r.get("id"), r.get("lateFor"))
+               if isinstance(i, str) and i]
+        ent = self._cash_out_pulls().get(key)
+        if ent and ent.get("id") in ids:
+            return ent.get("acct") or None
+        gone = self._cash_out_pulls_gone()
+        for cid in ids:
+            was = gone.get(cid)
+            if was and time.time() - was["ts"] \
+                    <= self.CASH_OUT_PULL_OPEN_SEC:
+                return was.get("acct") or None
+        return None
+
+    def _cash_out_pull_answered(self, key, r):
+        """This result ends the screen pull it answers, if it answers one:
+        stop counting it as on its way."""
+        ids = (r.get("id"), r.get("lateFor"))
+        pulls = self._cash_out_pulls()
+        ent = pulls.get(key)
+        if ent and ent.get("id") in ids:
+            pulls.pop(key, None)
+        gone = self._cash_out_pulls_gone()
+        for cid in ids:
+            if isinstance(cid, str):
+                gone.pop(cid, None)
+
+    def _cash_out_pull_left(self, egm_id):
+        """The player at this machine carded out. True when a pull they
+        asked for is still unanswered: the caller tells the satellite to
+        drop it (dropPull). From here on it is not waited for; it is
+        remembered by its id for a while (_cash_out_pulls_gone)."""
+        leg = self.linked_leg(egm_id)
+        ent = self._cash_out_pulls().pop(leg, None) if leg else None
+        if ent is None:
+            return False
+        now = time.time()
+        gone = self._cash_out_pulls_gone()
+        for cid in [c for c, was in list(gone.items())
+                    if now - was["ts"] > self.CASH_OUT_PULL_OPEN_SEC]:
+            gone.pop(cid, None)
+        if len(gone) > 64:
+            gone.clear()
+        gone[ent["id"]] = {"acct": ent.get("acct"), "ts": ent["ts"]}
+        return True
+
+    def _cash_out_note(self, key, acct, msg):
+        """Put a line about a cash-out to wallet on a machine's screen for
+        CASH_OUT_ERROR_SEC. `acct` is the player it is for (None: whoever
+        is carded in); nobody else is shown it."""
+        if getattr(self, "_cash_out_errors", None) is None:
+            self._cash_out_errors = {}
+        note = {"ts": time.time(), "msg": msg, "acct": acct}
+        for owner in [m for m, sk in self.sas_links.items()
+                      if sk == key] + [key]:
+            self._cash_out_errors[owner] = note
 
     def _cash_out_pull_failed(self, key, r):
         """A cash-out to wallet the player asked for from the screen and
@@ -7597,15 +7728,21 @@ class G2SHost:
         without this the screen went back to the menu and said nothing.
         Kept for CASH_OUT_ERROR_SEC against the machine (and the G2S
         machine linked to it) and handed to its screen in the cash-out
-        data. Each result is taken once: the satellite repeats its last
-        results in every report."""
+        data, for the player who asked. Each result is taken once: the
+        satellite repeats its last results in every report.
+
+        Only the pull that is being waited for puts anything on the
+        screen. One whose player has carded out says nothing to whoever
+        is there next. Nor does one that found the machine empty after
+        waiting: the credits went somewhere else meanwhile (the machine's
+        own CASH OUT button, or they were played), and the player can see
+        that."""
         cid = str(r.get("id") or "")
         if not cid.startswith("copull"):
             return                      # not a pull asked from a screen
         seen = getattr(self, "_cash_out_pulls_seen", None)
         if seen is None:
             seen = self._cash_out_pulls_seen = set()
-            self._cash_out_errors = {}
         if cid in seen:
             return
         seen.add(cid)
@@ -7613,6 +7750,21 @@ class G2SHost:
             seen.clear()
             seen.add(cid)
         outcome = str(r.get("outcome") or "")
+        tries = r.get("tries")
+        tries = tries if isinstance(tries, int) \
+            and not isinstance(tries, bool) else 1
+        ent = self._cash_out_pulls().get(key)
+        waited_for = bool(ent and ent.get("id") == cid)
+        asked = ent.get("acct") if waited_for else None
+        if outcome != "unconfirmed":
+            # an answer. ("unconfirmed" is not one: the transfer was sent
+            # and its end is still to come, as a late result.)
+            self._cash_out_pull_answered(key, r)
+        log.warning("🏦 [sas:%s] cash-out to wallet %s did not happen: %s "
+                    "(%s)", key, cid, outcome or "failed",
+                    str(r.get("detail") or "")[:200])
+        if not waited_for or (outcome == "no_credits" and tries > 1):
+            return
         msg = {
             "no_credits": "This machine has no cashable credits to send "
                           "to your wallet.",
@@ -7620,16 +7772,13 @@ class G2SHost:
                               "yet. Its CASH OUT button still works.",
             "asset_unknown": "This machine is not set up for transfers "
                              "yet. Its CASH OUT button still works.",
+            "lock_failed": "The machine stayed busy, so nothing was sent "
+                           "to your wallet. Try again, or use its CASH "
+                           "OUT button.",
         }.get(outcome, "The machine did not send its credits to your "
                        "wallet just now. Try again, or use its CASH OUT "
                        "button.")
-        log.warning("🏦 [sas:%s] cash-out to wallet %s did not happen: %s "
-                    "(%s)", key, cid, outcome or "failed",
-                    str(r.get("detail") or "")[:160])
-        note = {"ts": time.time(), "msg": msg}
-        for owner in [m for m, sk in self.sas_links.items()
-                      if sk == key] + [key]:
-            self._cash_out_errors[owner] = note
+        self._cash_out_note(key, asked, msg)
 
     def _settle_aft_cashouts(self, command_results, key):
         """Credit-on-confirm the hub-pinned wallet for a button-driven SAS
@@ -7680,6 +7829,10 @@ class G2SHost:
                 if not r.get("ok"):
                     self._cash_out_pull_failed(key, r)
                 continue
+            # A pull asked for from the screen: who asked, taken before
+            # the record of it is closed (this result is its answer).
+            asker = self._cash_out_pull_asker(key, r)
+            self._cash_out_pull_answered(key, r)
             txn = r.get("txnId")
             cents = r.get("amountCents")
             if not isinstance(txn, str) or not txn:
@@ -7743,7 +7896,13 @@ class G2SHost:
             wire_acct = r.get("accountId")
             wire_acct = wire_acct.strip()[:64] if isinstance(wire_acct, str) \
                 and wire_acct.strip() else ""
-            acct_id = self._sas_cashout_pin(key)
+            # ...except that a pull the hub itself sent for a player's
+            # tap goes to THAT player (the hub's own note of who asked,
+            # matched on its own command id). The machine's pin can have
+            # moved in the up-to-fifteen seconds the satellite kept
+            # trying: the player switched the button's routing off, or
+            # carded out while the last try was under way.
+            acct_id = self._sas_cashout_pin(key, asker=asker)
             note = f"AFT cash-out from {key} to wallet ({r.get('outcome')})"
             acct = err = None
             if acct_id:
@@ -7767,11 +7926,15 @@ class G2SHost:
                 self._disarm_sas_leg(key)
             else:
                 bal = int((acct or {}).get("cashableMillicents", 0))
+                tries = r.get("tries")
                 log.info("💵 [sas:%s] AFT CASH-OUT CONFIRMED — credited %s "
-                         "$%.2f%s (txn %s); cashable now $%.2f",
+                         "$%.2f%s (txn %s%s); cashable now $%.2f",
                          key, acct_id, cents / 100,
                          f" and ${rc / 100:.2f} restricted" if rc else "",
-                         txn, bal / 100000)
+                         txn,
+                         f", on try {tries} after {r.get('waitedSec')} s"
+                         if isinstance(tries, int) and tries > 1 else "",
+                         bal / 100000)
                 if acct_id == "house":
                     # only a tournament sweep ever pins the House — this
                     # settle IS that sweep landing, so consume its pins:
@@ -8653,6 +8816,10 @@ class G2SHost:
         with self._glass_pin_lock:
             had_pin = self._glass_cash_out_pin.pop(egm_id, None)
             self._cash_out_armed().pop(egm_id, None)
+        # A cash-out to wallet they asked for that the satellite is still
+        # trying: it is told to drop it (below), so nothing of the NEXT
+        # player's is pulled to this one's wallet.
+        pull_left = self._cash_out_pull_left(egm_id)
         # DISARM the cash-out routing so an un-carded machine reverts to its
         # DEFAULT (a ticket): pair the pin pop with a protocol-correct disarm
         # (AJ — keep it simple). Fired only when a pin was actually armed (never
@@ -8660,18 +8827,20 @@ class G2SHost:
         # Runs OUTSIDE _glass_pin_lock so the SAS enqueue / WAT _enqueue can take
         # their own locks (the no-nesting rule), like the setIdValidation
         # enqueue below.
-        if had_pin is not None:
+        if had_pin is not None or pull_left:
             leg = self.sas_links.get(egm_id)
             if leg:
                 # SAS leg: the disarm is a pure HUB-SIDE flag clear — the
                 # satellite drops cashout_state["armed"]/pending and writes
                 # NOTHING to the machine (an unanswered 0x6A already tickets).
+                # dropPull: and it stops trying a pull that is waiting.
                 with self.sas_lock:
                     entry = self.sas_machines.get(leg) or {}
                 smib = entry.get("smibId") or str(leg).split("/", 1)[0]
                 self.sas_enqueue_command(smib, {
                     "id": f"codis{next(self._fob_seq)}-{int(time.time())}",
-                    "type": "aft_set_host_cashout", "enable": False})
+                    "type": "aft_set_host_cashout", "enable": False,
+                    "dropPull": True})
             else:
                 with self.assoc_lock:
                     a = self.associations.get(egm_id)
@@ -8814,7 +8983,8 @@ class G2SHost:
                     self.sas_enqueue_command(smib, {
                         "id": f"codis{next(self._fob_seq)}-"
                               f"{int(time.time())}",
-                        "type": "aft_set_host_cashout", "enable": False})
+                        "type": "aft_set_host_cashout", "enable": False,
+                        "dropPull": True})
                 else:
                     with self.assoc_lock:
                         a = self.associations.get(egm_id)
@@ -10545,8 +10715,20 @@ class G2SHost:
         # prints a ticket. The hub's note alone is not enough either: a
         # machine that did not take the arm prints a ticket too.
         # a cash-out to wallet that was asked for here and did not happen
+        # ...and one that was asked for and is still on its way: the
+        # satellite is trying the machine again every second
+        # (cashOutPending). Read first: a pull that has gone unanswered
+        # too long becomes a note here.
+        try:
+            leg = self.linked_leg(egm_id)
+            ent = self._cash_out_pull_waiting(leg) if leg else None
+            if ent is not None and ent.get("acct") == aid:
+                out["cashOutPending"] = True
+        except Exception:  # noqa: BLE001 — a fault reads as not pending
+            pass
         note = (getattr(self, "_cash_out_errors", None) or {}).get(egm_id)
-        if note and time.time() - note["ts"] <= self.CASH_OUT_ERROR_SEC:
+        if note and time.time() - note["ts"] <= self.CASH_OUT_ERROR_SEC \
+                and note.get("acct") in (None, aid):
             out["cashOutError"] = note["msg"]
         try:
             if (getattr(self, "sas_links", None) or {}).get(egm_id):
@@ -11058,9 +11240,13 @@ class G2SHost:
         inverse of walletFund. Pins the carded account, then enqueues an
         aft_cashout_pull to the satellite, which does a LOCK-FIRST EGM_TO_HOST
         pull and reports an 'aft_cashout' completion; the hub credits the
-        PINNED wallet on the CONFIRMED amount (_settle_aft_cashouts), never the
-        wire's echoed account. Gated on the machine's 0x74 "transfer from
-        gaming machine OK" bit (sas_from_egm_ready); the machine's host
+        wallet of the player who asked on the CONFIRMED amount
+        (_settle_aft_cashouts), never the wire's echoed account. Refused
+        only when the SAS side is not reporting. A machine that cannot
+        send its credits at that moment (mid-game, just out of a handpay)
+        is tried again by the satellite every second for
+        CASH_OUT_RETRY_SEC, with nothing held meanwhile; a second tap in
+        that time sends nothing more (_cash_out_pulls). The machine's host
         cashout setting does not come into a pull.
         AVP/plain-G2S cabinets are NOT host-control here (they keep the WAT
         arm+button via cashOutToWallet) — this refuses on them. The credit is
@@ -11096,14 +11282,41 @@ class G2SHost:
         # Pin the destination FIRST (TOCTOU-guarded) so the pull never fires
         # without a wallet home; then enqueue. A card switch that superseded
         # this token no-ops here (the departed player is never credited).
+        cid = f"copull{next(self._fob_seq)}-{int(time.time())}"
         with self._glass_pin_lock:
             if expect_tok is not None and \
                     not self.glass_sessions.still_live(egm_id, expect_tok):
                 return 409, {"ok": False, "egmId": egm_id, "path": "sas",
                              "error": "session superseded — re-tap your card"}
             self._glass_cash_out_pin[egm_id] = account_id
-        cmd = {"id": f"copull{next(self._fob_seq)}-{int(time.time())}",
-               "type": "aft_cashout_pull", "accountId": account_id}
+            # One pull at a time per machine. While the satellite is still
+            # trying the last one (up to CASH_OUT_RETRY_SEC), a second tap
+            # sends nothing more: that pull is the one that will bring the
+            # credits, and it is this player's now.
+            waiting = self._cash_out_pull_waiting(leg)
+            if waiting is not None:
+                waiting["acct"], waiting["egmId"] = account_id, egm_id
+            else:
+                self._cash_out_pulls()[leg] = {
+                    "id": cid, "acct": account_id, "egmId": egm_id,
+                    "ts": time.time()}
+        if waiting is not None:
+            return 200, {"ok": True, "path": "sas", "egmId": egm_id,
+                         "pending": True, "waiting": True,
+                         "account": account_id,
+                         "note": "already on its way — your balance "
+                                 "updates when the machine sends it"}
+        # the last one's outcome is old news once a new one is asked for
+        for owner in [m for m, sk in self.sas_links.items()
+                      if sk == leg] + [leg]:
+            (getattr(self, "_cash_out_errors", None) or {}).pop(owner, None)
+        # retrySec: a machine that cannot send its credits at this moment
+        # (mid-game, just out of a handpay) is tried again by the
+        # satellite every second for this long, with nothing held
+        # meanwhile; the answer comes when it works or the time is up.
+        cmd = {"id": cid, "type": "aft_cashout_pull",
+               "accountId": account_id,
+               "retrySec": self.CASH_OUT_RETRY_SEC}
         reply = self.sas_enqueue_command(smib, cmd)
         if not reply.get("ok"):
             # the pull won't fire — undo the pin we optimistically set (only if
@@ -11111,6 +11324,8 @@ class G2SHost:
             with self._glass_pin_lock:
                 if self._glass_cash_out_pin.get(egm_id) == account_id:
                     self._glass_cash_out_pin.pop(egm_id, None)
+                if (self._cash_out_pulls().get(leg) or {}).get("id") == cid:
+                    self._cash_out_pulls().pop(leg, None)
             return 400, dict(reply, egmId=egm_id, path="sas")
         log.info("🏦 [glass:%s] cashOutNow (host-pull) enqueued to SAS leg %s "
                  "(acct %s)", egm_id, smib, account_id)

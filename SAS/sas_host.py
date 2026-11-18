@@ -655,6 +655,146 @@ def _restricted_moved(res) -> int:
 
 
 # ---------------------------------------------------------------------------
+# A cash-out pull the machine cannot make just yet
+# ---------------------------------------------------------------------------
+PULL_RETRY_GAP_SEC = 1.0        # from the end of one try to the next
+PULL_RETRY_MAX_SEC = 30.0       # the longest a command may ask us to keep on
+
+#: What one try can end in that says "not now" and nothing more: nothing
+#: was sent to the machine.
+PULL_RETRY_OUTCOMES = frozenset({"lock_failed", "timeout",
+                                 "unresolved_earlier"})
+#: ...and a transfer the machine refused with status 87, "unable to perform
+#: transfers at this time (door open, tilt, disabled, cashout in progress,
+#: etc.)" (SAS 6.02 Table 8.3e): every refusal is a final "transfer
+#: failed", so nothing moved. From the document; no machine on this floor
+#: has answered a pull that way yet.
+PULL_RETRY_STATUSES = frozenset({0x87})
+
+
+class PullRetry:
+    """The cash-out pull (hub command aft_cashout_pull) that is waiting to
+    be tried again.
+
+    A pull is the hub asking the machine for all its credits, for a player
+    who tapped CASH OUT TO WALLET on the screen. A machine in the middle of
+    a game, or just coming out of a handpay, does not lock for a transfer
+    at that moment, and until v0.3.28 that was the whole answer: "game lock
+    never confirmed", about a second after the tap. The owner, 2026-11-18:
+    "why doesnt the hub hold it for up to 15 seconds and retry when
+    available", then "im not sure i want it as a hold... but a retry
+    queue.. it shouldnt be paused".
+
+    So a pull whose command carries retrySec is KEPT when a try ends in
+    "not now", and tried again PULL_RETRY_GAP_SEC later, until it works,
+    the machine gives a real answer, or retrySec has passed since the first
+    try began. Between tries nothing is held: the poll loop runs as usual
+    and the machine is not locked (each try asks for the lock, waits about
+    a second for it and cancels the request, exactly as a single try
+    always has; v0.3.29). The hub hears nothing until the end, and then
+    hears ONE result under the command's id, with `tries` and `waitedSec`
+    added when there was more than one try.
+
+    One pull waits at a time. A different pull arriving takes its place,
+    and a disarm that says dropPull (the player carded out) drops it.
+    Either way the pull that was waiting is answered at once as cancelled,
+    so nothing lands later for a player who has gone. A command without
+    retrySec is tried once, as before.
+
+    Poll thread only."""
+
+    def __init__(self, gap=None, clock=time.monotonic):
+        self.gap = PULL_RETRY_GAP_SEC if gap is None else gap
+        self.clock = clock
+        self._cur = None    # {"cmd", "began", "tries", "nextAt", "last"}
+
+    @staticmethod
+    def window(cmd) -> float:
+        """How long this command asks to be kept trying, in seconds."""
+        sec = cmd.get("retrySec")
+        if isinstance(sec, bool) or not isinstance(sec, (int, float)) \
+                or not sec > 0:
+            return 0.0
+        return float(min(sec, PULL_RETRY_MAX_SEC))
+
+    @staticmethod
+    def not_now(result) -> bool:
+        """Did this try end in "not now"? (Anything else is an answer.)"""
+        if result.get("ok"):
+            return False
+        if result.get("outcome") in PULL_RETRY_OUTCOMES:
+            return True
+        return (result.get("outcome") == "refused"
+                and result.get("transferStatus") in PULL_RETRY_STATUSES)
+
+    @property
+    def waiting(self):
+        """The command waiting for its next try, or None."""
+        cur = self._cur
+        return cur["cmd"] if cur and cur["nextAt"] is not None else None
+
+    def start(self, cmd):
+        """Call before a try of `cmd`. When a DIFFERENT pull was waiting,
+        `cmd` takes its place and the result to report for the one that
+        was waiting comes back; otherwise None."""
+        cur = self._cur
+        if cur is not None and cur["cmd"].get("id") == cmd.get("id"):
+            cur["tries"] += 1
+            cur["nextAt"] = None
+            return None
+        replaced = self.drop("a newer cash-out request took its place")
+        self._cur = {"cmd": cmd, "began": self.clock(), "tries": 1,
+                     "nextAt": None, "last": None}
+        return replaced
+
+    def finish(self, cmd, result):
+        """Call with the result of a try of `cmd`. Returns the result to
+        report, or None: the pull is kept and will be tried again."""
+        cur = self._cur
+        if cur is None or cur["cmd"].get("id") != cmd.get("id"):
+            return result
+        now = self.clock()
+        if self.not_now(result) \
+                and now + self.gap <= cur["began"] + self.window(cmd):
+            cur["last"] = result
+            cur["nextAt"] = now + self.gap
+            return None
+        self._cur = None
+        if cur["tries"] > 1:
+            waited = now - cur["began"]
+            result = dict(
+                result, tries=cur["tries"], waitedSec=round(waited, 1),
+                detail=f"{result.get('detail') or result.get('outcome')} "
+                       f"(try {cur['tries']}, {waited:.0f} s after it was "
+                       "asked)")
+        return result
+
+    def due(self):
+        """The waiting command once its next try is due, else None."""
+        cur = self._cur
+        if cur is None or cur["nextAt"] is None \
+                or self.clock() < cur["nextAt"]:
+            return None
+        return cur["cmd"]
+
+    def drop(self, why):
+        """Stop waiting. Returns the result to report for the pull that
+        was waiting (cancelled: nothing was sent), or None when none was."""
+        cur = self._cur
+        if cur is None or cur["nextAt"] is None:
+            return None
+        self._cur = None
+        last = cur["last"] or {}
+        return dict(
+            last, ok=False, outcome="cancelled", amountCents=0,
+            restrictedCents=0, result="cancelled", tries=cur["tries"],
+            waitedSec=round(self.clock() - cur["began"], 1),
+            when=time.strftime("%Y-%m-%dT%H:%M:%S"),
+            detail=f"not sent: {why} (the machine's last answer: "
+                   f"{last.get('detail') or last.get('outcome') or '-'})")
+
+
+# ---------------------------------------------------------------------------
 # The machine's clock (SAS 6.02 §7.17 long poll 7F, §7.18 long poll 7E)
 # ---------------------------------------------------------------------------
 CLOCK_CHECK_SEC = 86400         # once a day, and whenever the machine comes up
@@ -2185,6 +2325,9 @@ def main():
     # between polls (never a re-entrant transact inside the exception cb).
     cashout_state = {"armed": False, "pending": False, "accountId": None,
                      "code": CASHOUT_REQUEST}
+    # The cash-out pull waiting to be tried again (see PullRetry). Poll
+    # thread only, like cashout_state.
+    pull_retry = PullRetry()
 
     def on_cashout_request(addr, code):
         # Machine raised an AFT host-cashout request off the general poll:
@@ -2601,6 +2744,19 @@ def main():
                                    cmd_id, reg_detail)
                     return result
                 ls = aft_host.read_lock_status()
+                if ls is None:
+                    # No answer is not "no credits" (which is what this
+                    # said until v0.3.28: one lost frame told the player
+                    # the machine was empty). Nothing was sent.
+                    result["ok"] = False
+                    result["outcome"] = "timeout"
+                    result["amountCents"] = 0
+                    result["detail"] = ("no answer from the machine to the "
+                                        "status read (0x74); nothing sent")
+                    result["result"] = "timeout"
+                    logger.info("🏦 hub command {}: host-pull — no answer "
+                                "to the status read", cmd_id)
+                    return result
                 cashable = (ls.current_cashable_cents
                             if ls and ls.current_cashable_cents else 0)
                 # restricted promotional credit comes back too, as
@@ -2659,6 +2815,9 @@ def main():
                 rcredited = _restricted_moved(res)
                 result["ok"] = res.ok
                 result["outcome"] = res.outcome.value
+                if res.final is not None and res.final.status is not None:
+                    # the machine's own answer to the 0x72 (Table 8.3e)
+                    result["transferStatus"] = int(res.final.status)
                 result["txnId"] = res.request.transaction_id   # see the push
                 result["keySent"] = aft_host.key_sent
                 result["amountCents"] = credited
@@ -2691,6 +2850,23 @@ def main():
                 acct = cmd.get("accountId")
                 if isinstance(acct, str) and acct:
                     result["accountId"] = acct[:64]
+                if not enable and cmd.get("dropPull") is True:
+                    # The player who asked is gone (carded out, or their
+                    # account is). A pull still waiting for its next try
+                    # must not land after that: by then the credits on the
+                    # machine can be the next player's. (A player who only
+                    # switches the CASH OUT button's routing off sends no
+                    # dropPull, and keeps their pull.)
+                    dropped = pull_retry.drop(
+                        "the player left before the machine could send "
+                        "its credits")
+                    if dropped is not None:
+                        logger.info("🏦 hub command {}: cash-out pull {} "
+                                    "dropped after {} tries — {}", cmd_id,
+                                    dropped.get("id"), dropped.get("tries"),
+                                    dropped.get("detail"))
+                        if reporter is not None:
+                            reporter.record_result(dropped)
                 ls = None
                 try:
                     # the 0x72 that switches host cashout on or off needs
@@ -3542,7 +3718,42 @@ def main():
                 cmd = reporter.pending_commands.popleft()
             except IndexError:
                 break
-            reporter.record_result(run_hub_command(cmd))
+            res = (run_pull(cmd) if cmd.get("type") == "aft_cashout_pull"
+                   else run_hub_command(cmd))
+            if res is not None:         # None: a pull kept to try again
+                reporter.record_result(res)
+
+    def run_pull(cmd):
+        """One try of a cash-out pull. Returns its result, or None when
+        the machine could not make it just now and the command asked to be
+        kept trying (PullRetry); the result is then reported by a later
+        try."""
+        replaced = pull_retry.start(cmd)
+        if replaced is not None:
+            logger.info("🏦 cash-out pull {} gave way to {} — {}",
+                        replaced.get("id"), cmd.get("id"),
+                        replaced.get("detail"))
+            if reporter is not None:
+                reporter.record_result(replaced)
+        tried = run_hub_command(cmd)
+        result = pull_retry.finish(cmd, tried)
+        if result is None:
+            logger.info("🏦 hub command {}: the machine cannot send its "
+                        "credits just now ({}) — trying again in {:.0f} s, "
+                        "for up to {:.0f} s from the first try",
+                        cmd.get("id"), tried.get("outcome"), pull_retry.gap,
+                        pull_retry.window(cmd))
+        return result
+
+    def retry_pull_if_due():
+        """Poll thread, BETWEEN polls: the next try of a waiting pull.
+        Never raises (run_hub_command does not)."""
+        cmd = pull_retry.due()
+        if cmd is None:
+            return
+        res = run_pull(cmd)
+        if res is not None and reporter is not None:
+            reporter.record_result(res)
 
     def handle_cashout_if_pending():
         """Answer a machine-initiated host-cashout request (exception 0x6A
@@ -3612,6 +3823,7 @@ def main():
         while not stop["flag"] and not sas_enabled.wait(0.2):
             parked = True
             drain_hub_commands()
+            retry_pull_if_due()         # ends it: "SAS is disabled"
             heartbeat_if_due(time.monotonic())
         if stop["flag"]:
             return True
@@ -3658,6 +3870,12 @@ def main():
             cashout_state["pending"] = False
             logger.info("🏦 dropped a stale host-cashout request (machine went "
                         "offline before it could be answered)")
+        # A cash-out pull the machine could not make a second ago: its next
+        # try. After the machine's own cash-out request above, so a press
+        # of its CASH OUT button is answered first. Not gated on the link:
+        # with the machine not answering, the try ends the wait by saying
+        # so.
+        retry_pull_if_due()
         # AFT status cache (poll thread = the only transport toucher). The
         # reporter thread only READS stats["aft"] (single-writer/single-reader,
         # lock-free, like stats["last_meters"]). Throttled to AFT_STATUS_SEC

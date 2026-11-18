@@ -1275,8 +1275,16 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   // long as the hub sends them (v0.3.28; the tap itself only ever
   // answered "pending").
   var coPullMsg = '';
+  // ...and one that was asked for and is still on its way: a machine that
+  // cannot send its credits at that moment (mid-game) is tried again every
+  // second for up to fifteen. The hub says so (cashOutPending) until it has
+  // an answer; meanwhile the button rests and the line under it says what
+  // is happening.
+  var coPending = false;
+  var CO_PENDING_MSG = 'Sending to your wallet as soon as the machine is ready.';
   function renderCashout(d) {
     coPullMsg = d.cashOutError ? String(d.cashOutError) : '';
+    coPending = (d.cashOutPending === true);
     coMachineMc = (d.machineCreditsMc === undefined || d.machineCreditsMc === null)
       ? 0 : d.machineCreditsMc;
     coWalletMc = (d.walletMc === undefined || d.walletMc === null)
@@ -1310,10 +1318,11 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   function setToggleFace() {
     // HOST-CONTROL cash-out: a one-shot action button (not an arm toggle) —
     // tap it and the hub pulls the machine's credits to your wallet now.
-    var canCashOut = coHasWallet && coMachineMc > 0;
+    var canCashOut = coHasWallet && coMachineMc > 0 && !coPending;
     setText('co-toggle', 'CASH OUT TO WALLET');
     $('co-toggle').className = 'nb' + (canCashOut ? ' nb-gold' : ' nb-off');
-    setText('co-toggle-hint', !coHasWallet ? '' : coPullMsg ? coPullMsg
+    setText('co-toggle-hint', !coHasWallet ? ''
+      : coPending ? CO_PENDING_MSG : coPullMsg ? coPullMsg
       : (coMachineMc > 0
          ? 'Sends the ' + fmtMc(coMachineMc) + ' on this machine to your wallet now.'
          : 'No credits on this machine to cash out.'));
@@ -1347,6 +1356,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   //      "credits". Reuses walletFund + cashOutToWallet verbatim. -----------
   function renderWallet(d) {
     coPullMsg = d.cashOutError ? String(d.cashOutError) : '';
+    coPending = (d.cashOutPending === true);
     coMachineMc = (d.machineCreditsMc === undefined || d.machineCreditsMc === null)
       ? 0 : d.machineCreditsMc;
     coWalletMc = (d.walletMc === undefined || d.walletMc === null)
@@ -1425,10 +1435,11 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   function setWalletToggleFace() {
     // HOST-CONTROL cash-out: a one-shot action button — tap sends the machine's
     // credits straight to your wallet now (no walking to the CASH OUT button).
-    var canCashOut = coHasWallet && coMachineMc > 0;
+    var canCashOut = coHasWallet && coMachineMc > 0 && !coPending;
     setText('wl-toggle', 'CASH OUT TO WALLET');
     $('wl-toggle').className = 'nb' + (canCashOut ? ' nb-gold' : ' nb-off');
-    setText('wl-toggle-hint', !coHasWallet ? '' : coPullMsg ? coPullMsg
+    setText('wl-toggle-hint', !coHasWallet ? ''
+      : coPending ? CO_PENDING_MSG : coPullMsg ? coPullMsg
       : (coMachineMc > 0
          ? 'Sends the ' + fmtMc(coMachineMc) + ' on this machine to your wallet now.'
          : 'No credits on this machine to cash out.'));
@@ -1713,6 +1724,9 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
       confirmBusy = false;
       if (status === 200 && data && data.ok !== false) {
         pendingConfirm = null;
+        // a cash-out to wallet is on its way from this tap; the next poll
+        // carries the hub's own word on it
+        if (pc.body && pc.body.action === 'cashOutNow') { coPending = true; }
         returnFrom(pc.back);
       } else {
         // money refusal: the hub's own wording VERBATIM when it gave any
@@ -1747,7 +1761,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   $('co-toggle').onclick = function () {
     // HOST-CONTROL cash-out: pull the machine's credits to the wallet NOW via
     // a money-confirm (cashOutNow). No arm/wait, no physical button.
-    if (!coHasWallet || coMachineMc <= 0) { return; }
+    if (!coHasWallet || coMachineMc <= 0 || coPending) { return; }
     askConfirm('CASH OUT TO WALLET?',
       'Sends the ' + fmtMc(coMachineMc) + ' on this machine to your wallet.',
       { action: 'cashOutNow' }, 'cashout');
@@ -1814,7 +1828,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     // a money-confirm (cashOutNow). The hub owns any refusal wording (a machine
     // not reporting from-EGM answers "cash-out to wallet isn't set up …") and
     // doConfirm surfaces it verbatim.
-    if (!coHasWallet || coMachineMc <= 0) { return; }
+    if (!coHasWallet || coMachineMc <= 0 || coPending) { return; }
     askConfirm('CASH OUT TO WALLET?',
       'Sends the ' + fmtMc(coMachineMc) + ' on this machine to your wallet.',
       { action: 'cashOutNow' }, 'wallet');

@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.3.29
+CASH OUT TO WALLET on a machine's screen waits for a machine that is
+busy. A machine in the middle of a game, or just coming out of a handpay,
+does not lock for a transfer at that moment. The pull was tried once and
+failed about a second after the tap.
+- **The satellite keeps the pull and tries again every second, for up to
+  fifteen seconds.** Nothing is held meanwhile: the machine is not locked
+  between tries and the satellite goes on polling it as usual. The
+  credits move on the first try the machine accepts.
+- **The screen says it is waiting** ("Sending to your wallet as soon as
+  the machine is ready.") and the button rests until there is an answer.
+  A second tap in that time sends nothing more.
+- A machine that stays busy for the whole fifteen seconds: the player is
+  told nothing was sent.
+- **A player who cards out while it is waiting takes the request with
+  them.** The satellite stops trying, so nothing of the next player's is
+  pulled. A try already under way at that moment is credited to the
+  player who asked.
+- The credits of a pull asked for from the screen go to the player who
+  asked, whatever the machine's own CASH OUT button is set to by then.
+- A status read the machine did not answer is no longer reported as "no
+  cashable credits".
+- Tournament sweeps are tried once, as before.
+
+Needs the satellite's own update, which the hub sends after its own.
+Checked against a stand-in machine that will not lock: no machine on
+the test floor has turned a pull down for being busy (ten pulls on a
+Bluebird 2, all taken on the first try).
+
 ## v0.3.28
 A handpay on a SAS machine has an amount, and is booked when it is paid
 by hand. Until now a SAS machine told the hub only that a handpay was
