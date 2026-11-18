@@ -4540,6 +4540,191 @@ def batch_7_handpays():
           list(a.handpays_pending))
 
 
+# ---------------------------------------------------------------------------
+# The linked-machine rule (v0.3.27; the owner's, not an audit item)
+
+def linked_machines_use_sas():
+    print("— the owner, 2026-11-18: \"machines with SAS companions assigned "
+          "use SAS for all commands instead of G2S. we can use info from "
+          "G2S or whatever\"")
+    LEG = "smib-x/1"
+
+    def linked(name, denom=1, link=True):
+        host = make_host()
+        egm = online(joined(host, name))
+        with host.sas_lock:
+            host.sas_machines[LEG] = {"smibId": "smib-x", "denomCents": denom,
+                                      "online": True,
+                                      "receivedAt": time.time()}
+        if link:
+            host.sas_links[egm.egm_id] = LEG
+        return host, egm
+
+    def over_sas(host):
+        return [dict(c) for c in host.sas_commands.get("smib-x", ())]
+
+    def g2s_since(host, mark):
+        return names(sent_since(host, mark))
+
+    host, egm = linked("BTB_linked")
+    a = egm.assoc
+    drain(host, a)
+
+    print("— nothing is sent over G2S by the hub itself")
+    host.ticket_header = lambda: {"propName": "The Room", "line1": None,
+                                  "line2": None, "titleCash": None,
+                                  "expireDays": 180, "rev": 3}
+    mark = len(host.sent)
+    host._maybe_arm_remote_handpay_on_join(a)
+    host._maybe_push_ticket_header_on_join(a)
+    drain(host, a)
+    check("at a sign-on: no read ahead of an option change for the handpay "
+          "reset or the ticket text and expiry (four option changes went "
+          "to the Bluebird over G2S in one afternoon; the SAS side had "
+          "already set its ticket data)", g2s_since(host, mark) == [],
+          g2s_since(host, mark))
+    mark = len(host.sent)
+    host.enqueue_set_id_validation(a, "1", True, id_number="77")
+    host.enqueue_set_id_validation(a, "1", False)
+    drain(host, a)
+    check("at a card-in and a card-out: no card push",
+          g2s_since(host, mark) == [], g2s_since(host, mark))
+    mark = len(host.sent)
+    host._glass_recovery_push(a)
+    window = host.glass_target_device(a)    # takes the machine's lock
+    with a.lock:
+        a.glass_push[window] = {"stage": "shown", "uri": gh.GLASS_PAGE}
+    host._glass_follow(a, True)
+    drain(host, a)
+    check("and no glass window push or show (the Bluebird refused the "
+          "push at every card-in)", g2s_since(host, mark) == [],
+          g2s_since(host, mark))
+    mark = len(host.sent)
+    hdr, exp = host.push_ticket_header_g2s(), host.push_ticket_expiration_g2s()
+    drain(host, a)
+    check("a ticket header or expiry saved in Settings is not pushed to it "
+          "over G2S, and the answer says SAS has it",
+          g2s_since(host, mark) == []
+          and [v.get("via") for v in hdr + exp] == ["sas", "sas"],
+          (g2s_since(host, mark), hdr, exp))
+
+    print("— a command SAS can carry goes over SAS, whatever asked for it")
+    for action in ("resetHandpay", "clearHandpay"):
+        before = len(over_sas(host))
+        mark = len(host.sent)
+        code, reply = host.linked_command(action, egm.egm_id, LEG, {})
+        drain(host, a)
+        check(f"{action}: one handpay_reset to the satellite and no "
+              "setRemoteKeyOff to the machine (three paths still keyed "
+              "off over G2S)", code == 200 and reply.get("ok") is True
+              and reply.get("via") == "sas"
+              and [c["type"] for c in over_sas(host)[before:]]
+              == ["handpay_reset"] and g2s_since(host, mark) == [],
+              (reply, over_sas(host)[before:], g2s_since(host, mark)))
+    before = len(over_sas(host))
+    mark = len(host.sent)
+    code, reply = host.linked_command("setCabinetState", egm.egm_id, LEG,
+                                      {"enable": False})
+    drain(host, a)
+    check("a disable asked through setCabinetState is a SAS disable (a "
+          "G2S one left a second lock only G2S could lift)",
+          reply.get("ok") is True
+          and [c["type"] for c in over_sas(host)[before:]] == ["sas_disable"]
+          and g2s_since(host, mark) == [], (reply, g2s_since(host, mark)))
+    before = len(over_sas(host))
+    code, reply = host.linked_command("setCabinetState", egm.egm_id, LEG,
+                                      {"enable": True})
+    drain(host, a)
+    check("an enable is a SAS enable, and nothing over G2S while the "
+          "machine is not G2S-disabled",
+          [c["type"] for c in over_sas(host)[before:]] == ["sas_enable"]
+          and g2s_since(host, mark) == []
+          and "g2sLatchCleared" not in reply, reply)
+    with a.lock:
+        a.cabinet["hostEnabled"] = "false"          # an old G2S disable
+    mark = len(host.sent)
+    code, reply = host.linked_command("setCabinetState", egm.egm_id, LEG,
+                                      {"enable": True})
+    drain(host, a)
+    lifts = asks(sent_since(host, mark), "setCabinetState")
+    check("one left G2S-disabled from before is also enabled over G2S: "
+          "the one G2S command the rule sends, and only to lift",
+          reply.get("g2sLatchCleared") is True and len(lifts) == 1
+          and lifts[0].get("enable") == "true", (reply, lifts))
+    drain(host, a)
+    with a.lock:
+        a.cabinet["hostEnabled"] = "false"
+    with host.sas_lock:
+        host.sas_commands.clear()       # the satellite took what was queued
+    mark = len(host.sent)
+    code, reply = host.linked_command("setCabinetState", egm.egm_id, LEG,
+                                      {"enable": False})
+    drain(host, a)
+    check("a disable never sends that G2S enable",
+          reply.get("ok") is True and g2s_since(host, mark) == []
+          and "g2sLatchCleared" not in reply,
+          (reply, g2s_since(host, mark)))
+
+    host, egm = linked("BTB_linked_bonus", denom=25)
+    a = egm.assoc
+    drain(host, a)
+    mark = len(host.sent)
+    code, reply = host.linked_command(
+        "bonusAward", egm.egm_id, LEG, {"amountMillicents": 500_000})
+    drain(host, a)
+    sent = over_sas(host)
+    check("a $5.00 bonus on a 25-cent machine is a SAS bonus of 20 "
+          "credits, and no setBonusAward",
+          reply.get("ok") is True and reply.get("credits") == 20
+          and [(c["type"], c.get("credits")) for c in sent]
+          == [("legacy_bonus", 20)] and g2s_since(host, mark) == [],
+          (reply, sent))
+    code, reply = host.linked_command(
+        "bonusAward", egm.egm_id, LEG, {"amountMillicents": 510_000})
+    check("an amount that is not whole credits is refused, not rounded",
+          code == 400 and reply.get("ok") is False
+          and len(over_sas(host)) == 1, reply)
+    with host.sas_lock:
+        host.sas_machines[LEG]["denomCents"] = None
+    code, reply = host.linked_command(
+        "bonusAward", egm.egm_id, LEG, {"amountMillicents": 500_000})
+    check("and so is any bonus while the SAS side has not given its "
+          "denomination", reply.get("ok") is False
+          and len(over_sas(host)) == 1, reply)
+
+    print("— a G2S command on a subject SAS owns there is refused; what "
+          "only G2S can do stays")
+    host, egm = linked("BTB_linked_refused")
+    refused = {x: host.linked_command(x, egm.egm_id, LEG, {"enable": True})
+               for x in ("setWatCashOut", "watEnable", "watDisable",
+                         "setVoucherState", "setDateTime")}
+    check("cash-out routing, the transfer device, the ticket device and "
+          "the clock are refused with what does the job",
+          all(code == 409 and r.get("ok") is False and "SAS" in r["error"]
+              for code, r in refused.values()) and over_sas(host) == [],
+          refused)
+    check("a reboot, an option change, the Games tab's switches and every "
+          "read are left to G2S",
+          all(host.linked_command(x, egm.egm_id, LEG, {}) is None
+              for x in ("rebootEgmScript", "resetProcessor", "setOption",
+                        "setGamePlayState", "denomApply",
+                        "setNoteAcceptorState", "getCabinetStatus",
+                        "getMeterInfo", "refreshGameStatus")))
+
+    print("— a machine with no SAS link is not touched by any of it")
+    host, egm = linked("BTB_not_linked", link=False)
+    a = egm.assoc
+    drain(host, a)
+    mark = len(host.sent)
+    host.enqueue_set_id_validation(a, "1", True, id_number="77")
+    host._maybe_arm_remote_handpay_on_join(a)
+    drain(host, a)
+    check("its card push and its handpay arm go out over G2S as before",
+          g2s_since(host, mark) == ["setIdValidation", "getOptionList"]
+          and host.linked_leg(a) is None and over_sas(host) == [],
+          g2s_since(host, mark))
+
+
 def main():
     logging.basicConfig(level=logging.CRITICAL + 1)
     logging.getLogger("g2s_host").setLevel(logging.CRITICAL + 1)
@@ -4596,6 +4781,7 @@ def main():
     batch_7_card_reader()
     batch_7_transfers()
     batch_7_handpays()
+    linked_machines_use_sas()
     print("=" * 50)
     print(f"RESULT: {_p} passed, {_f} failed")
     return 1 if _f else 0

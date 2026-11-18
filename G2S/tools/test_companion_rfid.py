@@ -1314,9 +1314,11 @@ def main():
           snap["auto"] is True and snap["assigned"] is True and
           snap["bindings"]["g2sEgmId"] == EGM and
           snap["bindings"]["sasSmib"] == "smib-bb2")
-    check("the tap cards a player in on the auto-bound machine",
-          len(enge.sent) == 1 and
-          enge.sent[0][1].startswith("setIdValidation(present=True"))
+    # v0.3.27, the linked-machine rule: the session is the hub's, and a
+    # machine with a SAS link is sent no card push over G2S.
+    check("the tap cards a player in on the auto-bound machine, with no "
+          "card push over G2S (it has a SAS link)",
+          EGM in enge.card_sessions and enge.sent == [])
 
     # A reader that REPORTS its own binding (a legacy --g2s-egm flag) is honored
     # as-is even if it shares an IP with a SAS leg — the reported flag wins over
