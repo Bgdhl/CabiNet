@@ -25,6 +25,10 @@ pending: a machine with no G2S side showed no amount and booked nothing.
   which reports no record, the G2S key-off books it as before.
 - A handpay too large for the machine's credit meter says so on the
   banner.
+- **The admin handpay view on the machine's own screen lists a SAS
+  machine's handpay from its SAS record**, and its CLEAR goes over SAS
+  whether or not the machine has a G2S side. It read the G2S record
+  only, so a SAS-only machine listed nothing there.
 - A bonus sent to a linked machine is sized by the same denomination
   as its credit meter (a cent while none is set for it).
 Needs the satellite's own update, which the hub sends after its own.

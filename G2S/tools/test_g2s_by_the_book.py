@@ -4866,6 +4866,44 @@ def sas_handpays_have_an_amount_and_are_booked():
           and entry["lastHandpay"] is None
           and entry["handpayRecords"] is False, entry["pendingHandpay"])
 
+    print("— the admin handpay view on the machine's own screen (the "
+          "owner, at the Bluebird: \"the admin menu on the smib might be "
+          "using g2s because it listed the g2s jackpot info\")")
+    host = make_host()
+    report(host, pending=WIN)
+    view = host._glass_data_handpay("smib-x/1", None)
+    check("a SAS machine with no G2S side lists its handpay, with the "
+          "amount from its own record, and can clear it (it listed "
+          "nothing: the view read the G2S record only)",
+          view["pending"] == [{"amount": "$10,750.00", "type": "Game win",
+                               "when": WIN["since"]}]
+          and view["canClear"] is True and view.get("via") == "sas", view)
+    egm = online(joined(host, "BTB_hp_view"))
+    host.sas_links[egm.egm_id] = "smib-x/1"
+    egm.handpay_request(request=999_000)        # what G2S says: $9.99
+    view = host._glass_data_handpay(egm.egm_id, egm.assoc)
+    check("a machine with both sides is listed from the SAS record too, "
+          "once, not from the G2S one",
+          [p["amount"] for p in view["pending"]] == ["$10,750.00"], view)
+    report(host, pending={"since": WIN["since"], "code": "0x51"},
+           old_satellite=True)
+    view = host._glass_data_handpay(egm.egm_id, egm.assoc)
+    check("with a satellite that reports no amount, the G2S record's is "
+          "shown", [p["amount"] for p in view["pending"]] == ["$9.99"],
+          view)
+    report(host)
+    view = host._glass_data_handpay(egm.egm_id, egm.assoc)
+    check("nothing pending on the SAS side: nothing listed, nothing to "
+          "clear (the G2S record does not decide it)",
+          view["pending"] == [] and view["canClear"] is False, view)
+    host2 = make_host()
+    egm2 = online(joined(host2, "BTB_hp_view_g2s"))
+    egm2.handpay_request(request=999_000)
+    view = host2._glass_data_handpay(egm2.egm_id, egm2.assoc)
+    check("a machine with no SAS side is listed from G2S as before",
+          [p["amount"] for p in view["pending"]] == ["$9.99"]
+          and view["canClear"] is True and "via" not in view, view)
+
     print("— what comes off the wire is held to its shape")
     host = make_host()
     start = cash(host, "house")

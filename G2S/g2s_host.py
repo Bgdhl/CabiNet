@@ -10555,10 +10555,58 @@ class G2SHost:
         return {"ok": True, "view": "tickets", "egmId": egm_id,
                 "tickets": tickets[:12]}
 
+    #: what a SAS handpay record's kind reads as in the admin view
+    SAS_HANDPAY_KIND = {"win": "Game win", "topWin": "Top win",
+                        "progressive": "Progressive win",
+                        "cancelledCredits": "Cancelled credits"}
+
     def _glass_data_handpay(self, egm_id, assoc):
         """handpay view: the machine's pending lockups + whether the reset
-        path is available (a pending one, machine onLine). Read from
-        assoc.handpays_pending (the same source the Home tile uses)."""
+        path is available.
+
+        A machine with a SAS side (a SAS link, or a SAS machine with no
+        G2S at all) is listed from its SAS handpay: the amount the machine
+        itself gave in its handpay record, and CLEAR goes over SAS. Until
+        v0.3.28 this view read the G2S record only (the owner, 2026-11-18,
+        at the Bluebird: "the admin menu on the smib might be using g2s
+        because it listed the g2s jackpot info"), so a SAS-only machine's
+        admin view listed nothing. A satellite older than that reports no
+        amount: the G2S record's is shown, when there is one.
+
+        Any other machine is read from assoc.handpays_pending (the same
+        source the Home tile uses)."""
+        leg = self.linked_leg(egm_id)
+        if not leg:
+            with self.sas_lock:
+                leg = egm_id if egm_id in self.sas_machines else None
+        if leg:
+            with self.sas_lock:
+                entry = dict(self.sas_machines.get(leg) or {})
+            hp = entry.get("pendingHandpay")
+            live = entry.get("online") is not False and time.time() \
+                - (entry.get("receivedAt") or 0) <= self.SAS_STALE_SEC
+            pending = []
+            if hp:
+                amount = None
+                if hp.get("amountMc"):
+                    amount = int(hp["amountMc"])
+                elif assoc is not None:         # an older satellite
+                    with assoc.lock:
+                        recs = list(assoc.handpays_pending.values())
+                    if recs:
+                        r = recs[-1]
+                        amount = (int(r.get("pendingCashableAmt") or 0)
+                                  + int(r.get("pendingPromoAmt") or 0)
+                                  + int(r.get("pendingNonCashAmt") or 0))
+                pending.append({
+                    "amount": (f"{money_symbol()}{amount / 100000:,.2f}"
+                               if amount else "Handpay"),
+                    "type": self.SAS_HANDPAY_KIND.get(hp.get("kind"),
+                                                      "Handpay"),
+                    "when": hp.get("since")})
+            return {"ok": True, "view": "handpay", "egmId": egm_id,
+                    "via": "sas", "pending": pending,
+                    "canClear": bool(pending) and live}
         pending, can_clear = [], False
         if assoc is not None:
             try:
@@ -27275,6 +27323,19 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
         if action in GLASS_ADMIN_ACTIONS:
             if not admin:
                 return done(403, {"ok": False, "error": "not authorized"})
+            if action == "clearHandpay":
+                # A machine with a SAS side is reset over SAS (the
+                # linked-machine rule), whether or not it has a G2S side
+                # and whether or not that side is up.
+                _leg = engine.linked_leg(egm_id)
+                if not _leg:
+                    with engine.sas_lock:
+                        _leg = egm_id if egm_id in engine.sas_machines \
+                            else None
+                if _leg:
+                    code, payload = engine.linked_command(
+                        "clearHandpay", egm_id, _leg, req)
+                    return done(code, payload)
             with engine.assoc_lock:
                 assoc = engine.associations.get(egm_id)
             if assoc is None:
@@ -27284,13 +27345,6 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                 # reset the pending lockup to credits — the SAME reset a
                 # reset-fob fires. A specific transactionId keys THAT lockup
                 # off; omitted keys the NEWEST (the one the operator just saw).
-                # A machine with a SAS link is reset over SAS (the
-                # linked-machine rule).
-                _leg = engine.linked_leg(egm_id)
-                if _leg:
-                    code, payload = engine.linked_command(
-                        "clearHandpay", egm_id, _leg, req)
-                    return done(code, payload)
                 txn = req.get("transactionId")
                 if txn is not None:
                     txn = str(txn)
