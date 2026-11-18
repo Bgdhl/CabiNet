@@ -10221,12 +10221,28 @@ class G2SHost:
         and the amount, which a satellite or hub restart does not
         change."""
         rec = entry.get("lastHandpay")
-        if not rec or rec.get("how") != "hand":
+        if not rec or rec.get("how") not in ("hand", "unknown"):
             return
         mc = int(rec.get("amountMc") or 0)
         if mc <= 0 or not rec.get("since"):
             return
         ref = f"hp:sas:{key}:{rec['since']}:{rec.get('amount')}"
+        if rec["how"] == "unknown":
+            # Keyed off at the machine, and neither its jackpot meter nor
+            # its credit meter moved by the win: the satellite cannot say
+            # which key it was. Booking it could put a win in a wallet
+            # that is also on the machine, so it is not booked. Said once.
+            said = getattr(self, "_sas_handpays_unknown", None)
+            if said is None:
+                said = self._sas_handpays_unknown = set()
+            if ref not in said:
+                said.add(ref)
+                log.warning("💰 [sas:%s] a %s handpay was keyed off at the "
+                            "machine and its meters do not say whether it "
+                            "went to the credit meter or was paid by hand "
+                            "— NOT booked. If it was paid by hand, add it "
+                            "to the wallet by hand.", key, denom_dollars(mc))
+            return
         sess = {}
         with self.companion_lock:
             for owner in [m for m, sk in self.sas_links.items()

@@ -141,7 +141,12 @@ class TestHowItEnded:
         latch = lockup(HandpayLatch(denom_cents=lambda: None, settle_sec=0), credits=0,
                        seen="progressive level 4")
         latch.on_exception(RESET)
-        latch.on_credits(1_220_000)          # no denomination: not judged
+        latch.on_credits(1_220_000)          # no denomination to size it by:
+        assert latch.last["how"] == "credit"  # any rise is the win
+        latch = lockup(HandpayLatch(denom_cents=lambda: None, settle_sec=0), credits=0,
+                       seen="progressive level 4")
+        latch.on_exception(RESET)
+        latch.on_credits(0)
         assert latch.last["how"] == "hand"
 
     def test_no_reading_before_the_lockup(self):
@@ -185,6 +190,124 @@ class TestHowItEnded:
         assert latch.last is None
         latch.on_credits(500)
         assert latch.last["how"] == "hand"
+
+
+WIN = 1_075_000
+
+
+def keyed(credits_after, jackpot_after, kind=None, **kw):
+    """A lockup with 500 credits and 7,000 on the jackpot meter, keyed off
+    at the machine, then the two meters as read afterwards."""
+    latch = HandpayLatch(settle_sec=0, **kw)
+    latch.on_jackpot(7_000)
+    lockup(latch, credits=500)
+    if kind:
+        latch.pending["kind"] = kind
+    latch.on_exception(RESET)
+    if credits_after is not None:
+        latch.on_credits(credits_after)
+    if jackpot_after is not None:
+        latch.on_jackpot(jackpot_after)
+    return latch
+
+
+class TestWhichKey:
+    """SAS 6.02 §14.2: "Jackpot handpay resets to the credit meter are
+    accounted for by the gaming machine in the coin out meter, not the
+    jackpot meter." Appendix G: Total Jackpot is "the cumulative sum of
+    all credits paid by an attendant"."""
+
+    def test_the_handpay_key_shows_on_the_jackpot_meter(self):
+        latch = keyed(500, 7_000 + WIN)
+        assert latch.pending is None and latch.last["how"] == "hand"
+
+    def test_the_credits_key_shows_on_the_credit_meter_only(self):
+        latch = keyed(500 + WIN, 7_000)
+        assert latch.last["how"] == "credit"
+
+    def test_neither_meter_moved_is_not_booked_as_anything(self):
+        assert keyed(500, 7_000).last["how"] == "unknown"
+
+    def test_both_moved_is_not_paid_by_hand(self):
+        assert keyed(500 + WIN, 7_000 + WIN).last["how"] == "credit"
+
+    def test_it_waits_for_both_readings(self):
+        latch = keyed(500, None)
+        assert latch.last is None            # the jackpot reading is due
+        latch.on_jackpot(7_000 + WIN)
+        assert latch.last["how"] == "hand"
+        latch = keyed(None, 7_000 + WIN)
+        assert latch.last is None            # and so is the credit one
+        latch.on_credits(500)
+        assert latch.last["how"] == "hand"
+
+    def test_the_order_of_the_readings_does_not_matter(self):
+        latch = HandpayLatch(settle_sec=0)
+        latch.on_jackpot(7_000)
+        lockup(latch, credits=500)
+        latch.on_exception(RESET)
+        latch.on_jackpot(7_000)              # jackpot first, unchanged
+        latch.on_credits(500 + WIN)
+        assert latch.last["how"] == "credit"
+
+    def test_a_jackpot_reading_that_never_comes(self):
+        now = [100.0]
+        latch = keyed(500, None, clock=lambda: now[0])
+        assert latch.last is None
+        now[0] += HandpayLatch.JACKPOT_WAIT_SEC + 0.1
+        latch.on_credits(500)                # judged on the credit meter
+        assert latch.last["how"] == "hand"
+
+    def test_a_machine_that_gives_no_jackpot_meter(self):
+        latch = lockup(HandpayLatch(settle_sec=0), credits=500)
+        latch.on_exception(RESET)
+        latch.on_credits(500)                # nothing to wait for
+        assert latch.last["how"] == "hand"
+
+    def test_a_cash_out_paid_by_hand(self):
+        # cancelled credits do not go on the jackpot meter (Appendix G)
+        latch = keyed(0, 7_000, kind="cancelledCredits")
+        assert latch.last["how"] == "hand"
+
+    def test_readings_from_before_the_wait_is_over_are_not_used(self):
+        now = [100.0]
+        latch = HandpayLatch(clock=lambda: now[0])
+        latch.on_jackpot(7_000)
+        lockup(latch, credits=500)
+        latch.on_exception(RESET)
+        latch.on_credits(500)
+        latch.on_jackpot(7_000)              # the meters have not caught up
+        assert latch.last is None
+        now[0] += HandpayLatch.KEY_OFF_SETTLE_SEC
+        latch.on_credits(500)
+        latch.on_jackpot(7_000 + WIN)
+        assert latch.last["how"] == "hand"
+
+
+    def test_one_key_off_does_not_colour_the_next(self):
+        latch = keyed(500, 7_000 + WIN)                  # handpay key
+        assert latch.last["how"] == "hand"
+        lockup(latch, credits=500)                       # a second win
+        latch.on_exception(RESET)
+        latch.on_credits(500 + WIN)                      # credits key
+        assert latch.last["seq"] == 1                    # jackpot is due
+        latch.on_jackpot(7_000 + WIN)                    # unchanged since
+        assert (latch.last["seq"], latch.last["how"]) == (2, "credit")
+
+
+def test_the_meter_sweep_feeds_the_latch():
+    seen = []
+    latch = HandpayLatch(settle_sec=0)
+    feed = sas_host.feed_handpay_latch(
+        lambda *a: seen.append(a), latch)
+    feed(1, 0x1A, 500)
+    feed(1, 0x0F, {"cancelled_credits": 1, "coin_in": 2, "coin_out": 3,
+                   "total_drop": 4, "jackpot": 7_000, "games_played": 5})
+    feed(1, 0x46, 0)
+    assert len(seen) == 3                    # the ingest still gets all
+    latch.on_exception(PENDING)
+    assert latch.pending["creditsAtLockup"] == 500
+    assert latch.pending["jackpotAtLockup"] == 7_000
 
 
 class TestTheWait:

@@ -9,9 +9,13 @@ pending: a machine with no G2S side showed no amount and booked nothing.
   and reports it with the pending handpay. The Floor's HANDPAY banner
   and the Gameroom Board show the amount on a SAS machine.
 - **How a handpay ended is reported**: put on the credit meter (by the
-  hub's reset, or at the machine, seen as the credit meter rising by
-  the amount), keyed off at the machine and paid by hand, cancelled by
-  the player, or never there.
+  hub's reset or the machine's reset-to-credit key), paid by hand (the
+  handpay key), cancelled by the player, or never there. SAS does not
+  name the key; the machine says it by where it counts the win: a
+  reset to the credit meter is not added to its jackpot meter, a
+  handpay paid by the attendant is. The satellite reads both meters a
+  few seconds after the reset. If neither moved by the win it says so
+  and nothing is booked.
 - **A handpay paid by hand is booked**: to the wallet of whoever is
   carded in at the machine, the House when nobody is. Once, however
   many times it is reported. The same rule a G2S machine's hand-paid

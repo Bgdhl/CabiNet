@@ -4785,6 +4785,12 @@ def sas_handpays_have_an_amount_and_are_booked():
     check("put on the credit meter, cancelled, or never there: nothing "
           "is booked", cash(host, "house") == start,
           cash(host, "house") - start)
+    told = said(lambda: [report(host, last=ended("unknown"))
+                         for _ in range(3)])
+    check("keyed off at the machine with neither meter saying which key: "
+          "not booked, and said once so it can be added by hand",
+          cash(host, "house") == start and told.count("NOT booked") == 1,
+          (cash(host, "house") - start, told))
     entry = report(host, last=ended("hand"))
     check("paid by hand with nobody carded in: the House is credited the "
           "$10,750.00", cash(host, "house") == start + 1_075_000_000

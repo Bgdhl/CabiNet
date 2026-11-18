@@ -307,6 +307,19 @@ def make_on_meter(stats):
     return on_meter
 
 
+def feed_handpay_latch(on_meter, latch):
+    """Wrap main()'s on_meter so the handpay latch also sees the two
+    readings a key-off at the machine is judged on: current credits (long
+    poll 1A) and Total Jackpot (in the 0F meters)."""
+    def fed(addr, meter_code, value):
+        on_meter(addr, meter_code, value)
+        if meter_code == 0x1A:
+            latch.on_credits(value)
+        elif isinstance(value, dict) and "jackpot" in value:
+            latch.on_jackpot(value.get("jackpot"))
+    return fed
+
+
 def parse_handpay_record(data):
     """One handpay record (long poll 1B, SAS 6.02 Table 7.8): progressive
     group, level, amount (5 BCD), partial pay (2 BCD), reset ID, ten unused
@@ -375,14 +388,28 @@ class HandpayLatch:
     # record the machine gives (long poll 1B) is now kept with the latch,
     # and when the handpay ends `last` says how:
     #   "credit"     put on the credit meter: by the hub's reset (A8 with
-    #                the credit-meter method, then 94), or at the machine,
-    #                seen as the credit meter rising by the amount;
-    #   "hand"       keyed off at the machine and not on the credit meter:
-    #                paid by hand. This is the one the hub books;
+    #                the credit-meter method, then 94), or with the
+    #                machine's own reset-to-credit key;
+    #   "hand"       paid by the attendant (the handpay key). This is the
+    #                one the hub books;
+    #   "unknown"    keyed off at the machine and the meters do not say
+    #                which. Not booked;
     #   "cancelled"  the player cancelled the request (exception 55);
     #   "gone"       the machine says it is in no handpay.
-    # A key-off at the machine is settled by the next credit-meter
-    # reading (on_credits), so `last` follows it by one meter sweep.
+    #
+    # WHICH KEY (the owner, 2026-11-18: "im pretty sure the SAS knows it
+    # was keyed to credits too"). SAS has no message naming the key; the
+    # machine says it by where it counts the win: "Jackpot handpay resets
+    # to the credit meter are accounted for by the gaming machine in the
+    # coin out meter, not the jackpot meter" (SAS 6.02 §14.2), and Total
+    # Jackpot is "the cumulative sum of all credits paid by an attendant"
+    # (Appendix G). So a key-off at the machine is "hand" when the
+    # jackpot meter rose by the win, "credit" when the credit meter did.
+    # The owner's Bluebird 2 bears it out: on 2026-11-18 its jackpot
+    # meter read 1,075,000, the one win cleared with the handpay key,
+    # and none of the three reset to credits. A machine that gives no
+    # jackpot meter is judged on the credit meter alone. Both are read
+    # at least KEY_OFF_SETTLE_SEC after the reset.
 
     # A key-off at the machine is judged on a credit-meter reading taken
     # at least this long after the machine said the handpay was reset, so
@@ -405,7 +432,9 @@ class HandpayLatch:
         self._seq = 0
         self._credits = None        # newest 0x1A reading, in credits
         self._resetting = False     # a hub reset is running
-        self._settling = None       # a key-off waiting for a credit reading
+        self._settling = None       # a key-off waiting for the meters
+        self._jackpot = None        # newest Total Jackpot reading
+        self._after = {}            # readings taken since the wait ended
 
     def on_exception(self, code: int) -> None:
         """Feed every dispatched exception code through here (poll thread)."""
@@ -414,7 +443,8 @@ class HandpayLatch:
                 self.pending = {
                     "since": time.strftime("%Y-%m-%dT%H:%M:%S"),
                     "code": f"0x{HANDPAY_PENDING_EXCEPTION:02X}",
-                    "creditsAtLockup": self._credits}
+                    "creditsAtLockup": self._credits,
+                    "jackpotAtLockup": self._jackpot}
                 logger.info("🧾 handpay latch ON (0x51) — pending since {}",
                             self.pending["since"])
         elif code == HANDPAY_RESET_EXCEPTION and self.pending is not None:
@@ -425,6 +455,7 @@ class HandpayLatch:
                 # meter shows it went there
                 self._settling, self.pending = self.pending, None
                 self._settle_at = self._clock() + self._settle_sec
+                self._after = {}
             logger.info("🧾 handpay latch cleared (0x52 handpay was reset)")
         elif code == HANDPAY_CANCELLED_EXCEPTION and self.pending is not None:
             self._finish("cancelled", "the player cancelled the request")
@@ -448,22 +479,58 @@ class HandpayLatch:
         if not isinstance(credits, int) or isinstance(credits, bool):
             return
         self._credits = credits
+        self._reading("credits", credits)
+
+    def on_jackpot(self, credits) -> None:
+        """Every Total Jackpot reading (in the 0F meters), in credits."""
+        if not isinstance(credits, int) or isinstance(credits, bool):
+            return
+        self._jackpot = credits
+        self._reading("jackpot", credits)
+
+    # how long a key-off waits for a jackpot-meter reading it expects
+    # before it is judged on the credit meter alone
+    JACKPOT_WAIT_SEC = 20.0
+
+    def _reading(self, which, value) -> None:
         rec = self._settling
         if rec is None or self._clock() < self._settle_at:
             return
+        self._after[which] = value
+        if "credits" not in self._after:
+            return
+        has_jackpot = isinstance(rec.get("jackpotAtLockup"), int)
+        if has_jackpot and "jackpot" not in self._after and \
+                self._clock() < self._settle_at + self.JACKPOT_WAIT_SEC:
+            return                      # its jackpot reading is still due
         self._settling = None
-        before, amount = rec.get("creditsAtLockup"), rec.get("amount")
-        on_meter = False
+        amount = rec.get("amount")
         if isinstance(amount, int) and amount > 0 and rec.get("inCents"):
             denom = self._denom_cents()      # a progressive is in cents
             amount = amount / denom if denom else None
-        if isinstance(before, int) and amount:
-            # More than half of it arrived on the meter: it was put
-            # there. (Half, not all: a bet placed between the reset and
-            # this reading takes a little off.)
-            on_meter = credits - before >= amount / 2
-        self._publish(rec, "credit" if on_meter else "hand",
-                      "keyed off at the machine")
+
+        def rose(before, after):
+            # By more than half the win. Half, not all: a bet placed
+            # between the reset and the reading takes a little off the
+            # credit meter. With no amount to go by, any rise.
+            if not isinstance(before, int) or not isinstance(after, int):
+                return False
+            return after - before >= amount / 2 if amount \
+                else after > before
+        on_credit_meter = rose(rec.get("creditsAtLockup"),
+                               self._after["credits"])
+        if rec.get("kind") == "cancelledCredits":
+            # a cash-out the machine could not pay: it was not a win to
+            # put back on the meter
+            how = "hand"
+        elif has_jackpot and "jackpot" in self._after:
+            by_attendant = rose(rec["jackpotAtLockup"],
+                                self._after["jackpot"])
+            how = ("credit" if on_credit_meter else
+                   "hand" if by_attendant else "unknown")
+        else:
+            how = "credit" if on_credit_meter else "hand"
+        self._publish(rec, how, "keyed off at the machine")
 
     def begin_reset(self) -> None:
         """A hub handpay_reset is about to run: a 0x52 that arrives
@@ -2020,12 +2087,7 @@ def main():
     # Meter ingest: on_meter deliveries (scalars + the 0x0F composite dict)
     # flatten into stats["last_meters"] via ingest_meter_reading — see the
     # REPORT KEY CONTRACT at POLLED_METERS.
-    _fold_meter = make_on_meter(stats)
-
-    def on_meter(addr, meter_code, value):
-        _fold_meter(addr, meter_code, value)
-        if meter_code == 0x1A:
-            hp_latch.on_credits(value)   # settles a key-off at the machine
+    on_meter = feed_handpay_latch(make_on_meter(stats), hp_latch)
 
     def on_handpay_reset(addr, result):
         logger.info("🔑 addr {} handpay reset: {}", addr, result)
