@@ -1,5 +1,50 @@
 # Changelog
 
+## v0.3.26
+Seventh and last batch from the G2S audit: the card reader, the bill
+acceptor, bonus awards, handpays and transfers. Sixteen items and seven
+comment corrections. Nearly all of it is for cases the AVP and the
+Bluebird 2 have never produced; nothing here makes the hub send a
+machine a command it did not send before.
+- **A bonus is taken from the House once per machine, transaction and
+  award.** It was keyed on the transaction number alone, which each
+  machine counts from 1: a second machine's award under a number the
+  first had used was paid on the machine, logged as debited, and never
+  taken from the House.
+- **A failed bonus says why**, in the document's words (machine not
+  playable, pay method not available, ...), and the command API accepts
+  all five pay methods (credit-meter-or-fail and pay-to-account were
+  missing).
+- **With several handpays waiting, Reset takes the cashable one first**,
+  then promotional, then non-cashable, the order a machine may insist
+  on. Lockups read back from a machine's log after a hub restart are
+  held oldest first, as live ones are; they were held newest first and
+  the two reset actions then worked on each other's lockup.
+- **A refused key-off type is explained for both kinds of machine.** The
+  AVP goes by its options at the time, so arming the option and trying
+  again works there; a machine that goes by what the lockup offered
+  when it was raised needs the lockup cleared at the machine.
+- **What a machine says about its card reader is kept and shown**
+  (`idReader` in /api/status), with its events named. It was only
+  logged. Nothing is decided on it: a card session is the hub's own.
+- **The card push uses the reader the machine says the hub owns**, the
+  cabinet's own locale, and the lengths the fields have (playerId 16,
+  localeId 10).
+- **A machine's own card-validation request is answered "command not
+  supported"**, no longer "class not supported".
+- **A bill acceptor that disables itself when the hub is quiet is
+  named**, with the time, when its profile is read.
+- For a machine that runs its own transfers: an overdrawn House is given
+  as 0, an account name is cut to 64 characters, a withdrawal is capped
+  at the balance, and a key asked for under a real algorithm is refused
+  as not supported.
+- Settled without a change: the bonus award keeps the attribute list
+  the AVP accepted (the document does not list one of them); no card
+  state is re-sent by the hub at a sign-on; a transfer request written
+  off when a machine reports a reset stays written off.
+- Comment corrections (wrong section numbers, and what the code no
+  longer does).
+
 ## v0.3.25
 Two things seen on the floor.
 - **TO WALLET reads ON only when it is on.** On a G2S machine the

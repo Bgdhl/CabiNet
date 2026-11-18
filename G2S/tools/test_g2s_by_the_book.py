@@ -4203,6 +4203,343 @@ def to_wallet_says_what_it_does():
           "armed over SAS", wat_says(host, egm, "true") == [])
 
 
+# ---------------------------------------------------------------------------
+# Batch 7: card reader, bill acceptor, bonus, handpay and transfers
+
+def said(fn):
+    """What the host logged at WARNING or above while fn ran."""
+    import logging
+    lines = []
+
+    class Keep(logging.Handler):
+        def emit(self, record):
+            if record.levelno >= logging.WARNING:
+                lines.append(record.getMessage())
+    h = Keep()
+    was = gh.log.level              # the gate runs with the log silenced
+    gh.log.addHandler(h)
+    gh.log.setLevel(logging.WARNING)
+    try:
+        fn()
+    finally:
+        gh.log.setLevel(was)
+        gh.log.removeHandler(h)
+    return " | ".join(lines)
+
+
+def batch_7_bonus():
+    print("— audit item 32: a transactionId is unique \"within an EGM\" "
+          "(§1.14.3) and starts again after a memory reset (§1.21)")
+    host = make_host()
+    one, two = joined(host, "BTB_bonus_a"), joined(host, "BTB_bonus_b")
+
+    def commit(egm, txn, bonus_id, paid=500_000, exc="0"):
+        return egm.send(
+            "bonus",
+            f'<g2s:commitBonus g2s:transactionId="{txn}" '
+            f'g2s:bonusId="{bonus_id}" g2s:bonusPaidAmt="{paid}" '
+            f'g2s:bonusException="{exc}" g2s:payMethod="G2S_payAny" '
+            f'g2s:creditType="G2S_cashable"/>')
+    start = cash(host, "house")
+    commit(one, 7, 101)
+    commit(two, 7, 102)
+    check("two machines' awards under the same transactionId are each "
+          "taken from the House (the second was \"already debited\": paid "
+          "on the machine, logged as debited, never taken)",
+          cash(host, "house") == start - 1_000_000,
+          start - cash(host, "house"))
+    one.resend()
+    commit(two, 7, 102)
+    check("the same commit sent again is not taken twice",
+          cash(host, "house") == start - 1_000_000,
+          start - cash(host, "house"))
+    commit(one, 7, 103)
+    check("the same number again on the same machine for another award "
+          "(its count restarted) is a new debit",
+          cash(host, "house") == start - 1_500_000,
+          start - cash(host, "house"))
+    commit(one, 9, "")
+    commit(two, 9, "")
+    check("and so are two machines' awards that carry no bonusId",
+          cash(host, "house") == start - 2_500_000,
+          start - cash(host, "house"))
+    told = said(lambda: commit(one, 8, 104, paid=0, exc="7"))
+    check("an award that was not paid takes nothing, and the log says why "
+          "in the document's words (Table 19.21; it gave the bare number)",
+          cash(host, "house") == start - 2_500_000
+          and "machine not playable" in told, told)
+
+    print("— audit item 64: the pay methods are the five of Table 19.20")
+    a = online(one).assoc
+    check("credit-meter-or-fail and pay-to-account can be asked for",
+          host.start_bonus_award(a, amount_mc=100_000,
+                                 pay_method="G2S_payCredit").get("ok")
+          is not False
+          and "G2S_payWat" in gh.BONUS_PAY_METHODS
+          and host.start_bonus_award(
+              a, amount_mc=100_000, pay_method="G2S_payCheque").get("ok")
+          is False)
+
+    print("— audit item 33, decided: the award keeps the attribute list "
+          "the AVP took on 2026-07-09 after refusing the short one, "
+          "idRank included, though Table 19.9 does not list it")
+    drain(host, a)
+    mark = len(host.sent)
+    host.enqueue_set_bonus_award(a, 5, 100_000)
+    drain(host, a)
+    sent = asks(sent_since(host, mark), "setBonusAward")
+    check("the form sent is unchanged", len(sent) == 1
+          and sorted(sent[0]) == sorted(
+              ("bonusId", "bonusAwardAmt", "creditType", "payMethod",
+               "idReaderType", "idNumber", "playerId", "idRank",
+               "textMessage", "msgDuration")), sent)
+
+
+def batch_7_card_reader():
+    print("— audit item 35: the hub speaks the idReader class, so a "
+          "request in it that it does not serve is \"command not "
+          "supported\" (G2S_APX008), not \"class not supported\" (§1.18.3.3)")
+    host = make_host()
+    egm = online(joined(host, "BTB_reader"))
+    a = egm.assoc
+    egm.send("idReader", '<g2s:getIdValidation g2s:idReaderType='
+                         '"G2S_magCard" g2s:idNumber="1234"/>')
+    raw = "".join(egm.raw)
+    check("a machine's own getIdValidation is answered G2S_APX008 (it "
+          "was G2S_APX007)", "G2S_APX008" in raw and "G2S_APX007" not in raw,
+          raw[-300:])
+
+    print("— audit item 70: setIdValidation is for the owner (Table 18.2); "
+          "being in the option inventory is not ownership")
+    with a.lock:
+        for d in ("1", "2"):
+            a.config_devices[f"G2S_idReader/{d}"] = {
+                "deviceClass": "G2S_idReader", "deviceId": d}
+    check("before the machine's host list is read, its readers are taken "
+          "from the option inventory",
+          host.owned_id_reader_devices(a) == {"1", "2"}
+          and host.default_id_reader_device(a) == "1")
+    with a.lock:
+        a.host_items[host.host_id] = {"owned": ["G2S_idReader/2",
+                                                "G2S_cabinet/1"]}
+    check("once it is, only a reader the machine says this host owns is "
+          "used (taps went to reader 1, which the hub could only read)",
+          host.owned_id_reader_devices(a) == {"2"}
+          and host.default_id_reader_device(a) == "2")
+    with a.lock:
+        a.host_items[host.host_id] = {"owned": ["G2S_cabinet/1"]}
+    check("and none when it owns none",
+          host.default_id_reader_device(a) is None)
+
+    print("— audit items 66 and 68: playerId holds 16 characters and "
+          "localeId 10 (Appendix A); with no locale known for a player "
+          "the cabinet's own is sent (Table 18.9)")
+    xml = gh.G2SHost.set_id_validation_xml(
+        True, id_number="77", player_id="p" * 40, locale_id="x" * 20)
+    check("both are cut to their type's length (32 and 16 were sent)",
+          'g2s:playerId="' + "p" * 16 + '"' in xml
+          and 'g2s:localeId="' + "x" * 10 + '"' in xml, xml)
+
+    def pushed_locale():
+        drain(host, a)
+        mark = len(host.sent)
+        host.enqueue_set_id_validation(a, "2", True, id_number="77")
+        drain(host, a)
+        return asks(sent_since(host, mark), "setIdValidation")[0]["localeId"]
+    check("a machine that has not given its locale is sent en_US",
+          pushed_locale() == "en_US")
+    with a.lock:
+        a.config_options["G2S_cabinet/1/G2S_cabinetOptions/"
+                         "G2S_cabinetOptions"] = {
+            "deviceClass": "G2S_cabinet", "deviceId": "1",
+            "currentValues": [{"kind": "complex",
+                               "paramId": "G2S_cabinetParams",
+                               "children": [{"tag": "stringValue",
+                                             "paramId": "G2S_localeId",
+                                             "value": "fr_CA"}]}]}
+    check("one whose cabinet options give fr_CA is sent fr_CA (every "
+          "card-in said en_US)", pushed_locale() == "fr_CA")
+
+    print("— audit items 34 and 69: what the machine says about its "
+          "reader is kept, not only logged. Nothing is decided on it and "
+          "nothing is sent on it: a card session is the hub's own")
+    mark = len(host.sent)
+    answer_to(egm, "idReader", "setIdValidation",
+              '<g2s:idReaderStatus g2s:idNumber="" g2s:idType="G2S_none" '
+              'g2s:egmEnabled="false"/>', device="2")
+    shown = a.snapshot()["idReader"].get("2") or {}
+    check("its answer to a pushed card is shown as it gave it (here: no "
+          "ID, reader disabled)", shown.get("idType") == "G2S_none"
+          and shown.get("egmEnabled") == "false"
+          and shown.get("hostEnabled") == "true", shown)
+    egm.event_id = getattr(egm, "event_id", 5000) + 1
+    egm.send(
+        "eventHandler",
+        f'<g2s:eventReport g2s:deviceClass="G2S_idReader" g2s:deviceId="2" '
+        f'g2s:eventCode="G2S_IDE107" g2s:eventId="{egm.event_id}" '
+        f'g2s:eventDateTime="{egm.stamp()}" g2s:transactionId="0">'
+        '<g2s:deviceList><g2s:statusInfo g2s:deviceClass="G2S_idReader" '
+        'g2s:deviceId="2"><g2s:idReaderStatus g2s:idNumber="77" '
+        'g2s:idType="G2S_player" g2s:idValidExpired="true"/>'
+        '</g2s:statusInfo></g2s:deviceList></g2s:eventReport>')
+    shown = a.snapshot()["idReader"].get("2") or {}
+    check("an ID the machine has let expire (G2S_IDE107) shows as expired, "
+          "and the event has its name", shown.get("idValidExpired") == "true"
+          and shown.get("statusSource") == "event"
+          and a.events[-1].get("label", "").endswith(
+              "ID validation expired (ID abandoned)"),
+          (shown, a.events[-1].get("label")))
+    check("the hub sends the machine nothing on either (items 36 and 69, "
+          "decided: no card state is re-sent by the hub itself)",
+          asks(sent_since(host, mark), "setIdValidation") == [])
+    answer_to(egm, "idReader", "setIdValidation",
+              '<g2s:idReaderProfile g2s:egmPhysicallyControls="true" '
+              'g2s:idValidMethod="G2S_host"/>', device="2")
+    check("a profile, when one is read, is kept beside it",
+          a.snapshot()["idReader"]["2"].get("profile", {}).get(
+              "egmPhysicallyControls") == "true")
+
+    print("— audit item 38: noMessageTimer is \"the maximum time allowed "
+          "... between commands from the host to the device before the "
+          "device is disabled\" (Table 13.4)")
+
+    def profile(timer):
+        host.enqueue_get_note_acceptor_profile(a, "1")
+        drain(host, a)
+        return said(lambda: answer_to(
+            egm, "noteAcceptor", "getNoteAcceptorProfile",
+            f'<g2s:noteAcceptorProfile g2s:noMessageTimer="{timer}" '
+            'g2s:noteEnabled="true" g2s:voucherEnabled="true"/>'))
+    check("a machine that reports one is named, with the time (it was "
+          "stored and nothing said)", "60 s without a command"
+          in profile(60000), profile(60000))
+    check("0, the default, says nothing", profile(0) == "", profile(0))
+
+
+def batch_7_transfers():
+    print("— audit items 59, 60, 61: what a machine in EGM-controlled mode "
+          "is told about accounts")
+    host = make_host()
+    egm = online(joined(host, "BTB_accounts"))
+    acct, _ = host.account_store.create("N" * 70)
+    host.account_store.adjust(acct["id"], d_cash=2_500_000, note="t",
+                              ref="t1")
+    host.account_store.adjust("house", d_cash=-9_000_000
+                              - cash(host, "house"), note="t", ref="t2")
+    got = egm.send("wat", '<g2s:getWatBalance g2s:accountId="house"/>')
+    bal = egm.answer(got, "watBalance") or {}
+    check("an overdrawn House is given as 0: the amounts are meterValue, "
+          "which cannot be below 0 (it went out negative)",
+          cash(host, "house") < 0 and bal.get("cashableAmt") == "0", bal)
+    got = egm.send("wat", "<g2s:getWatAccounts/>")
+    rows = {}
+    for _c, name, _a, el in got:
+        if name == "watAccountList":
+            for child in el:
+                attrs = {k.rsplit("}", 1)[-1]: v
+                         for k, v in child.attrib.items()}
+                rows[attrs.get("accountId")] = attrs
+    mine, house = rows.get(acct["id"]) or {}, rows.get("house") or {}
+    check("an account name is cut to the 64 characters of "
+          "accountDescription", mine.get("accountDescription") == "N" * 64,
+          mine.get("accountDescription"))
+    check("a withdrawal is capped at what the account holds, a deposit at "
+          "the document's example figure (both were 0, which read to the "
+          "letter allows no transfer)",
+          mine.get("withdrawMax") == "2500000"
+          and house.get("withdrawMax") == "0"
+          and mine.get("depositMax") == "999999999999000", (mine, house))
+    egm.send("wat", '<g2s:getKeyPair g2s:keyPairId="3" '
+                    'g2s:hashType="G2S_sha1"/>')
+    raw = "".join(egm.raw)
+    check("a key asked for under a real algorithm is refused as not "
+          "supported (G2S_WTX010); it was answered with a keyPair naming "
+          "G2S_none and no key", "G2S_WTX010" in raw
+          and "keyPair " not in raw, raw[-300:])
+    got = egm.send("wat", '<g2s:getKeyPair g2s:keyPairId="3" '
+                          'g2s:hashType="G2S_none"/>')
+    kp = egm.answer(got, "keyPair") or {}
+    check("one asked for under G2S_none gets the empty keyPair as before",
+          kp.get("hashType") == "G2S_none" and kp.get("keyPairId") == "3",
+          kp)
+
+
+def batch_7_handpays():
+    print("— audit item 65: several lockups are \"reset one at a time in "
+          "the order cashable, promotional, non-cashable\" (§11.12)")
+    host = make_host()
+    egm = online(joined(host, "BTB_reset_order"))
+    a = egm.assoc
+
+    def lockup(cash_amt=0, promo=0, non_cash=0):
+        txn = egm.next_txn()
+        egm.send(
+            "handpay",
+            f'<g2s:handpayRequest g2s:transactionId="{txn}" '
+            f'g2s:handpayType="G2S_cancelCredit" '
+            f'g2s:handpayDateTime="{egm.stamp()}" '
+            f'g2s:requestCashableAmt="{cash_amt}" '
+            f'g2s:requestPromoAmt="{promo}" '
+            f'g2s:requestNonCashAmt="{non_cash}" '
+            f'g2s:remoteCredit="true" g2s:remoteHandpay="true"/>')
+        return str(txn)
+
+    def reset(fn):
+        drain(host, a)
+        mark = len(host.sent)
+        fn()
+        drain(host, a)
+        sent = asks(sent_since(host, mark), "setRemoteKeyOff")
+        return sent[0]["transactionId"] if sent else None
+    promo = lockup(promo=300_000)
+    cashable = lockup(cash_amt=700_000)
+    non_cash = lockup(non_cash=200_000)
+    check("the Floor's Reset takes the cashable one first, not the one "
+          "that arrived last (a machine that holds to the order refuses "
+          "another)", reset(lambda: host.reset_newest_handpay(a))
+          == cashable)
+    check("and so does a reset that names no lockup (it took the oldest, "
+          "here the promotional one)",
+          reset(lambda: host.enqueue_set_remote_key_off(a)) == cashable)
+    with a.lock:
+        a.handpays_pending.pop(cashable)
+    check("then the promotional one, then the non-cashable",
+          reset(lambda: host.reset_newest_handpay(a)) == promo
+          and gh.pick_handpay_to_reset(
+              {k: v for k, v in a.handpays_pending.items()
+               if k != promo}) == non_cash)
+    host = make_host()
+    egm = online(joined(host, "BTB_reset_same"))
+    a = egm.assoc
+    first = lockup(cash_amt=100_000)
+    second = lockup(cash_amt=200_000)
+    check("among lockups of one kind nothing changes: the Floor's Reset "
+          "takes the newest, a reset that names none the oldest",
+          reset(lambda: host.reset_newest_handpay(a)) == second
+          and reset(lambda: host.enqueue_set_remote_key_off(a)) == first)
+
+    print("— a log is read newest first (§1.14.5)")
+    host = make_host()
+    egm = online(joined(host, "BTB_reset_recovered"))
+    a = egm.assoc
+    rows = "".join(
+        f'<g2s:handpayLog g2s:logSequence="{seq}" g2s:deviceId="1" '
+        f'g2s:transactionId="{txn}" g2s:handpayState="G2S_handpayPend" '
+        f'g2s:handpayType="G2S_gameWin" '
+        f'g2s:handpayDateTime="2026-11-17T10:0{seq}:00.000-05:00" '
+        f'g2s:requestCashableAmt="100000" g2s:keyOffType="G2S_unknown" '
+        f'g2s:remoteCredit="true"/>'
+        for seq, txn in ((3, 43), (2, 42), (1, 41)))
+    egm.send("handpay", f"<g2s:handpayLogList>{rows}</g2s:handpayLogList>",
+             stype="G2S_response")
+    check("lockups recovered from the machine's log are held oldest "
+          "first, as live ones are (they were held newest first, and the "
+          "two reset buttons then acted on each other's lockup)",
+          list(a.handpays_pending) == ["41", "42", "43"]
+          and reset(lambda: host.reset_newest_handpay(a)) == "43",
+          list(a.handpays_pending))
+
+
 def main():
     logging.basicConfig(level=logging.CRITICAL + 1)
     logging.getLogger("g2s_host").setLevel(logging.CRITICAL + 1)
@@ -4255,6 +4592,10 @@ def main():
     items_17_and_49_event_subscriptions()
     items_43_and_53_restarting_a_machine()
     to_wallet_says_what_it_does()
+    batch_7_bonus()
+    batch_7_card_reader()
+    batch_7_transfers()
+    batch_7_handpays()
     print("=" * 50)
     print(f"RESULT: {_p} passed, {_f} failed")
     return 1 if _f else 0

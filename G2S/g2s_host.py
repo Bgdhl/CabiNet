@@ -125,7 +125,7 @@ if "tournament_names" not in _hub_store_mod.HOST_SETTING_KEYS:
 # the MINOR bump per the repo's version rule). Surfaced in engine_meta() ->
 # /api/status ["_engine"]["version"]; bump this and add a CHANGELOG.md
 # section on every commit with a user-visible change.
-CABINET_VERSION = "0.3.25"
+CABINET_VERSION = "0.3.26"
 
 WSDL_NS = "http://www.gamingstandards.com/wsdl/g2s/v1.0"
 SCHEMA_NS = "http://www.gamingstandards.com/g2s/schemas/v1.0.3"
@@ -614,6 +614,12 @@ SPOKEN_CLASSES = frozenset((
     "download",  # RB: reboot script (setDownloadState/setScript) + the
     #              downloadStatus/scriptStatus response folds
     "bonus",     # G2S-41: reads + setBonusAward/commitBonus money cycle
+    "idReader",  # the hub builds setIdValidation, getIdReaderStatus and
+    #              getIdReaderProfile. A machine's own getIdValidation
+    #              (a card in ITS reader, validated by the host, §18.10)
+    #              is not served: it is answered "command not supported"
+    #              (G2S_APX008). Until v0.3.26 it was answered "class not
+    #              supported", which is not true of a class the hub sends.
 ))
 
 # Join-sequence gamePlay sweep pacing (G2S-21, un-gated 2026-07-02). The real
@@ -947,6 +953,18 @@ EVENT_LABELS = {
     "G2S_GPE111": "Game result",
     "G2S_GPE112": "🎰 Game ENDED (meters final)",
     "G2S_GPE113": "Game idle",
+    "G2S_IDE001": "💳 Card reader disabled by the machine",
+    "G2S_IDE002": "💳 Card reader enabled by the machine",
+    "G2S_IDE003": "💳 Card reader disabled by host",
+    "G2S_IDE004": "💳 Card reader enabled by host",
+    "G2S_IDE101": "💳 Valid ID presented",
+    "G2S_IDE102": "💳 Invalid ID presented",
+    "G2S_IDE103": "💳 ID cleared from the reader",
+    "G2S_IDE104": "💳 ID validated offline",
+    "G2S_IDE105": "💳 Unable to validate ID offline",
+    "G2S_IDE106": "💳 Validation information changed",
+    "G2S_IDE107": "💳 ID validation expired (ID abandoned)",
+    "G2S_IDE108": "💳 Invalid validation information received",
     "G2S_NAE114": "💵 Bill STACKED (money in)",
     "G2S_NAE112": "🚪 Stacker door opened",
     "G2S_NAE113": "🚪 Stacker door closed",
@@ -1227,8 +1245,10 @@ EVENT_HOOK_CODES = {
     "G2S_VCE103": ("voucher_issued", {}),
     "G2S_VCE108": ("voucher_redeemed", {}),
     # wat (G2S-39): wat_transfer_completed / wat_transfer_failed deliberately
-    # do NOT ride event codes. G2S_WTE107 fires only on success and carries
-    # none of the amounts, while a failed transfer has NO event code at all —
+    # do NOT ride event codes. By the document G2S_WTE107 marks the commit
+    # of a transfer that completed AND of one that was aborted (the log
+    # entry goes to G2S_commitSent with its egmException and the actual
+    # amounts, Table 22.67), so the event alone does not say money moved —
     # so both hooks fire from the commitTransfer dispatch handler instead
     # (the authoritative, §22.31-deduped moment, with the ACTUAL transferred
     # amounts as extras). Mapping WTE107 here as well would double-tape every
@@ -1636,11 +1656,17 @@ REMOTE_CREDIT_ENABLE_PARAMS = {
 
 def pick_remote_key_off_type(rec):
     """Pick the reset type from the lockup's flags — WORDING/ROUTING only,
-    never permission. Wire-proven 2026-07-29: the handpayRequest flags are
-    an advisory SNAPSHOT, not a lifetime stamp — txn 173 arrived with
-    remoteHandpay=false and still keyed off clean once the option was
-    armed, because the EGM enforces against its CURRENT options at key-off
-    time. So we always send something and let the machine adjudicate.
+    never permission. Wire-proven on the AVP, 2026-07-29: txn 173 arrived
+    with remoteHandpay=false and still keyed off clean once the option was
+    armed, so THAT machine goes by its options at the time of the key-off.
+    The document says otherwise: "Only key-offs that the EGM indicated
+    could be keyed off remotely in the handpayRequest command are
+    permitted" (§11.14), the flags being fixed for the life of the lockup.
+    A machine that holds to it answers G2S_JPX002 whatever is armed later.
+    So something is always sent and the machine decides; what a refusal
+    means depends on the machine (see the G2S_JPX002 hint). Only
+    remoteCredit and remoteHandpay are ever chosen: a lockup that offered
+    remoteVoucher or remoteWat alone is not reset from the hub.
 
     Routing: credits when the machine offered them; else the attendant-key
     equivalent. When neither remote flag is set, localCredit is the honest
@@ -1654,6 +1680,32 @@ def pick_remote_key_off_type(rec):
     if _t("remoteHandpay"):
         return "G2S_remoteHandpay"
     return "G2S_remoteCredit" if _t("localCredit") else "G2S_remoteHandpay"
+
+
+def pick_handpay_to_reset(pending, newest=False):
+    """With several lockups pending, the transactionId to reset first.
+    One handpay can arrive as several handpayRequests (a machine that does
+    not mix credit types sends one per type), and §11.12 has them "reset
+    one at a time in the order cashable, promotional, non-cashable"; a
+    machine that holds to the order refuses another. Among lockups of the
+    same kind: the oldest, or the newest when asked (the Floor's button).
+    `pending` is handpays_pending, oldest first. None when it is empty."""
+    keys = list(pending)
+    if newest:
+        keys.reverse()
+
+    def kind(txn):
+        rec = pending[txn]
+        for rank, name in enumerate(("pendingCashableAmt",
+                                     "pendingPromoAmt",
+                                     "pendingNonCashAmt")):
+            try:
+                if int(rec.get(name) or 0) > 0:
+                    return rank
+            except (TypeError, ValueError):
+                pass
+        return 3
+    return min(keys, key=kind) if keys else None
 
 
 def pick_glass_device(profiles, default=GLASS_DEFAULT_DEVICE):
@@ -1889,9 +1941,12 @@ class EgmAssociation:
         # option_change is the detailed record surfaced in /api/status
         # (configId/txn/4-tuple/paramId/old+new value/result). optionconfig_
         # stage is the coarse UI stage. option_change_log holds the last
-        # getOptionChangeLogStatus reply (lastSequence/totalEntries). All are
-        # API-triggered ONLY (nothing automatic ever changes an option) and
-        # persist across warm re-handshakes.
+        # getOptionChangeLogStatus reply (lastSequence/totalEntries). An
+        # option is changed when someone asks (the Options tab, the command
+        # API) and, by the hub itself, at a join: the handpay options, the
+        # ticket header and the ticket expiry are put back to what the hub
+        # holds when a machine reports otherwise. All persist across warm
+        # re-handshakes.
         self.optionconfig_stage = None  # None|setting|authorizing|applied|failed|cancelling|cancelled
         self.pending_option_config_id = None
         self.pending_option_txn_id = None
@@ -1902,7 +1957,9 @@ class EgmAssociation:
         # AVP refuses an option change outright with G2S_OCX002 "EGM is not in
         # optionConfig mode and provided applyCondition does not disable the
         # EGM". While enabled the EGM MUST NOT allow game play (§9.7), so this
-        # is deliberate and disruptive — API-triggered ONLY, never automatic.
+        # is deliberate and disruptive: entered for a change someone asked
+        # for, or for one of the join-time ones above when the machine
+        # demands it, and left again when the change is done.
         # None = never asked; True/False = the EGM's last optionConfigModeStatus.
         self.optionconfig_mode = None
         self.optionconfig_mode_at = None
@@ -2171,6 +2228,18 @@ class EgmAssociation:
         # only re-fires on deviceReset, and a re-handshake does not un-stack
         # a bill).
         self.note_acceptor = {}
+        # idReader: what the MACHINE says about each of its readers
+        # ({deviceId: {idNumber, idType, idState, idValidExpired,
+        # egmEnabled, hostEnabled, statusAt, statusSource, profile}}),
+        # from its idReaderStatus answers, the status its idReader events
+        # carry, and an idReaderProfile when one is read. A card session
+        # is the hub's own (card_sessions); the card push to the machine
+        # is extra, and this is where its outcome can be read. On the two
+        # floor machines it does not take: the AVP's reader is disabled
+        # (it refuses the push, G2S_APX016) and both report
+        # egmPhysicallyControls=true, where the document has the machine
+        # go by the ID at its own reader (§18.11).
+        self.id_readers = {}
         self.bill_ins = []
         self.bill_in_count = 0
         self.bill_in_session_amt = 0
@@ -2208,7 +2277,7 @@ class EgmAssociation:
         # is a bounded ring of award records UPDATED IN PLACE through the
         # dossier §2.2 lifecycle (sent -> acked -> committed/failed), so
         # snapshot dict-copies each entry (the wat_transfers treatment).
-        # Money truth is the AccountStore ledger (ref g2sbonus:<txn>,
+        # Money truth is the AccountStore ledger (ref g2sbonus:<egmId>:<txn>:<bonusId>,
         # debit-on-confirm at commitBonus ONLY) — this ring is presentation.
         # Accumulated knowledge — NOT cleared in new_epoch (a re-handshake
         # does not unpay an award).
@@ -2669,6 +2738,7 @@ class EgmAssociation:
             "handpayRemoteCreditAllowed": g2s_bool(
                 handpay_options.get("G2S_enabledRemoteCredit"), None),
             "noteAcceptor": note_acceptor,
+            "idReader": {k: dict(v) for k, v in self.id_readers.items()},
             "billInCount": self.bill_in_count,
             "billInSessionAmt": self.bill_in_session_amt,
             "recentBillIns": recent_bill_ins,
@@ -2784,18 +2854,38 @@ WAT_ACTIVE_STATES = ("requested", "pending", "initiated", "authorized")
 # record stays live and is LOCALLY cancellable via watCancel.
 WAT_REQUEST_ABANDON_SEC = 120
 
+# watAccountList depositMax: the figure the document's own example sends
+# (22.40.5.2), in millicents.
+WAT_DEPOSIT_MAX_MC = 999999999999000
+
 # ---------------------------------------------------------------------------
-# bonus class (G2S-41, spec ch.19 — dossier-reconstructed; the chapter body
-# is lost). Wire-facing constants only; anything the dossier marks
-# RECONSTRUCTED (bonusStates strings, bonusException meanings, error codes)
-# is deliberately NOT enumerated here — handlers capture those verbatim.
+# bonus class (G2S-41, spec ch.19). The class was first built from the
+# document's index, when chapter 19 was thought missing; the chapter is in
+# the 1.0.3 document (Table 19.20 data types, Table 19.21 exceptions) and
+# the constants below are from it. bonusId is a long, minimum 1; the states
+# are G2S_bonusPending, G2S_bonusCommit, G2S_bonusAck.
 # ---------------------------------------------------------------------------
 
-# bonusPayMethods (dossier §3, STRONGLY INFERRED from the intact ch.17
-# progPayMethods table whose description reads "Payment method for bonuses."
-# — the copy-paste artifact). The /api/command whitelist; P-5 probes for a
-# possible fourth member on the bench.
-BONUS_PAY_METHODS = ("G2S_payAny", "G2S_payHandpay", "G2S_payVoucher")
+# bonusPayMethods, Table 19.20: all five. The /api/command whitelist.
+# G2S_payCredit is "the credit meter or fail", the one that cannot end in a
+# lockup or a ticket; G2S_payWat pays to the player's account.
+BONUS_PAY_METHODS = ("G2S_payAny", "G2S_payCredit", "G2S_payHandpay",
+                     "G2S_payVoucher", "G2S_payWat")
+
+# bonusExceptions, Table 19.21: why an award was not paid. For the log and
+# the award record; only 0 is ever acted on (the House debit).
+BONUS_EXCEPTION_TEXT = {
+    0: "paid",
+    1: "bonus canceled",
+    2: "non-cashable handpay not supported",
+    3: "no player ID available",
+    4: "incorrect player ID",
+    5: "cannot mix non-cashable expirations",
+    6: "cannot mix non-cashable credits",
+    7: "machine not playable",
+    8: "pay method not available",
+    99: "unspecified reason",
+}
 
 # Presentation ring bound for assoc.bonus_awards (the wat_transfers
 # treatment, but bonus traffic is one-award-at-a-time hobbyist volume).
@@ -4765,8 +4855,13 @@ class G2SHost:
         # at most once per EGM. See _maybe_warn_host_base_mismatch.
         self._hostbase_mismatch_seen = set()
         # Host-assigned configurationId sequence for commConfig/optionConfig
-        # change sets (spec §8.3.1). Monotonic; seeded off wall-clock so it does
-        # not collide with a prior run's ids the EGM may still remember.
+        # change sets (spec §8.3.1): it "uniquely identif[ies] the set of
+        # changes from the host". Counts up within a run. The seed is the
+        # clock modulo 100000 (about 28 hours), so a later run CAN begin
+        # below numbers an earlier run used; a clash needs the same number
+        # while the machine still holds the old change set. Left as it is
+        # (audit item 55): a longer number is a change to what every
+        # option command carries, for a clash nobody has seen.
         self._config_seq = int(time.time()) % 100000
         self._config_lock = threading.Lock()
         self.inline = inline            # last-resort fallback: app response in sync reply
@@ -14045,8 +14140,8 @@ class G2SHost:
 
     def enqueue_reboot_script(self, assoc, script_id=None, auto_retry=False,
                               force=False):
-        """download.setScript w/ systemCmd G2S_resetEgm (spec §10.30
-        setScript p.422-423, §10.37 systemCmd p.424, Table 10.70 operSystem
+        """download.setScript w/ systemCmd G2S_resetEgm (spec §10.27
+        setScript, Table 10.37 systemCmd, Table 10.70 operSystem
         p.441) — plan-B remote warm reboot, for the machines (this AVP014
         R2 included) that APX008 cabinet.resetProcessor. A setDownloadState
         enable rides ahead in the same FIFO (§10.7/§10.9: script execution
@@ -14252,7 +14347,11 @@ class G2SHost:
 
     def _known_wat_ids(self, assoc):
         """The ACTIVE wat deviceIds this machine reported in its last
-        descriptorList harvest. Empty before the first harvest — callers fall
+        descriptorList harvest, the hub's own or not: for READS only
+        (getWatStatus, getWatProfile). A descriptor's ownerId, deviceOwner
+        and deviceGuest (Table 2.12) are not kept by the harvest, so this
+        is not a list of devices the hub may command; that is
+        owned_wat_devices. Empty before the first harvest — callers fall
         back to the ("1","2") guess every IGT cabinet has answered to."""
         out = []
         with assoc.lock:
@@ -14260,8 +14359,9 @@ class G2SHost:
         for d in descs:
             if d.get("deviceClass") == "G2S_wat":
                 did = str(d.get("deviceId") or "").strip()
-                # inactive devices are noise, and a GUEST personality device
-                # (the AVP's SAS-6.02 wat/3) is never ours to drive — G2S-40.
+                # inactive devices are noise. A guest device (the AVP's
+                # SAS-6.02 wat/3) IS returned: it is read, never commanded
+                # (the owner guard, G2S-40, sees to that).
                 if did and str(d.get("active")).lower() in ("true", "1"):
                     out.append(did)
         return out
@@ -15133,10 +15233,13 @@ class G2SHost:
         hostEnabled — sessionId pairing drives the per-device stateChange
         record riding the G2S-21 game_play store (sent -> acked ->
         confirmed / disagree / error:*; snapshot() derives a lazy 30s
-        timeout). NOTE §6.9 apply semantics: the EGM waits for credit meter
-        = 0 then cabinet idleTimePeriod idle, and ANY player activity
-        restarts the wait — a disable on a machine with credits sits
-        SILENTLY pending. egmEnabled stays independent (host-enabled may
+        timeout). NOTE §6.9: a machine MAY wait for a zero credit meter
+        and an idle cabinet before it applies the change, but the request
+        lives only its timeToLive (30 s here): a machine that has not
+        started on it by then aborts it with G2S_APX011 (the AVP does,
+        with credits on the meter), the record reads error:G2S_APX011, and
+        the disable has to be sent again. It does not land later by
+        itself. egmEnabled stays independent (host-enabled may
         still be unplayable, e.g. zero active denoms, §6.2.2). Pre-ownership
         the AVP just g2sAcks then ignores — no retry storms, and NO
         re-enable logic hangs off this: the restore is the same deliberate
@@ -16458,12 +16561,15 @@ class G2SHost:
 
     # ------------------------------------------------------------ bonus — G2S-41
     #
-    # Spec ch.19 — the chapter body is LOST (missing PDF split); the build
-    # follows the recovered wire dossier (scratchpad bonus_dossier.md):
-    # attribute censuses are index-backed, choreography mirrors the intact
-    # ch.17 progressive twin, and everything the dossier marks RECONSTRUCTED
-    # (bonusStates strings, bonusException codes, error codes) is handled
-    # DEFENSIVELY — captured/logged verbatim, never switched on. Live wire
+    # Spec ch.19. This class was first built from the document's index and
+    # a wire dossier, when the chapter was thought missing; it is in the
+    # 1.0.3 document, and the pay methods and exception meanings now come
+    # from it (BONUS_PAY_METHODS, BONUS_EXCEPTION_TEXT). The handlers still
+    # capture each element's attributes verbatim and act on nothing but
+    # bonusException 0 and the paid amount. By the document bonusActivity
+    # is a heartbeat the HOST sends and the EGM answers with bonusStatus;
+    # the EGM never originates it, so the inbound bonusActivity branch
+    # below is not expected to run. Live wire
     # facts (first-light 2026-07-02): G2S_bonus/1 and /2 are ownerId=1 (ours,
     # device 1 is the default target); G2S_bonus/3 is the EGM-internal SAS
     # 6.02 bridge owned by hostIndex 0 "localhost" — we are guest there and
@@ -16472,8 +16578,9 @@ class G2SHost:
     # keep-alive) — the build is inert until an operator explicitly probes
     # or awards; the hostActive/noMessageTimer decision is FLAGGED FOR THE
     # BENCH. Money: AccountStore debit-on-confirm ONLY — the House is
-    # debited at commitBonus by bonusPaidAmt (ref g2sbonus:<transactionId>,
-    # once=True — idempotent across §-retries), NEVER at award-send/ack.
+    # debited at commitBonus by bonusPaidAmt (ref
+    # g2sbonus:<egmId>:<transactionId>:<bonusId>, once=True — idempotent
+    # across retries), NEVER at award-send/ack.
 
     @staticmethod
     def _bonus_attrs(el, limit=200):
@@ -16653,7 +16760,15 @@ class G2SHost:
         minimal 4-attribute form drew errorCode=G2S_MSX005 on the sync
         g2sAck — the AVP's gSOAP deserializer requires every attribute
         present (the getDescriptor deviceClass/deviceId lesson, §MSX005
-        again). Deliberately NO transactionId (index-proven omission — the
+        again). idRank IS NOT IN THE 1.0.3 DOCUMENT for this command
+        (Table 19.9 lists bonusId, bonusAwardAmt, creditType, payMethod,
+        expireCredits, expireDateTime, idRestrict, idReaderType, idNumber,
+        playerId, textMessage, msgDuration), and a machine that checks
+        against that schema may refuse it (audit item 33, decided
+        2026-11-17: left as it is). This attribute list is the one the AVP
+        took after refusing the short one, and no award has been tried
+        without idRank. Take it out only with a bonus award watched on a
+        machine. Deliberately NO transactionId (index-proven omission — the
         EGM assigns it in bonusAwardAck) and NO idReader TARGETING in v1
         (G2S_none/empty = uncarded award). The EGM pays when game state
         allows (gameIdle/gameEnded per intact ch.6), then closes out with
@@ -16690,7 +16805,7 @@ class G2SHost:
         transactionId), narrates BNE103/104, then closes out with
         commitBonus. MONEY RULE: nothing is debited here or at the ack —
         the House debit happens ONLY in the commitBonus handler
-        (debit-on-confirm, idempotent on g2sbonus:<transactionId>).
+        (debit-on-confirm, once per machine, transactionId and bonusId).
         Returns the /api/command reply dict."""
         try:
             amount_mc = int(amount_mc)
@@ -16754,22 +16869,73 @@ class G2SHost:
     # new response parser needed for v1.
 
     def owned_id_reader_devices(self, assoc):
-        """The set of idReader deviceId strings WE OWN — owned_wat_devices
-        mirrored onto G2S_idReader (same two sources, same union: the
-        optionConfig config-sync inventory + the commHostList owned list
-        for THIS host). MUST NOT be called holding assoc.lock (it takes
-        it)."""
-        owned = set()
+        """The set of idReader deviceId strings WE OWN: the machine's own
+        host list for THIS host (commHostList, owned). setIdValidation is
+        for the owner only (Table 18.2), and a device being in the option
+        inventory does not make the hub its owner: that list comes from a
+        wildcard read and holds every device the hub can see the options
+        of. The inventory is used only until a host list has been read,
+        and the log says so once. MUST NOT be called holding assoc.lock
+        (it takes it)."""
+        owned, from_inventory = set(), False
         with assoc.lock:
-            for d in assoc.config_devices.values():
-                if d.get("deviceClass") == "G2S_idReader" and \
-                        d.get("deviceId"):
-                    owned.add(str(d["deviceId"]))
-            h = assoc.host_items.get(self.host_id) or {}
-            for dev in h.get("owned", []):
-                if str(dev).startswith("G2S_idReader/"):
-                    owned.add(str(dev).split("/", 1)[1])
+            h = assoc.host_items.get(self.host_id)
+            if h is not None:
+                for dev in h.get("owned", []):
+                    if str(dev).startswith("G2S_idReader/"):
+                        owned.add(str(dev).split("/", 1)[1])
+            else:
+                for d in assoc.config_devices.values():
+                    if d.get("deviceClass") == "G2S_idReader" and \
+                            d.get("deviceId"):
+                        owned.add(str(d["deviceId"]))
+                from_inventory = bool(owned) and \
+                    not getattr(assoc, "id_reader_inventory_said", False)
+                if from_inventory:
+                    assoc.id_reader_inventory_said = True
+        if from_inventory:
+            log.info("💳 [%s] the machine's host list has not been read: "
+                     "taking its card reader(s) %s from the option "
+                     "inventory for now", assoc.egm_id, sorted(owned))
         return owned
+
+    def cabinet_locale(self, assoc):
+        """The cabinet's own localeId, from its cabinet options (read at
+        every join) or a cabinetProfile if one was read; None when the
+        machine has not said. MUST NOT be called holding assoc.lock."""
+        with assoc.lock:
+            # getattr: the gates' stand-in associations carry neither
+            prof = ((getattr(assoc, "cabinet", None) or {}).get("profile")
+                    or {}).get("localeId")
+            opts = [o for o in (getattr(assoc, "config_options", None)
+                                or {}).values()
+                    if o.get("deviceClass") == "G2S_cabinet"]
+        if prof:
+            return str(prof)
+        for o in opts:
+            loc = option_param_values(o.get("currentValues")).get(
+                "G2S_localeId")
+            if loc:
+                return str(loc)
+        return None
+
+    def _fold_id_reader_status(self, assoc, dev, el, source):
+        """Keep what the machine says about one of its readers (Table
+        18.4). Returns the folded dict."""
+        data = {
+            "idNumber": attr(el, "idNumber") or "",
+            "idType": attr(el, "idType") or "G2S_none",
+            "idState": attr(el, "idState") or "",
+            "idValidExpired": g2s_bool(attr(el, "idValidExpired")),
+            "egmEnabled": g2s_bool(attr(el, "egmEnabled"), "true"),
+            "hostEnabled": g2s_bool(attr(el, "hostEnabled"), "true"),
+            "statusAt": now_iso(), "statusSource": source,
+        }
+        with assoc.lock:
+            merged = dict(assoc.id_readers.get(str(dev)) or {})
+            merged.update(data)
+            assoc.id_readers[str(dev)] = merged
+        return data
 
     def default_id_reader_device(self, assoc):
         """The carded-session target: the LOWEST owned idReader device, or
@@ -16816,7 +16982,7 @@ class G2SHost:
             prefer_name = esc(prefer_name, 32)   # Table 18.9: ≤32
             full_name = esc(full_name, 64)       # Table 18.9: ≤64
             id_class = esc(id_class, 32)         # Table 18.9: ≤32
-            player_id = esc(player_id, 32)
+            player_id = esc(player_id, 16)       # Appendix A: 0 to 16
             expired = "false"
         else:
             id_number, id_type = "", "G2S_none"
@@ -16833,7 +16999,7 @@ class G2SHost:
                 f'g2s:idPreferName="{prefer_name}" '
                 f'g2s:idFullName="{full_name}" '
                 f'g2s:idClass="{id_class}" '
-                f'g2s:localeId="{esc(locale_id, 16) or "en_US"}" '
+                f'g2s:localeId="{esc(locale_id, 10) or "en_US"}" '
                 f'g2s:playerId="{player_id}" '
                 f'g2s:idLossLimit="0" '
                 f'g2s:idTripEnd="{ts}" '
@@ -16850,14 +17016,20 @@ class G2SHost:
     def enqueue_set_id_validation(self, assoc, device_id, present,
                                   id_number="", id_type="G2S_player",
                                   prefer_name="", full_name="",
-                                  player_id="", locale_id="en_US",
+                                  player_id="", locale_id=None,
                                   id_class="", rank=0):
         """idReader.setIdValidation (ch.18 §18.11) — the host TELLS the
         EGM who is carded in (present=True) or that no ID is present
         (present=False, the card-out). The full Table 18.9 attribute
         census is built in set_id_validation_xml (the MSX005 regression
         trap lives there). The EGM answers idReaderStatus + fires its
-        IDE-class events; both ride the existing inbound paths."""
+        IDE-class events; both are kept (assoc.id_readers). localeId: the
+        hub keeps no locale per player, and for "unknown" Table 18.9 gives
+        the cabinet's own, so that is what is sent (en_US only for a
+        machine that has not said)."""
+        if locale_id is None:
+            locale_id = self.cabinet_locale(assoc) or "en_US"
+
         def build(a):
             dev = str(device_id)
             sid = a.next_session_id()
@@ -16874,9 +17046,10 @@ class G2SHost:
 
     def enqueue_get_id_reader_status(self, assoc, device_id="1"):
         """idReader.getIdReaderStatus (ch.18) — empty request element; the
-        response is idReaderStatus (egmPhysicallyControls + the current
-        idNumber/idType/idState face). Owner+guest read; silence-tolerant
-        one-shot (bench probe)."""
+        response is idReaderStatus (the current idNumber/idType/idState
+        face and the two enabled flags; egmPhysicallyControls is in the
+        PROFILE, Table 18.5, not here). Kept in assoc.id_readers.
+        Owner+guest read; silence-tolerant one-shot (bench probe)."""
         def build(a):
             dev = str(device_id)
             sid = a.next_session_id()
@@ -18122,8 +18295,10 @@ class G2SHost:
             if txn_id is not None:
                 rec = a.handpays_pending.get(str(txn_id))
             elif a.handpays_pending:
-                # dict insertion order == arrival order -> oldest pending
-                rec = next(iter(a.handpays_pending.values()))
+                # the oldest pending, cashable before promotional before
+                # non-cashable (pick_handpay_to_reset)
+                rec = a.handpays_pending[
+                    pick_handpay_to_reset(a.handpays_pending)]
             if rec is None:
                 log.warning("[%s] clearHandpay: no matching pending handpay "
                             "(hpId=%s) — nothing sent", a.egm_id,
@@ -18169,8 +18344,8 @@ class G2SHost:
         with assoc.lock:
             if not assoc.handpays_pending:
                 return {"ok": False, "error": "no pending handpay"}
-            # dict insertion order == arrival order -> last key is newest
-            txn = next(reversed(assoc.handpays_pending))
+            # the newest, cashable before promotional before non-cashable
+            txn = pick_handpay_to_reset(assoc.handpays_pending, newest=True)
             rec = dict(assoc.handpays_pending[txn])
         kt = pick_remote_key_off_type(rec)
         self.enqueue_set_remote_key_off(assoc, txn_id=txn)
@@ -18558,7 +18733,7 @@ class G2SHost:
         <optionCurrentValues> (one param edited, the rest copied — §9.15), and
         an <authorizeList> naming THIS host (the initiator MUST include itself,
         p.362). disableCondition is emitted ONLY with applyCondition=
-        G2S_disable (Table 9.35). Response: optionChangeStatus (G2S_pending)."""
+        G2S_disable (Table 9.27). Response: optionChangeStatus (G2S_pending)."""
         def build(a):
             sid = a.next_session_id()
             disable_xml = ""
@@ -18643,7 +18818,7 @@ class G2SHost:
     def enqueue_get_option_list(self, assoc, epoch=None,
                                 device_class="G2S_all", device_id="-1",
                                 option_detail=False):
-        """optionConfig.getOptionList (§9.10 Table 9.6) — read the option
+        """optionConfig.getOptionList (§9.12) — read the option
         inventory back on demand (GR-10). All five attributes are REQUIRED:
         deviceClass/deviceId default to the everything-wildcards G2S_all/-1
         (the getDescriptor pattern) but may be scoped to one device;
@@ -20055,12 +20230,16 @@ class G2SHost:
                     # against CURRENT options at key-off time, so the
                     # remedy is arm-then-retry, never "give up".
                     if rerr == "G2S_JPX002":
-                        hint = ("the EGM does not currently permit this "
-                                "key-off type — arm it (enableRemoteHandpay "
-                                "sets both remote pairs; the join re-asserts "
-                                "them) and RETRY this same lockup: the flags "
-                                "on the request are advisory, the EGM judges "
-                                "against its options at key-off time")
+                        hint = ("the machine does not permit this key-off "
+                                "type — arm it (enableRemoteHandpay sets "
+                                "both remote pairs; the join re-asserts "
+                                "them) and try this lockup again. The AVP "
+                                "goes by its options at the time of the "
+                                "key-off, so that works there. The document "
+                                "has a machine go by what the lockup offered "
+                                "when it was raised (11.14): on such a "
+                                "machine a retry cannot work and this lockup "
+                                "has to be cleared at the machine")
                     log.warning("[%s] 💰 REMOTE KEY-OFF REJECTED txn=%s — "
                                 "%s%s", assoc.egm_id, txn, rerr,
                                 f" ({hint})" if hint else "")
@@ -20360,9 +20539,18 @@ class G2SHost:
                 seen = assoc.comms_online_seen
             # G2S-39: the EGM says it reset (deviceReset/metersReset) — any
             # host push still waiting on that machine's answer (requested/
-            # pending) died with its RAM, and the epoch bump above just
+            # pending) is written off, and the epoch bump above just
             # dropped any still-queued initiateRequest too: abandon them so
-            # they can't wedge pendingTransfers forever. The records of
+            # they can't wedge pendingTransfers forever. (Audit item 58,
+            # decided: this stays. The document has a machine KEEP its
+            # transfers through a restart and finish one it gave a
+            # transactionId, so such a machine may come back to an
+            # abandoned request; its initiateTransfer is then denied with
+            # hostException 99 and its commitTransfer closes the record,
+            # no money moves. In the hub's log from 2026-11-07 to 11-17
+            # the AVP raised none of the flags in 38 sign-ons; the
+            # Bluebird, which has no transfer device, raised all four
+            # once.) The records of
             # earlier transactions are NOT fenced off on these flags. §1.21
             # has the EGM set all four on its first contact with a host and
             # keep them set until that host's commsOnLineAck arrives (which
@@ -21019,6 +21207,16 @@ class G2SHost:
                 for st_el in el.iter():
                     if localname(st_el.tag) == "cabinetStatus":
                         self._fold_cabinet_status(assoc, st_el, "event")
+                        break
+            # idReader events carry the reader's status the same way: an ID
+            # the machine cleared, expired (G2S_IDE107) or refused
+            # (G2S_IDE108) shows in assoc.id_readers. Nothing is re-sent
+            # on them (audit item 69, decided): the session is the hub's.
+            if ev["deviceClass"] == "G2S_idReader":
+                for st_el in el.iter():
+                    if localname(st_el.tag) == "idReaderStatus":
+                        self._fold_id_reader_status(
+                            assoc, ev.get("deviceId") or "1", st_el, "event")
                         break
             # SAME ride-along for gamePlay (2026-07-25): an eKey enable/disable
             # at the cabinet raises a gamePlay event carrying that device's
@@ -22231,6 +22429,54 @@ class G2SHost:
                             "setNoteAcceptorState disable would take the "
                             "WHOLE EGM down via evaluate(cabinet.egmState) "
                             "(Table 13.4/§13.19.1)", assoc.egm_id)
+            try:
+                idle_ms = int(profile["noMessageTimer"] or 0)
+            except (TypeError, ValueError):
+                idle_ms = 0
+            if idle_ms > 0:
+                # Table 13.4: the longest the machine lets pass between
+                # commands from the host to this device before it disables
+                # the device; 0 turns that off. The hub sends this device
+                # nothing by itself, so say what will happen. (It learns
+                # the figure only when the profile is read: from the
+                # console, or after an ownership change.)
+                log.warning("[%s] 💵 this machine disables its bill "
+                            "acceptor after %d s without a command from "
+                            "the hub (noMessageTimer). The hub does not "
+                            "send it one on a timer.", assoc.egm_id,
+                            idle_ms // 1000)
+
+        elif cmd == "idReaderStatus" and stype == "G2S_response":
+            # The machine's answer to setIdValidation and getIdReaderStatus
+            # (Table 18.4): what IT holds for the reader. Kept and shown;
+            # it was only logged. Nothing is decided on it: a card session
+            # is the hub's own.
+            data = self._fold_id_reader_status(
+                assoc, req["deviceId"], req["commandEl"], "idReaderStatus")
+            log.info("💳 [%s] idReaderStatus dev=%s — idType=%s idState=%s "
+                     "expired=%s egmEnabled=%s hostEnabled=%s",
+                     assoc.egm_id, req["deviceId"], data["idType"],
+                     data["idState"], data["idValidExpired"],
+                     data["egmEnabled"], data["hostEnabled"])
+
+        elif cmd == "idReaderProfile" and stype == "G2S_response":
+            # Table 18.5. egmPhysicallyControls says whose reader it is:
+            # true and the machine goes by the ID at its own reader, a
+            # pushed card is not shown there (§18.11).
+            el = req["commandEl"]
+            prof = {k.rsplit('}', 1)[-1]: v for k, v in el.attrib.items()}
+            prof.setdefault("egmPhysicallyControls", "false")
+            prof.setdefault("limitLosses", "false")
+            prof["profileAt"] = now_iso()
+            with assoc.lock:
+                merged = dict(assoc.id_readers.get(req["deviceId"]) or {})
+                merged["profile"] = prof
+                assoc.id_readers[req["deviceId"]] = merged
+            log.info("💳 [%s] idReaderProfile dev=%s — "
+                     "egmPhysicallyControls=%s idValidMethod=%s "
+                     "limitLosses=%s", assoc.egm_id, req["deviceId"],
+                     prof["egmPhysicallyControls"],
+                     prof.get("idValidMethod"), prof["limitLosses"])
 
         elif cmd == "commsClosing":
             log.warning("[%s] commsClosing reason=%s — EGM is tearing down",
@@ -23113,9 +23359,19 @@ class G2SHost:
             # already hold: a live JPE101 is fresher than any log read.
             el = req["commandEl"]
             recovered, closed = [], 0
-            for lg in el:
-                if localname(lg.tag) != "handpayLog":
-                    continue
+
+            def _seq(lg):
+                try:
+                    return int(attr(lg, "logSequence") or 0)
+                except ValueError:
+                    return 0
+            # A log is read newest first (§1.14.5). Taken in that order,
+            # the newest lockup became the "oldest" one held, and the two
+            # reset buttons acted on each other's lockup after a hub
+            # restart. Oldest first, as live requests arrive.
+            for lg in sorted((c for c in el
+                              if localname(c.tag) == "handpayLog"),
+                             key=_seq):
                 txn = attr(lg, "transactionId") or "0"
                 ko = (attr(lg, "keyOffType") or "G2S_unknown").strip()
                 state = (attr(lg, "handpayState") or "").strip()
@@ -23833,16 +24089,25 @@ class G2SHost:
                 f' g2s:{k}="{html.escape(attr(el, k) or "", quote=True)}"'
                 for k in ("idReaderType", "idNumber", "playerId")
                 if attr(el, k))
+            # Table 22.12: accountDescription holds 64 characters, and
+            # withdrawMax / depositMax are "the maximum value" for a
+            # request. They were sent as 0, which the document does not
+            # define: read to the letter it allows no transfer at all. A
+            # withdrawal is now capped at what the account holds (never
+            # below 0: the House may be), a deposit at the document's own
+            # example figure.
             snap = self.account_store.snapshot()
             items = "".join(
                 '<g2s:watAccount '
                 f'g2s:accountId="{html.escape(a["id"], quote=True)}" '
                 'g2s:accountDescription="'
-                f'{html.escape(a.get("name") or "", quote=True)}" '
+                f'{html.escape((a.get("name") or "")[:64], quote=True)}" '
                 'g2s:authRequired="false" g2s:withdrawOk="true" '
                 'g2s:cashDepositOk="true" g2s:promoDepositOk="true" '
                 'g2s:nonCashDepositOk="true" g2s:selectAmt="true" '
-                'g2s:defaultAmt="0" g2s:withdrawMax="0" g2s:depositMax="0"/>'
+                'g2s:defaultAmt="0" g2s:withdrawMax="'
+                f'{max(0, int(a.get("cashableMillicents") or 0))}" '
+                f'g2s:depositMax="{WAT_DEPOSIT_MAX_MC}"/>'
                 for a in snap["accounts"])
             log.info("🏦 [%s] getWatAccounts -> watAccountList (%d "
                      "account(s))", assoc.egm_id, len(snap["accounts"]))
@@ -23874,26 +24139,44 @@ class G2SHost:
                     assoc, req,
                     f'<g2s:watBalance{echo} '
                     f'g2s:accountId="{html.escape(acct_id, quote=True)}" '
-                    f'g2s:cashableAmt="{account["cashableMillicents"]}" '
-                    f'g2s:promoAmt="{account["promoMillicents"]}" '
-                    f'g2s:nonCashAmt="{account["nonCashMillicents"]}" '
+                    # the three amounts are meterValue, a long that cannot
+                    # be below 0 (Appendix A); the House may be overdrawn
+                    'g2s:cashableAmt="'
+                    f'{max(0, int(account["cashableMillicents"] or 0))}" '
+                    'g2s:promoAmt="'
+                    f'{max(0, int(account["promoMillicents"] or 0))}" '
+                    'g2s:nonCashAmt="'
+                    f'{max(0, int(account["nonCashMillicents"] or 0))}" '
                     'g2s:frozen="false"/>',
                     "watBalance")
 
         elif cmd == "getKeyPair" and stype == "G2S_request":
             # wat (G2S-39, §22.18/19): hashType=G2S_none is the PERMANENT
-            # decision (PIN-less enthusiast accounts, no auth hardening) —
-            # answer with an empty key so a spec-faithful EGM that asks
-            # anyway stays satisfied. keyPairId echoes back (§22.19).
+            # decision (PIN-less enthusiast accounts, no auth hardening).
+            # A machine asks for a key only when its own hashType is a real
+            # algorithm, and it names it. The hub makes no keys, so that is
+            # answered G2S_WTX010 (algorithm not supported, Table 22.41);
+            # it used to get a keyPair naming G2S_none and no key, which is
+            # neither what it asked for nor a refusal. A request that names
+            # G2S_none, or none, gets the empty keyPair as before.
             kp = attr(req["commandEl"], "keyPairId") or "1"
-            log.info("🏦 [%s] getKeyPair(keyPairId=%s) -> keyPair "
-                     "hashType=G2S_none (cert-less/PIN-less by decision)",
-                     assoc.egm_id, kp)
-            self.enqueue_class_response(
-                assoc, req,
-                f'<g2s:keyPair g2s:keyPairId="{kp}" '
-                'g2s:hashType="G2S_none"/>',
-                "keyPair")
+            asked = attr(req["commandEl"], "hashType") or "G2S_none"
+            if asked != "G2S_none":
+                log.warning("🏦 [%s] getKeyPair asks for %s — the hub keeps "
+                            "PIN-less accounts and makes no keys: answered "
+                            "G2S_WTX010", assoc.egm_id, asked)
+                self.enqueue_app_error(assoc, req, "G2S_WTX010",
+                                       "Algorithm Not Supported.")
+            else:
+                log.info("🏦 [%s] getKeyPair(keyPairId=%s) -> keyPair "
+                         "hashType=G2S_none (cert-less/PIN-less by "
+                         "decision)", assoc.egm_id, kp)
+                self.enqueue_class_response(
+                    assoc, req,
+                    f'<g2s:keyPair g2s:keyPairId="'
+                    f'{html.escape(kp, quote=True)}" '
+                    'g2s:hashType="G2S_none"/>',
+                    "keyPair")
 
         elif cmd == "voucherStatus" and stype == "G2S_response":
             # voucher device picture (G2S-39 companion, §21.12) — response
@@ -24060,13 +24343,19 @@ class G2SHost:
             # bonus (G2S-41, dossier §19.23) — THE money moment. The EGM
             # closes the award out with the ACTUAL bonusPaidAmt; it RETRIES
             # commitBonus until acked, so the House debit is idempotent on
-            # ref=g2sbonus:<transactionId> (adjust once=True) and the ack
+            # its ref (adjust once=True; the key is given below) and the ack
             # is ALWAYS re-sent. Money rule: debit ONLY when the exception
             # is absent/zero AND bonusPaidAmt parses > 0 — an unpaid/failed
-            # award must never debit (skip + log LOUDLY). bonusException
-            # meanings beyond 0=success are unrecovered (§19.31.1) — any
-            # nonzero/unparseable value is treated as not-paid, never
-            # switched on.
+            # award must never debit (skip + log LOUDLY). Any nonzero or
+            # unparseable bonusException is not-paid; its Table 19.21
+            # meaning goes in the log (BONUS_EXCEPTION_TEXT).
+            # The key the debit is made once under names the MACHINE and
+            # the award as well as the transaction: a transactionId is
+            # unique only inside one EGM (1.14.3) and starts again after a
+            # memory reset (1.21), so keyed on it alone the second
+            # machine's award with the same number, or the same machine's
+            # after a RAM clear, was "already debited": paid on the
+            # machine, not taken from the House, and logged as debited.
             el = req["commandEl"]
             txn = attr(el, "transactionId") or "0"
             bid = attr(el, "bonusId") or ""
@@ -24098,7 +24387,7 @@ class G2SHost:
                     "house", d_cash=-paid,
                     note=f"G2S bonus paid ({bid or 'no bonusId'}, "
                          f"{pay_method or 'payMethod?'})",
-                    ref=f"g2sbonus:{txn}", once=True)
+                    ref=f"g2sbonus:{assoc.egm_id}:{txn}:{bid}", once=True)
                 if err:
                     # house may go negative by design, so this only fires
                     # on store-level faults — the award WAS paid on-glass.
@@ -24110,19 +24399,22 @@ class G2SHost:
                     log.info("=" * 64)
                     log.info("🎁💰 [%s] BONUS PAID — %s (txn=%s bonusId=%s "
                              "payMethod=%s creditType=%s) — House debited "
-                             "(ref g2sbonus:%s, §-retry-safe)",
+                             "(once per machine, transaction and award)",
                              assoc.egm_id, denom_dollars(paid), txn,
                              bid or "?", pay_method or "?",
-                             credit_type or "?", txn)
+                             credit_type or "?")
                     log.info("=" * 64)
             else:
                 log.warning("=" * 64)
                 log.warning("🎁⚠️ [%s] commitBonus txn=%s bonusId=%s NOT "
-                            "DEBITED — bonusException=%r bonusPaidAmt=%r%s "
+                            "DEBITED — bonusException=%r (%s) "
+                            "bonusPaidAmt=%r%s "
                             "(an unpaid/failed/unparseable award must never "
-                            "debit the House; exception meanings are "
-                            "unrecovered — probe P-6)", assoc.egm_id, txn,
-                            bid or "?", exc_raw, paid_raw,
+                            "debit the House)", assoc.egm_id, txn,
+                            bid or "?", exc_raw,
+                            BONUS_EXCEPTION_TEXT.get(exc_val, "not a code "
+                                                     "of Table 19.21"),
+                            paid_raw,
                             "" if txn_ok else
                             " missing/invalid transactionId ="
                             " no idempotency key = no debit")
@@ -25859,7 +26151,7 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
             # 1..100000000, "deviceId"?: "1", "payMethod"?: one of
             # G2S_payAny/G2S_payHandpay/G2S_payVoucher, "textMessage"?:
             # clamped 128}. Money: House debited at commitBonus ONLY
-            # (debit-on-confirm, ref g2sbonus:<txn>, retry-idempotent).
+            # (debit-on-confirm, once per machine, transaction and award).
             "getBonusStatus": engine.enqueue_get_bonus_status,
             "getBonusProfile": engine.enqueue_get_bonus_profile,
             "setBonusState": engine.enqueue_set_bonus_state,
