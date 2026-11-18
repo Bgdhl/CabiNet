@@ -5013,6 +5013,27 @@ async function pinAdminToggle(btn){
   flash(btn,ok);
   if(ok) tickStatus();
 }
+async function quickAddSave(){
+  /* Quick amounts save (Settings ▸ Gameroom): the three one-tap amounts on
+     the admin's add pad on a machine's screen. Typed as whole amounts
+     ("1000", "1,000" and "$1,000" all read as 1000); the hub checks each one
+     and says why when it will not do. The screens pick the new amounts up on
+     their next poll. */
+  const cents=[], shown=[];
+  for(let i=0;i<3;i++){
+    const el=$("st-quick"+i); if(!el) return;
+    const t=(el.value||"").replace(/[\s,]/g,"").replace(/^\D+/,"");
+    if(!/^\d{1,8}$/.test(t)){
+      toast("Quick amounts — type three whole amounts, no cents",false); return;
+    }
+    cents.push(Number(t)*100); shown.push(Number(t).toLocaleString("en-US"));
+  }
+  const cur=(((S.status||{}).hostOptions||{}).quickAddCents)||[];
+  if(cents.join()===cur.join()){ toast("Quick amounts — nothing changed",true); return; }
+  const ok=await settingsPost({quickAddCents:cents},
+    "Quick amounts set to "+shown.join(", "));
+  if(ok) tickStatus();
+}
 async function gameroomSave(){
   /* Gameroom name save — reversible personalization, no arm. Posts only when
      it differs from the hub face ("" clears it back to the neutral default).
@@ -5069,6 +5090,7 @@ function renderSettings(){
   if(ae && (ae.tagName==="INPUT" || ae.tagName==="TEXTAREA") &&
      (String(ae.id).indexOf("st-ticket-")===0 || ae.id==="st-bankroll" ||
       ae.id==="st-gameroom" || ae.id==="st-currency" ||
+      String(ae.id).indexOf("st-quick")===0 ||
       String(ae.id).indexOf("st-tour-")===0)) return;
   /* Host options — hostOptions is feature-detected: an old hub omits it
      from /api/status and gets the pending chip until the update lands. */
@@ -5127,6 +5149,23 @@ function renderSettings(){
           ${ho.pinAdminAllowed
             ?"A PIN login on an admin account gets the admin menu."
             :"A PIN login never gets the admin menu, whatever the account's flag — a PIN typed on a public keypad is easy to watch."}</p>`}
+        ${!Array.isArray(ho.quickAddCents)?"":`
+        <div class="tkf" style="margin-top:12px"><label for="st-quick0">Quick
+          amounts on the admin's add pad (${esc(String(ho.currencySymbol||"$"))})</label>
+          <div style="display:flex;gap:8px">
+            ${[0,1,2].map(i=>`<input type="text" inputmode="numeric" id="st-quick${i}"
+              maxlength="11" style="width:auto;flex:1;min-width:0"
+              aria-label="Quick amount ${i+1}"
+              value="${esc(String(Math.floor(Number(ho.quickAddCents[i]||0)/100)))}">`).join("")}
+          </div></div>
+        <p class="none">The three one-tap amounts an admin gets on a machine's
+          screen when adding to a player's wallet or Free Slot Play, or taking
+          back. Whole amounts, no cents. From 10,000 use round thousands (shown
+          as 25K), from 1,000,000 round hundred thousands (shown as 2.5M).</p>
+        <div class="btnrow" style="margin-top:8px">
+          <button class="btn slim gold" onclick="quickAddSave()">
+            <span class="bl">Save amounts</span></button>
+        </div>`}
         ${ho.lockBrandGameroom===undefined?"":`
         <div class="tkf" style="margin-top:12px"><label>When you lock a
           machine, its screen says</label></div>

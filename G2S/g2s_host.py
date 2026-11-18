@@ -386,8 +386,56 @@ GLASS_RID_ACTIONS = ("svcFund", "plFund", "plTake", "plCreate")
 GLASS_RID_KEEP_SEC = 600
 GLASS_RID_MAX = 64
 # The most a screen can add to a wallet, or take back, in one go (whole
-# cents: $100,000.00). Larger sums are for the Players web page.
-GLASS_ADMIN_MAX_CENTS = 10_000_000
+# cents: $99,999,999.99). This is not a house rule: it is the largest
+# figure the keypads are built to show. It was $100,000.00 until the
+# owner said (2026-11-18): "It's a home game room. If someone wants to be
+# a fake millionaire and hand out fat wallets let them."
+GLASS_ADMIN_MAX_CENTS = 9_999_999_999
+# The three quick amounts on the admin's amount pad (ADD TO WALLET, ADD
+# FREE SLOT PLAY, ADD FUNDS, TAKE BACK), in cents. These are what a hub
+# starts with; the owner sets their own in Settings ("the game room owner
+# can choose what they want for quick adds").
+QUICK_ADD_DEFAULT_CENTS = (2000, 5000, 10000)
+
+
+def quick_add_error(cents):
+    """Why `cents` cannot be a quick amount, in words for the Settings
+    page; None when it can.
+
+    A quick amount is a chip on a small screen (72 px wide on the digital
+    glass), so it has to have a short label: whole dollars, written out up
+    to 9,999, as thousands above that (10K, 250K) and as millions from a
+    million (1M, 2.5M). An amount that cannot be written that way exactly
+    is refused here, so a chip never shows a rounded figure."""
+    if not isinstance(cents, int) or cents < 100 or cents % 100:
+        # (True and False are 1 and 0 here, and refused as too small)
+        return ("Each quick amount is a whole number of 1 or more, with "
+                "no cents.")
+    dollars = cents // 100
+    if cents > GLASS_ADMIN_MAX_CENTS:
+        # the largest round figure under the keypad's own most
+        return "A quick amount can be 99,900,000 at most."
+    if dollars >= 1_000_000 and dollars % 100_000:
+        return ("From 1,000,000 up, a quick amount has to be a round "
+                "hundred thousand (2,500,000 shows as 2.5M).")
+    if dollars >= 10_000 and dollars % 1_000:
+        return ("From 10,000 up, a quick amount has to be a round "
+                "thousand (25,000 shows as 25K).")
+    return None
+
+
+def quick_add_cents(hub_store):
+    """The three quick amounts in force, in cents (host setting
+    quick_add_cents, stored as "a,b,c"). What a hub starts with when the
+    setting is unset or cannot be read as three good amounts."""
+    try:
+        vals = [int(x) for x in str(
+            hub_store.host_setting("quick_add_cents", "") or "").split(",")]
+    except Exception:  # noqa: BLE001 — a store fault reads as the default
+        vals = []
+    if len(vals) == 3 and all(quick_add_error(v) is None for v in vals):
+        return vals
+    return list(QUICK_ADD_DEFAULT_CENTS)
 # The longest name the on-screen keyboard can give a player.
 GLASS_NAME_MAX = 16
 # ADD FOB: how long the screen counts down for a tap on the reader.
@@ -11037,7 +11085,8 @@ class G2SHost:
         out.update(machineMc=machine,
                    machine=f"{sym}{machine / 100000:,.2f}",
                    handpay=self._glass_service_handpay(egm_id, assoc),
-                   maxCents=GLASS_ADMIN_MAX_CENTS)
+                   maxCents=GLASS_ADMIN_MAX_CENTS,
+                   quickCents=quick_add_cents(self.hub_store))
         return out
 
     def _glass_player_rows(self, only=None):
@@ -11086,6 +11135,7 @@ class G2SHost:
         return {"ok": True, "view": "players", "egmId": egm_id,
                 "players": rows,
                 "limits": {"maxCents": GLASS_ADMIN_MAX_CENTS,
+                           "quickCents": quick_add_cents(self.hub_store),
                            "nameMax": GLASS_NAME_MAX,
                            "fobWaitSec": ADD_FOB_WAIT_SEC},
                 "fobWait": self._fob_wait_view(egm_id, tok, now)}
@@ -27060,6 +27110,9 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                             "currency_symbol", "") or "",
                         # PIN login (2026-09-14): Settings ▸ Gameroom ▸ PIN
                         "pinMinDigits": pin_min_digits(engine.hub_store),
+                        # Settings ▸ Gameroom ▸ Quick amounts: the three
+                        # one-tap amounts on the admin's amount pad
+                        "quickAddCents": quick_add_cents(engine.hub_store),
                         "pinAdminAllowed": engine.hub_store.host_setting(
                             "pin_admin_allowed", "0") == "1",
                         # Collector economy (2026-07-13, de-caged 07-15): the bank's
@@ -29922,6 +29975,21 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                     raise ValueError("pinMinDigits must be 4 or 6")
                 engine.hub_store.set_host_setting("pin_min_digits", str(md))
                 out["pinMinDigits"] = md
+            if "quickAddCents" in req:
+                # The three quick amounts on the admin's amount pad on a
+                # machine's screen (2026-11-18). Exactly three, each one
+                # an amount a chip can show exactly (quick_add_error). The
+                # screens pick it up on their next poll.
+                qa = req.get("quickAddCents")
+                if not isinstance(qa, list) or len(qa) != 3:
+                    raise ValueError("Give three quick amounts.")
+                for v in qa:
+                    why = quick_add_error(v)
+                    if why:
+                        raise ValueError(why)
+                engine.hub_store.set_host_setting(
+                    "quick_add_cents", ",".join(str(v) for v in qa))
+                out["quickAddCents"] = list(qa)
             if "pinAdminAllowed" in req:
                 # Whether a PIN login on an admin account gets the admin
                 # menu (default no — see _session_is_admin). Strict bool.

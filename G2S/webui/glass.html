@@ -972,6 +972,10 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
         boxes[i].style.left = ''; boxes[i].style.top = '';
       }
     }
+    // the quick-amount chips are a different width in each lane: fit their
+    // labels again (not on the first call below, which runs before the
+    // amounts exist)
+    if (GIVE_CHIPS) { paintGiveChips(); }
   }
   applyLayout(window.innerWidth, window.innerHeight, false);
 
@@ -1038,9 +1042,12 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
                                      // machine's currencyId) overrides it
   var CHIPS = [100, 500, 2000];      // preset chips (cents): $1 / $5 / $20
   var GIVE_CHIPS = [2000, 5000, 10000];  // the service screen's quick amounts
-                                     // (cents): $20 / $50 / $100
-  var GIVE_MAX = 10000000;           // the most one add may be (cents) when
-                                     // state.service names no limit; the hub
+                                     // (cents). $20 / $50 / $100 until the
+                                     // hub sends the owner's own (Settings)
+                                     // in state.service.quickCents
+  var GIVE_MAX = 9999999999;         // the most one add may be (cents) when
+                                     // state.service names no limit: the
+                                     // largest figure the pad shows; the hub
                                      // keeps its own limit whatever we send
   var selIdx = 1;                    // selected chip index (default $5)
   var selCents = CHIPS[selIdx];      // its value in cents (what walletFund sends)
@@ -1248,6 +1255,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
         svc = null;
       } else if (seq === svcSeq || s.sess !== sess) {
         svc = (s.service && typeof s.service === 'object') ? s.service : null;
+        if (svc) { takeQuick(svc.quickCents); }
       }
       // else: this poll left before the last add was answered and carries
       // the friend's OLDER figures. The answer's are newer: keep them for
@@ -1334,13 +1342,13 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   // millicents -> dollars string (1 cent = 1000 millicents, the hub-side rule)
   function fmtMc(mc) { return fmtCents(Math.floor((mc || 0) / 1000)); }
   // the preset chips are static HTML ("$1 $5 $20", and the keypad's quick
-  // amounts "$20 $50 $100"); repaint them and the live amount button
-  // whenever the hub's money symbol changes
+  // amounts); repaint them and the live amount button whenever the hub's
+  // money symbol changes
   function repaintCurrency() {
     for (var i = 0; i < 3; i++) {
       setText('wl-chip' + i, CUR + String(CHIPS[i] / 100));
-      setText('kp-chip' + i, CUR + String(GIVE_CHIPS[i] / 100));
     }
+    paintGiveChips();
     setText('wl-custom', fmtCents(selCents));
     fitAmountButton();
   }
@@ -1486,6 +1494,40 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   // setStyle so an idle poll writes nothing. It never reads /api/glass/data:
   // a data read counts as activity on the hub and would hold the tap-over
   // open for ever. svc is null when the hub left the block out.
+  // A quick amount's label, short enough for a 72px chip: written out up
+  // to 9,999, as thousands from 10,000 (25K) and as millions from a
+  // million (2.5M). The hub only lets the owner pick amounts this writes
+  // exactly; anything else is written out in full and the type steps down.
+  function chipLabel(cents) {
+    var d = cents / 100;
+    if (d >= 1000000 && d % 100000 === 0) { return CUR + String(d / 1000000) + 'M'; }
+    if (d >= 10000 && d % 1000 === 0) { return CUR + String(d / 1000) + 'K'; }
+    return fmtCents(cents).replace(/\.00$/, '');
+  }
+  function paintGiveChips() {
+    // a chip is 72px wide in the tall lane, 140px in the wide one; 18px type
+    var lane = (layoutMode === 'wide') ? 128 : 62, i;
+    for (i = 0; i < 3; i++) {
+      setText('kp-chip' + i, chipLabel(GIVE_CHIPS[i]));
+      if (!fitFigure('kp-chip' + i, lane, 18, 10)) {
+        setStyle($('kp-chip' + i), 'fontSize', '');
+      }
+    }
+  }
+  // The owner's quick amounts as the hub sends them: three whole positive
+  // numbers of cents. Anything else and the page keeps what it has.
+  function takeQuick(q) {
+    var i;
+    if (!q || q.length !== 3) { return; }
+    for (i = 0; i < 3; i++) {
+      if (typeof q[i] !== 'number' || !(q[i] >= 1) ||
+          q[i] !== Math.floor(q[i])) { return; }
+    }
+    if (q[0] === GIVE_CHIPS[0] && q[1] === GIVE_CHIPS[1] &&
+        q[2] === GIVE_CHIPS[2]) { return; }
+    GIVE_CHIPS = [q[0], q[1], q[2]];
+    paintGiveChips();
+  }
   function svcFriend() {
     // the friend's block when an action for them may start: a tap-over is
     // up, we hold its token, DONE is not on its way, and the friend's fob
@@ -1579,6 +1621,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   function serviceResult(data, say) {
     if (data.service && typeof data.service === 'object') {
       svc = data.service;
+      takeQuick(svc.quickCents);
       svcSeq++;              // polls already in flight are older than this
     }
     svMsg = data.msg ? String(data.msg) : say;

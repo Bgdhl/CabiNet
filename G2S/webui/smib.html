@@ -565,7 +565,8 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
              border: 2px solid #1c2634; cursor: pointer; }
 #kp-cancel:active { background: #1c2634; }
 
-/* the admin's quick amounts ($20 / $50 / $100), right of the grid; shown
+/* the admin's three quick amounts (the owner's own, from Settings; $20 /
+   $50 / $100 until the hub says), right of the grid; shown
    only while the pad is adding to or taking back from a player's wallet
    (#kp-scrim.give). A chip is the same as typing that amount and OK. */
 .kp-chip { position: absolute; left: 736px; width: 160px; height: 72px;
@@ -1250,7 +1251,10 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
 
   // ---- what an admin does for a player ------------------------------------
   var GIVE_CHIPS = [2000, 5000, 10000];  // quick amounts (cents) on the
-                                     // admin's amount pad: $20 / $50 / $100
+                                     // admin's amount pad. $20 / $50 / $100
+                                     // until the hub sends the owner's own
+                                     // (Settings): service.quickCents and
+                                     // the players view's limits.quickCents
   var kpCtx = null;                  // amount pad in 'give' mode: who it is
                                      // for and what it will ask (openGivePad)
   var pinCtx = null;                 // SET PIN: {action, accountId, back}
@@ -1259,8 +1263,9 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
                                      // until the second is compared with it
   var plRows = null;                 // PLAYERS: the page's copy of the list
   var plPage = 0;                    // PLAYERS: which page of it is showing
-  var plMax = 10000000;              // most cents per add / take back (the
-                                     // players view's limits.maxCents)
+  var plMax = 9999999999;            // most cents per add / take back (the
+                                     // players view's limits.maxCents): the
+                                     // largest figure the pad shows
   var ppRow = null;                  // PLAYER: the row whose page is open
   var ppMsg = '';                    // PLAYER: the hub's last sentence
   var fwOn = false;                  // ADD FOB: waiting for a tap
@@ -1464,6 +1469,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
       // on a timer would hold the tap-over open for ever)
       svc = (overlay && s.service && typeof s.service === 'object')
         ? s.service : null;
+      if (svc) { takeQuick(svc.quickCents); }
       who = s.name || '';
       sinceIso = s.sinceIso || '';
       // the hub leaves credits out during a tap-over (the friend's balance
@@ -1547,14 +1553,45 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   // millicents -> dollars string (1 cent = 1000 millicents, the hub rule)
   function fmtMc(mc) { return fmtCents(Math.floor((mc || 0) / 1000)); }
   // the preset chips are static HTML ("$1 $5 $20", and the admin pad's
-  // "$20 $50 $100"); repaint them and the live amount button whenever the
+  // quick amounts); repaint them and the live amount button whenever the
   // hub's money symbol changes
   function repaintCurrency() {
     for (var i = 0; i < 3; i++) {
       setText('wl-chip' + i, CUR + String(CHIPS[i] / 100));
-      setText('kp-chip' + i, CUR + String(GIVE_CHIPS[i] / 100));
     }
+    paintGiveChips();
     setText('wl-custom', fmtCents(selCents));
+  }
+  // A quick amount's label, short enough for a chip: written out up to
+  // 9,999, as thousands from 10,000 (25K) and as millions from a million
+  // (2.5M). The hub only lets the owner pick amounts this writes exactly;
+  // anything else is written out in full and the type steps down to fit.
+  function chipLabel(cents) {
+    var d = cents / 100;
+    if (d >= 1000000 && d % 100000 === 0) { return CUR + String(d / 1000000) + 'M'; }
+    if (d >= 10000 && d % 1000 === 0) { return CUR + String(d / 1000) + 'K'; }
+    return fmtCents(cents).replace(/\.00$/, '');
+  }
+  function paintGiveChips() {
+    for (var i = 0; i < 3; i++) {
+      setText('kp-chip' + i, chipLabel(GIVE_CHIPS[i]));
+      // a chip is 160px wide (252px in the strip lane), 26px type
+      fitText('kp-chip' + i, isStrip() ? 240 : 148, 26, 14);
+    }
+  }
+  // The owner's quick amounts as the hub sends them: three whole positive
+  // numbers of cents. Anything else and the page keeps what it has.
+  function takeQuick(q) {
+    var i;
+    if (!q || q.length !== 3) { return; }
+    for (i = 0; i < 3; i++) {
+      if (typeof q[i] !== 'number' || !(q[i] >= 1) ||
+          q[i] !== Math.floor(q[i])) { return; }
+    }
+    if (q[0] === GIVE_CHIPS[0] && q[1] === GIVE_CHIPS[1] &&
+        q[2] === GIVE_CHIPS[2]) { return; }
+    GIVE_CHIPS = [q[0], q[1], q[2]];
+    paintGiveChips();
   }
   // paint a money string; a below-zero amount goes RED (house rule: negative
   // balances read red on every surface). '' hands the color back to the
@@ -2221,6 +2258,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     if (back === 'service') {
       if (data && data.service && typeof data.service === 'object') {
         svc = data.service;
+        takeQuick(svc.quickCents);
       }
       svMsg = msg;
       show('service');
@@ -2385,6 +2423,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
         typeof d.players.length !== 'number') { return false; }
     plRows = d.players;
     if (d.limits && d.limits.maxCents > 0) { plMax = d.limits.maxCents; }
+    if (d.limits) { takeQuick(d.limits.quickCents); }
     return true;
   }
   // err = a failed read's words; '' paints the rows of the current page

@@ -923,10 +923,11 @@ def admin_menu_callers():
     check("the service actions and the players actions are the ones the "
           "pages use",
           gh.GLASS_SERVICE_ACTIONS == SVC and gh.GLASS_PLAYERS_ACTIONS == PL)
-    check("the limits: $100,000.00 per action, 16 letters in a name, a "
-          "20 second ADD FOB count",
-          gh.GLASS_ADMIN_MAX_CENTS == 10_000_000 and gh.GLASS_NAME_MAX == 16
-          and gh.ADD_FOB_WAIT_SEC == 20)
+    check("the limits: the largest figure a keypad shows per action "
+          "($99,999,999.99; not a house rule, it was $100,000.00), 16 "
+          "letters in a name, a 20 second ADD FOB count",
+          gh.GLASS_ADMIN_MAX_CENTS == 9_999_999_999
+          and gh.GLASS_NAME_MAX == 16 and gh.ADD_FOB_WAIT_SEC == 20)
 
     eng = menu_engine("M_PLAYER", "M_PIN", "M_ADMIN", "M_ATT", "M_TAP",
                       "M_GONE")
@@ -1261,7 +1262,8 @@ def admin_menu_service():
               "handpay": {"pending": True, "amount": "$1,250.00",
                           "type": "G2S_gameWin", "canClear": True,
                           "more": 0},
-              "maxCents": 10000000}, st_.get("service"))
+              "maxCents": 9999999999,
+              "quickCents": [2000, 5000, 10000]}, st_.get("service"))
     check("the admin's identity and the tap-over flags are as before",
           st_.get("overlay") is True and st_.get("admin") is True
           and st_.get("name") == "Dana" and st_.get("sess") == tok
@@ -1352,7 +1354,7 @@ def admin_menu_service():
           blk.get("hasWallet") is False and blk.get("name") == "spare fob"
           and not any(k in blk for k in ("walletMc", "wallet", "freePlayMc",
                                          "freePlay", "hasPin"))
-          and blk.get("maxCents") == 10000000 and "machineMc" in blk, blk)
+          and blk.get("maxCents") == 9999999999 and "machineMc" in blk, blk)
     st, r = adm(eng, tok2, "svcFund", cents=500, rid=rid())
     st2, r2 = adm(eng, tok2, "svcSetPin", pin="482913")
     check("both service actions say the fob is not linked to a player, "
@@ -1785,22 +1787,31 @@ def admin_menu_money():
         check(f"an amount of {bad!r} is refused: Enter an amount.",
               (st, r.get("error")) == (200, "Enter an amount.")
               and r.get("ok") is False and len(rows(eng)) == n0, (st, r))
-    st, r = adm(eng, svc, "svcFund", cents=10_000_001, rid=rid())
-    check("one cent over the ceiling is refused, and says the ceiling",
+    st, r = adm(eng, svc, "svcFund", cents=10_000_000_000, rid=rid())
+    check("one cent over the largest figure a keypad shows is refused, "
+          "and says that figure",
           (st, r.get("error")) == (200, "The most you can add at once is "
-                                        "$100,000.00.")
+                                        "$99,999,999.99.")
           and len(rows(eng)) == n0, (st, r))
-    st, r = adm(eng, adm_tok, "plTake", accountId=sam, cents=10_000_001,
-                rid=rid())
+    st, r = adm(eng, adm_tok, "plTake", accountId=sam,
+                cents=10_000_000_000, rid=rid())
     check("the same for TAKE BACK, in its own words",
           (st, r.get("error")) == (200, "The most you can take back at "
-                                        "once is $100,000.00.")
+                                        "once is $99,999,999.99.")
           and len(rows(eng)) == n0, (st, r))
-    st, r = adm(eng, svc, "svcFund", cents=10_000_000, rid=rid())
-    check("the ceiling itself goes through",
-          r.get("ok") is True and cash(eng, chris) == c0 + 10_000_000_000
-          and r.get("msg") == "Added $100,000.00 to Christopher's wallet.",
+    st, r = adm(eng, svc, "svcFund", cents=10_000_001, rid=rid())
+    check("what was the ceiling, $100,000.00, is no ceiling: a cent over "
+          "it goes through (the owner: \"If someone wants to be a fake "
+          "millionaire and hand out fat wallets let them\")",
+          r.get("ok") is True and cash(eng, chris) == c0 + 10_000_001_000
+          and r.get("msg") == "Added $100,000.01 to Christopher's wallet.",
           r)
+    c1 = cash(eng, chris)
+    st, r = adm(eng, svc, "svcFund", cents=9_999_999_999, rid=rid())
+    check("and so does the largest figure itself",
+          r.get("ok") is True and cash(eng, chris) == c1 + 9_999_999_999_000
+          and r.get("msg") == "Added $99,999,999.99 to Christopher's "
+                              "wallet.", r)
     n0 = len(rows(eng))
     for bad in ("true", 1, None, "false"):
         st, r = adm(eng, svc, "svcFund", cents=500, restricted=bad,
@@ -2254,8 +2265,9 @@ def admin_menu_pins_names_fobs():
     check("no whole fob uid anywhere in the view",
           not any(f["uid"] in json.dumps(v) for f in eng.hub_store.fobs()))
     check("the limits the page needs, and no ADD FOB wait",
-          v.get("limits") == {"maxCents": 10000000, "nameMax": 16,
-                              "fobWaitSec": 20}
+          v.get("limits") == {"maxCents": 9999999999,
+                              "quickCents": [2000, 5000, 10000],
+                              "nameMax": 16, "fobWaitSec": 20}
           and "fobWait" in v and v["fobWait"] is None, v.get("limits"))
     real_snap = store.snapshot
     store.snapshot = lambda: (_ for _ in ()).throw(RuntimeError("db"))
@@ -2354,6 +2366,107 @@ class Records(logging.Handler):
         if record.exc_info:
             self.lines.append(logging.Formatter().formatException(
                 record.exc_info))
+
+
+def admin_menu_quick_amounts():
+    print("— the quick amounts on the admin's add pad are the owner's to "
+          "set (the owner: \"the game room owner can choose what they want "
+          "for quick adds\")")
+    for good, label in ((100, "1"), (2000, "20"), (999_900, "9,999"),
+                        (1_000_000, "10K"), (2_500_000, "25K"),
+                        (100_000_000, "1M"), (250_000_000, "2.5M"),
+                        (9_990_000_000, "99.9M")):
+        check(f"{good} cents can be a quick amount (a chip shows it as "
+              f"{label})", gh.quick_add_error(good) is None,
+              gh.quick_add_error(good))
+    for bad, why in ((0, "nothing"), (50, "under 1"), (2050, "has cents"),
+                     (-2000, "negative"), (True, "not a number"),
+                     ("2000", "text"), (2000.0, "not whole cents"),
+                     (None, "missing"),
+                     (1_050_000, "10,500 cannot be written as thousands"),
+                     (255_000_000, "2,550,000 is not a round hundred "
+                                   "thousand"),
+                     (9_999_999_900, "99,999,999 is not round"),
+                     (10_000_000_000, "100,000,000 is over the most a "
+                                      "keypad shows")):
+        check(f"{bad!r} cannot ({why}), and the reason is a sentence",
+              isinstance(gh.quick_add_error(bad), str)
+              and gh.quick_add_error(bad).endswith("."),
+              gh.quick_add_error(bad))
+
+    eng = menu_engine("M1", "M2")
+    player(eng, "Christopher", "C4150001", cents=1000)
+    player(eng, "Dana", "DA4A0001", admin=True)
+    check("a hub starts with 20, 50 and 100",
+          gh.quick_add_cents(eng.hub_store) == [2000, 5000, 10000]
+          and gh.QUICK_ADD_DEFAULT_CENTS == (2000, 5000, 10000))
+
+    def settings(payload):
+        h = gh.G2SRequestHandler.__new__(gh.G2SRequestHandler)
+        h.host_engine = eng
+        sent = []
+        h._send = lambda code, body, ctype=None, soap=True: \
+            sent.append((code, json.loads(body)))
+        h._handle_settings(json.dumps(payload))
+        return sent[0]
+
+    st, r = settings({"quickAddCents": [500, 2_500_000, 100_000_000]})
+    check("Settings takes three amounts and answers with them",
+          st == 200 and r.get("ok") is True
+          and r.get("quickAddCents") == [500, 2_500_000, 100_000_000],
+          (st, r))
+    check("and they are the ones in force from then on, in the order "
+          "given", gh.quick_add_cents(eng.hub_store)
+          == [500, 2_500_000, 100_000_000])
+    tap_at(eng, "M1", "C4150001")
+    tap_at(eng, "M1", "DA4A0001")           # Dana taps over Christopher
+    blk = eng.glass_state("M1").get("service") or {}
+    check("the service screen of a tap-over is told them",
+          blk.get("quickCents") == [500, 2_500_000, 100_000_000], blk)
+    tap_at(eng, "M2", "DA4A0001")           # ...and cards in at M2
+    st, v = eng.glass_data(tok_of(eng, "M2"), "players")
+    check("so is the players menu of an admin carded in",
+          st == 200 and (v.get("limits") or {}).get("quickCents")
+          == [500, 2_500_000, 100_000_000], v.get("limits"))
+    for bad, why in (([500, 2000], "two"), ([500, 2000, 5000, 100], "four"),
+                     ("500,2000,5000", "text"), (None, "nothing"),
+                     ({"a": 500, "b": 2000, "c": 5000}, "a set of three "
+                                                        "named ones")):
+        st, r = settings({"quickAddCents": bad})
+        check(f"{why} is refused: Give three quick amounts.",
+              (st, r.get("error")) == (400, "Give three quick amounts.")
+              and gh.quick_add_cents(eng.hub_store)
+              == [500, 2_500_000, 100_000_000], (st, r))
+    check("the most a quick amount can be is said as a figure",
+          gh.quick_add_error(10_000_000_000)
+          == "A quick amount can be 99,900,000 at most.")
+    for bad, why in (([500, 2000, 10_000_000_000], "one over the most"),
+                     ([500, 2000, 2050], "one with cents"),
+                     ([500, 2000, 1_050_000], "one a chip cannot write"),
+                     ([500, True, 2000], "one that is not a number")):
+        st, r = settings({"quickAddCents": bad})
+        check(f"{why} is refused in words and changes nothing",
+              st == 400 and r.get("ok") is False
+              and isinstance(r.get("error"), str) and r["error"]
+              and gh.quick_add_cents(eng.hub_store)
+              == [500, 2_500_000, 100_000_000], (st, r))
+    for stored in ("", "500,2000", "500,abc,2000", "500,2000,2050",
+                   "0,0,0"):
+        eng.hub_store.set_host_setting("quick_add_cents", stored)
+        check(f"a stored value of {stored!r} reads as what a hub starts "
+              "with", gh.quick_add_cents(eng.hub_store)
+              == [2000, 5000, 10000])
+    real = eng.hub_store.host_setting
+    eng.hub_store.host_setting = lambda *a, **k: (_ for _ in ()).throw(
+        RuntimeError("db"))
+    try:
+        got = gh.quick_add_cents(eng.hub_store)
+    finally:
+        eng.hub_store.host_setting = real
+    check("so does a store that cannot be read", got == [2000, 5000, 10000])
+    st, r = settings({"quickAddCents": [2000, 2000, 2000]})
+    check("three the same is the owner's business", st == 200
+          and gh.quick_add_cents(eng.hub_store) == [2000, 2000, 2000])
 
 
 def admin_menu_logs():
@@ -3221,6 +3334,7 @@ def admin_menus():
     admin_menu_callers()
     admin_menu_service()
     admin_menu_logs()       # runs the money, PIN, name and fob checks first
+    admin_menu_quick_amounts()
     admin_menu_add_fob()
 
 

@@ -22,8 +22,12 @@ mostly read-only information nobody uses on the floor.
   buttons, HANDPAY, HIDE WINDOW and LOG OUT, and the SERVICE screen on a
   tap-over. It has no keyboard and no player management.
 - Money added from a screen comes from the House, as on the Players web
-  page, and the ledger note names the admin and the machine. At most
-  $100,000.00 at a time. A repeated tap cannot pay twice.
+  page, and the ledger note names the admin and the machine. There is no
+  house limit on an amount: the keypad takes anything up to
+  $99,999,999.99. A repeated tap cannot pay twice.
+- **The three quick amounts on the admin's add pad are yours to set**:
+  Settings, Host options, under the PIN switches. They start as $20, $50
+  and $100. Large ones show short on the chip (25K, 2.5M).
 - Making someone an admin and deleting a player stay on the web page.
 - **A PIN typed at a keypad, or set on the Players web page, is no longer
   written to the hub's wire log**, which support bundles copy. Logs and
