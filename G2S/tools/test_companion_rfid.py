@@ -39,6 +39,11 @@ Covers:
     an admin carded in normally, a tap-over), the service screen's reach
     (the friend at this machine and nobody else), money booked once, PINs,
     names, the players view, REMOVE FOB, and what reaches the logs.
+  * ADD FOB — an admin arms the reader of the machine they are carded in
+    at, and the next tap there is the new fob instead of a card-in: which
+    fobs are taken and what the screen is told about the others, that such
+    a tap cards nobody in or out, the 20 seconds, every way a wait ends,
+    and that every other tap still does what it always did.
 
 Run from G2S/:  python3 tools/test_companion_rfid.py
 Must end "RESULT: N passed, 0 failed".
@@ -841,12 +846,21 @@ def player(eng, name, uid=None, admin=False, cents=0, free=0):
     return aid
 
 
-def tap_at(eng, egm, uid):
-    """One tap of a fob on the reader of that machine."""
+def tap_at(eng, egm, uid, now=None, smib=None):
+    """One tap of a fob on the reader of that machine. `now` is the time
+    on the ADD FOB wait's clock, for the checks that set one; `smib` is
+    the machine's SAS side, when its reader is bound to one too."""
     n = eng._taps.get(egm, -1) + 1
     eng._taps[egm] = n
-    return report(eng, taps=[tap(n, uid=uid)], comp="companion-" + egm,
-                  g2s=egm)
+    if now is not None:
+        real = eng._process_companion_tap
+        eng._process_companion_tap = lambda comp, t: real(comp, t, now)
+    try:
+        return report(eng, taps=[tap(n, uid=uid)], comp="companion-" + egm,
+                      g2s=egm, smib=smib)
+    finally:
+        if now is not None:
+            del eng._process_companion_tap
 
 
 def tok_of(eng, egm):
@@ -1044,16 +1058,20 @@ def admin_menu_callers():
               all(st in (200, 400, 403) and r.get("error") != "not authorized"
                   and r.get("error") != "unknown session"
                   for st, r in got.values())
-              and all(got[n][0] != 403 for n in PL
-                      if n not in ("plAddFob", "plAddFobCancel")),
+              and all(got[n][0] != 403 for n in PL),
               {n: (st, r.get("error")) for n, (st, r) in got.items()})
         check(f"{who}: a players action with nothing in it is refused in "
               "words and changes nothing",
               got["plFund"] == (200, {"ok": False, "error": GONE,
                                       "action": "plFund", "egmId": egm})
               and got["plCreate"][1].get("error") == "Type a name."
-              and books(eng) == before,
-              (got["plFund"], got["plCreate"]))
+              and got["plAddFob"][1].get("error") == GONE
+              and got["plAddFobCancel"] == (200, {
+                  "ok": True, "fobWait": None, "action": "plAddFobCancel",
+                  "egmId": egm})
+              and books(eng) == before and not eng._fob_waits,
+              (got["plFund"], got["plCreate"], got["plAddFob"],
+               got["plAddFobCancel"]))
         st, r = act(eng, tok, "clearHandpay")
         check(f"{who}: clearHandpay is let in (nothing is pending here)",
               st == 200 and r.get("ok") is False
@@ -2245,13 +2263,6 @@ def admin_menu_pins_names_fobs():
     check("removing it again: it is not on that player any more",
           r.get("error") == "That fob is not on Sam any more.", r)
 
-    print("— ADD FOB: not built into the endpoint yet")
-    st, r = adm(eng, adm_tok, "plAddFob", accountId=sam)
-    st2, r2 = adm(eng, adm_tok, "plAddFobCancel")
-    check("plAddFob and plAddFobCancel answer 403 not yet for an admin "
-          "(the wait for a tap is the next piece of work)",
-          (st, r.get("error")) == (403, "not yet")
-          and (st2, r2.get("error")) == (403, "not yet"), (r, r2))
     return eng, svc, adm_tok, chris, sam
 
 
@@ -2442,10 +2453,687 @@ def admin_menu_logs():
               for ln in rec.lines))
 
 
+def floor(eng):
+    """Everything a tap can change on the floor: who is carded in where,
+    the tap-overs, each machine's live token, how much was sent to the
+    machines, and what is queued for a SAS machine."""
+    with eng.companion_lock:
+        cards = json.dumps(eng.card_sessions, sort_keys=True)
+        overs = json.dumps(eng.admin_overlays, sort_keys=True)
+    with eng.sas_lock:
+        queued = {k: [c.get("type") for c in q]
+                  for k, q in eng.sas_commands.items()}
+    toks = {e: tok_of(eng, e) for e in sorted(eng.associations)}
+    return cards, overs, toks, len(eng.sent), queued
+
+
+def admin_menu_add_fob():
+    print("— ADD FOB: an engine that never armed a reader")
+    lean = make_engine(assoc=FakeAssoc())
+    report(lean, taps=[tap(0)])
+    check("the tap path of an engine with no wait holds none, and needs "
+          "nothing set on it", gh.G2SHost._fob_waits is None
+          and lean._fob_waits is None and "_fob_waits" not in vars(lean))
+    check("the hub counts 20 seconds, allows 2 more for the tap to arrive, "
+          "ignores the new fob for 5, and keeps the result 60",
+          (gh.ADD_FOB_WAIT_SEC, gh.ADD_FOB_GRACE_SEC, gh.ADD_FOB_SETTLE_SEC,
+           gh.ADD_FOB_KEEP_SEC) == (20, 2, 5, 60))
+
+    eng = menu_engine("M1", "M2", "M3", "M4")
+    store, hs = eng.account_store, eng.hub_store
+    hs.set_nickname("M2", "Bluebird 2", protocol="g2s")
+    eng.sas_machines["smib-M1/1"] = {"smibId": "smib-M1"}
+    aj = player(eng, "AJ", "A1A00001", admin=True)
+    sam = player(eng, "Sam", cents=5000)
+    dana = player(eng, "Dana", "DA4A0001")
+    player(eng, "Christopher", "C4150001")
+    pia = player(eng, "Pia", admin=True)
+    hs.fob_set("DEADBEEF", tier="reset", label="Reset key")
+    hs.fob_set("A77E0001", tier="attendant", label="Floor key")
+    hs.fob_set("0FF1CE01", tier="player")       # player fobs with no player
+    hs.fob_set("0FF1CE02", tier="player")
+    hs.fob_set("0FF1CE03", tier="player", account_id="p999")   # ...deleted
+    store.set_pin(pia, "771234")
+    hs.set_host_setting("pin_admin_allowed", "1")
+    hs.fob_set("0DDBA110", tier="player")
+    with hs.lock:       # a kind of fob a later build might add
+        hs._conn.execute("PRAGMA ignore_check_constraints=ON")
+        hs._conn.execute("UPDATE fobs SET tier='vip' WHERE uid='0DDBA110'")
+        hs._conn.commit()
+        hs._conn.execute("PRAGMA ignore_check_constraints=OFF")
+    clock = [1_000_000.0]       # the wait's own clock: no check sleeps
+    real_pa = eng.player_action
+
+    def tap1(uid):
+        return tap_at(eng, "M1", uid, now=clock[0], smib="smib-M1")
+
+    def tap_other(egm, uid):
+        return tap_at(eng, egm, uid, now=clock[0])
+
+    def arm(aid, tok=None):
+        return eng.glass_admin_action(
+            {"sess": tok or tok_of(eng, "M1"), "action": "plAddFob",
+             "accountId": aid}, clock[0])
+
+    def cancel(tok=None):
+        return adm(eng, tok or tok_of(eng, "M1"), "plAddFobCancel")
+
+    def wait(tok=None):
+        return eng.glass_data(tok or tok_of(eng, "M1"), "players",
+                              clock[0])[1].get("fobWait")
+
+    def held():
+        return sorted(eng._fob_waits or {})
+
+    def waiting(left, note="", aid=sam, name="Sam"):
+        return {"state": "waiting", "secondsLeft": left, "accountId": aid,
+                "name": name, "note": note, "msg": ""}
+
+    def over(state, msg, aid=sam, name="Sam"):
+        return {"state": state, "secondsLeft": 0, "accountId": aid,
+                "name": name, "note": "", "msg": msg}
+
+    def last_tap(egm="M1"):
+        return (eng.companion_snapshot().get("companion-" + egm)
+                or {}).get("lastTap") or {}
+
+    def card(egm="M1"):
+        return eng.card_sessions.get(egm) or {}
+
+    def owner(uid):
+        return (hs.fob_get(uid) or {}).get("accountId")
+
+    def not_known(uid):
+        return hs.fob_get(uid) is None and last_tap().get("uid") == uid \
+            and last_tap().get("known") is False
+
+    tap1("A1A00001")                    # AJ cards in at M1
+    tap_other("M2", "0FF1CE02")         # a fob with no player, at Bluebird 2
+    tap_other("M3", "C4150001")         # Christopher at M3
+    tok = tok_of(eng, "M1")
+    check("the cast: an admin carded in at M1 beside its reader, a fob "
+          "with no player carded in at Bluebird 2, a player at M3",
+          eng.glass_state("M1").get("admin") is True
+          and card("M2").get("name") == "Player"
+          and card("M3").get("name") == "Christopher"
+          and (eng.companions["companion-M1"]["bindings"]["g2sEgmId"],
+               eng.companions["companion-M1"]["readerOk"]) == ("M1", True))
+
+    print("— ADD FOB: when the reader is not armed")
+    before = books(eng)
+    for label, who in (("the House", "house"), ("an unknown id", "p999"),
+                       ("an id that is not text", 7), ("no id", None)):
+        st, r = arm(who)
+        check(f"ADD FOB for {label}: that player is not there any more",
+              (st, r.get("error"), r.get("ok")) == (200, GONE, False)
+              and "fobWait" not in r, (st, r))
+    st, r = arm(pia)
+    check("ADD FOB for an admin's account is refused: a screen must not "
+          "make a new admin fob",
+          (st, r) == (200, {"ok": False, "action": "plAddFob", "egmId": "M1",
+                            "error": "Pia is an admin. Add an admin's fob "
+                                     "on the Players web page."}), (st, r))
+    no_reader = "This machine's fob reader is not answering."
+    comp = eng.companions["companion-M1"]
+    seen = comp["lastSeen"]
+    comp["lastSeen"] = seen - 25
+    st, r = arm(sam)
+    check("this machine's reader last reported 25 seconds ago: the reader "
+          "is not answering",
+          (st, r.get("error"), r.get("ok")) == (200, no_reader, False),
+          (st, r))
+    comp["lastSeen"] = time.time() - 15
+    st, r = arm(sam)
+    cancel()
+    comp["lastSeen"] = seen
+    check("(one that reported 15 seconds ago is answering)",
+          (st, r.get("ok")) == (200, True), (st, r))
+    report(eng, comp="companion-M1", g2s="M1", smib="smib-M1",
+           reader_ok=False)
+    st, r = arm(sam)
+    check("this machine's reader says its fob reader is not working: the "
+          "reader is not answering",
+          (st, r.get("error"), r.get("ok")) == (200, no_reader, False),
+          (st, r))
+    report(eng, comp="companion-M1", g2s="M1", smib="smib-M1")
+    eng.pin_login("M4", "771234")
+    pia_tok = tok_of(eng, "M4")
+    st, r = arm(sam, pia_tok)
+    check("an admin at a machine with no reader of its own (the readers "
+          "of other machines are answering): the reader is not answering",
+          eng.glass_data(pia_tok, "players")[0] == 200
+          and (st, r.get("error"), r.get("ok")) == (200, no_reader, False),
+          (st, r))
+    st, r = arm(sam, tok_of(eng, "M3"))
+    st2, r2 = cancel(tok_of(eng, "M3"))
+    check("a player who is not an admin cannot arm or cancel: 403",
+          (st, r.get("error")) == (403, "not authorized")
+          and (st2, r2.get("error")) == (403, "not authorized"), (r, r2))
+    tap_other("M3", "A77E0001")         # the floor key taps over Christopher
+    st, r = arm(sam, tok_of(eng, "M3"))
+    st2, r2 = cancel(tok_of(eng, "M3"))
+    check("a tap-over cannot arm or cancel: 403",
+          eng.admin_overlays.get("M3") is not None
+          and (st, r.get("error")) == (403, "not authorized")
+          and (st2, r2.get("error")) == (403, "not authorized"), (r, r2))
+    tap_other("M3", "A77E0001")         # ...and hands the screen back
+    check("none of those armed a reader or changed a fob", held() == []
+          and books(eng) == before and wait() is None)
+    was = floor(eng)
+    tap1("0E0F0001")
+    check("so a fob the hub has never seen, tapped at M1, is recorded and "
+          "nothing else, as always", not_known("0E0F0001")
+          and floor(eng) == was and books(eng) == before)
+
+    print("— ADD FOB: armed")
+    t0 = clock[0]
+    st, r = arm(sam)
+    check("ADD FOB for a player: ok, no sentence yet, and a wait with 20 "
+          "seconds on the count",
+          (st, r) == (200, {"ok": True, "fobWait": waiting(20),
+                            "action": "plAddFob", "egmId": "M1"}), (st, r))
+    st, r = Screen(eng)._handle_glass_admin(json.dumps(
+        {"sess": tok, "action": "plAddFobCancel"}))
+    st2, r2 = Screen(eng)._handle_glass_admin(json.dumps(
+        {"sess": tok, "action": "plAddFob", "accountId": sam}))
+    check("the same two actions through the screen's own POST handler",
+          (st, r) == (200, {"ok": True, "fobWait": None,
+                            "action": "plAddFobCancel", "egmId": "M1"})
+          and st2 == 200
+          and (r2.get("fobWait") or {}).get("state") == "waiting",
+          (st, r, st2, r2))
+    with eng.companion_lock:    # (the handler armed it on the wall clock)
+        ((eng._fob_waits or {}).get("M1") or {})["armedTs"] = t0
+    st, v = eng.glass_data(tok, "players", t0)
+    check("the players view carries the wait for the screen that armed it, "
+          "beside the players", st == 200 and v.get("ok") is True
+          and v.get("fobWait") == waiting(20)
+          and "Sam" in [p["name"] for p in v.get("players") or []],
+          v.get("fobWait"))
+    check("an admin at another machine reads no wait",
+          eng.glass_data(pia_tok, "players", t0)[1].get("fobWait", 0) is None)
+    eng._glass_card_out("M4")           # Pia leaves
+    before, was = books(eng), floor(eng)
+    for dt, left in ((0.4, 20), (1, 19), (1.2, 19), (10, 10), (19.5, 1),
+                     (20, 0), (21.9, 0)):
+        clock[0] = t0 + dt
+        check(f"{dt} seconds after arming the count reads {left}",
+              wait() == waiting(left), wait())
+    check("in all that time nobody was carded out and nothing was sent",
+          floor(eng) == was)
+
+    print("— ADD FOB: a tap on this machine's reader that is not a new fob")
+    t0 = clock[0] = t0 + 100
+    arm(sam)
+    for label, uid, note in (
+            ("the fob the admin carded in with", "A1A00001",
+             "That is the fob you carded in with."),
+            ("a reset fob", "DEADBEEF",
+             "That is a reset fob. It can't be a player's fob."),
+            ("an attendant's fob", "A77E0001",
+             "That is a staff fob. It can't be a player's fob."),
+            ("a fob of a kind this build does not know", "0DDBA110",
+             "That is a staff fob. It can't be a player's fob."),
+            ("another player's fob", "DA4A0001",
+             "That fob belongs to Dana. Remove it from Dana first."),
+            ("the fob of a player who is carded in at another machine",
+             "C4150001", "That fob belongs to Christopher. Remove it from "
+                         "Christopher first."),
+            ("a fob with no player that is carded in at another machine",
+             "0FF1CE02", "That fob is carded in at Bluebird 2. Card out "
+                         "there first.")):
+        clock[0] += 1
+        tap1(uid)
+        check(f"{label} is not taken: {note}",
+              wait() == waiting(20 - int(clock[0] - t0), note), wait())
+        check("...the wait goes on, nobody is carded in or out, no tap-over "
+              "is raised, nothing is sent to a machine or queued for one, "
+              "and no fob has changed hands",
+              floor(eng) == was and books(eng) == before
+              and tok_of(eng, "M1") == tok and last_tap().get("uid") == uid,
+              (floor(eng), was))
+    with eng.companion_lock:    # by hand: its account was deleted since
+        eng.admin_overlays["M4"] = {"uid": "0FF1CE01", "name": "Player",
+                                    "tier": "player", "tok": "gs_none"}
+    tap1("0FF1CE01")
+    with eng.companion_lock:
+        eng.admin_overlays.pop("M4")
+    check("the fob of a tap-over that is up at another machine is not "
+          "taken: That fob is carded in at M4. Card out there first.",
+          wait() == waiting(20 - int(clock[0] - t0), "That fob is carded in "
+                            "at M4. Card out there first.")
+          and floor(eng) == was and books(eng) == before, wait())
+    clock[0] += 1
+    tap1("0FF1CE01")
+    check("then a player fob with no player is tapped: it is added, and "
+          "the wait is over (Fob added for Sam.)",
+          wait() == over("linked", "Fob added for Sam.")
+          and owner("0FF1CE01") == sam
+          and floor(eng) == was, wait())
+    check("the players view shows the new fob on the player's row, by its "
+          "last 6 characters",
+          [f["tail"] for p in eng.glass_data(tok, "players", clock[0])[1]
+           .get("players") or [] if p["id"] == sam for f in p["fobs"]]
+          == ["F1CE01"])
+
+    print("— ADD FOB: the new fob tapped again straight away")
+    linked_at = clock[0]
+    clock[0] = linked_at + 3
+    tap1("0FF1CE01")
+    check("3 seconds after it was added, the new fob on this reader does "
+          "nothing: the admin is still carded in with the same token, "
+          "nothing is sent, and Sam is not carded in",
+          floor(eng) == was and tok_of(eng, "M1") == tok
+          and card().get("uid") == "A1A00001", floor(eng))
+    tap_other("M4", "0FF1CE01")
+    check("...on ANOTHER machine's reader it is an ordinary tap: Sam cards "
+          "in there",
+          card("M4").get("accountId") == sam
+          and card("M4").get("uid") == "0FF1CE01"
+          and card().get("uid") == "A1A00001")
+    tap_other("M4", "0FF1CE01")         # ...and out again
+    sent = len(eng.sent)
+    tap1("0E0F0001")
+    check("...and a fob the hub has never seen is still recorded and "
+          "nothing else", not_known("0E0F0001")
+          and card().get("uid") == "A1A00001"
+          and len(eng.sent) == sent)
+    clock[0] = linked_at + 4.9
+    tap1("0FF1CE01")
+    check("4.9 seconds after: still nothing",
+          tok_of(eng, "M1") == tok and len(eng.sent) == sent
+          and card().get("uid") == "A1A00001")
+    clock[0] = linked_at + 6
+    tap1("0FF1CE01")
+    check("6 seconds after, it is a fob like any other: tapped here it is "
+          "a card switch, the admin out and Sam in",
+          card().get("uid") == "0FF1CE01"
+          and card().get("accountId") == sam
+          and tok_of(eng, "M1") != tok and len(eng.sent) == sent + 2
+          and held() == [], card())
+    tap1("0FF1CE01")                    # Sam out
+    tap1("A1A00001")                    # AJ in again
+    tok = tok_of(eng, "M1")
+
+    print("— ADD FOB: fobs the hub has never seen, and when the hub cannot "
+          "write")
+    t0 = clock[0] = clock[0] + 100
+    arm(sam)
+    before, was = books(eng), floor(eng)
+    tap1("0FF1CE01")
+    check("a fob the player already has: That fob is already Sam's.",
+          wait() == waiting(20, "That fob is already Sam's.")
+          and books(eng) == before and floor(eng) == was, wait())
+    real_set = hs.fob_set
+    hs.fob_set = lambda *a, **k: (None, "fob registry full (256)")
+    tap1("0E0F0002")
+    check("the hub's fob list is full: the screen says so, and where to "
+          "make room",
+          wait() == waiting(20, "The fob list is full. Remove a fob on the "
+                                "hub's web page first.")
+          and floor(eng) == was, wait())
+    hs.fob_set = lambda *a, **k: (None, "db write failed")
+    tap1("0E0F0002")
+    check("the hub cannot write the fob for another reason: That fob could "
+          "not be added. Try again.",
+          wait() == waiting(20, "That fob could not be added. Try again.")
+          and floor(eng) == was, wait())
+    hs.fob_set = real_set
+
+    def boom(req, by=None):
+        raise RuntimeError("link failed for " + str(req))
+    eng.player_action = boom
+    rec = Records()
+    host_log = logging.getLogger("g2s_host")
+    level = host_log.level
+    host_log.addHandler(rec)
+    host_log.setLevel(logging.DEBUG)
+    logging.disable(logging.NOTSET)
+    try:
+        tap1("DA4A0001")
+        tap1("0E0F0002")
+        eng.player_action = real_pa
+        check("a fault while adding the fob: the tap still does nothing "
+              "else (no card-in, no card switch), the fob is not added, "
+              "and the wait goes on",
+              floor(eng) == was and books(eng) == before
+              and (wait() or {}).get("state") == "waiting", wait())
+        clock[0] += 2
+        tap1("0e:0f:00:02")
+        new = hs.fob_get("0E0F0002") or {}
+        check("a fob the hub has never seen is registered as a player fob "
+              "and added, in one go",
+              wait() == over("linked", "Fob added for Sam.")
+              and (new.get("tier"), new.get("accountId")) == ("player", sam)
+              and floor(eng) == was, (wait(), new))
+        check("...and the tap that added it counts as its first: the fob "
+              "does not read as never used", bool(new.get("lastSeen")), new)
+        clock[0] += 1
+        tap1("0E0F0002")                # tapped again: ignored
+        arm(sam)
+        cancel()
+        st, r = arm(sam)
+    finally:
+        eng.player_action = real_pa
+        logging.disable(logging.CRITICAL)
+        host_log.removeHandler(rec)
+        host_log.setLevel(level)
+    by = " — by AJ at M1 (admin menu)"
+    check("the hub log has each result with the fob, the player and who "
+          "did it at which machine",
+          any(ln.endswith("[M1] ADD FOB: fob DA4A0001 not taken for Sam "
+                          f"({sam}): That fob belongs to Dana. Remove it "
+                          "from Dana first." + by) for ln in rec.lines)
+          and any(ln.endswith(f"[M1] ADD FOB: fob 0E0F0002 added for Sam "
+                              f"({sam})" + by) for ln in rec.lines)
+          and any(f"fob 0E0F0002 linked to {sam} (Sam)" in ln
+                  and ln.endswith(by) for ln in rec.lines)
+          and any(ln.endswith("[M1] fob 0E0F0002 tapped again just after "
+                              "it was added: ignored") for ln in rec.lines),
+          rec.lines)
+    check("arming and CANCEL are logged with the player and who did it",
+          sum(ln.endswith(f"[M1] ADD FOB armed for Sam ({sam})" + by
+                          + "; waiting 20 s for a tap")
+              for ln in rec.lines) == 2
+          and sum(ln.endswith(f"[M1] ADD FOB for Sam ({sam}) cancelled"
+                              + by) for ln in rec.lines) == 1, rec.lines)
+    check("a fault is logged by its class, never its text, and no session "
+          "token is in the log",
+          any(ln.endswith("[M1] ADD FOB: the tap of fob 0E0F0002 failed on "
+                          "the hub side (RuntimeError)") for ln in rec.lines)
+          and not any("link failed" in ln or tok in ln for ln in rec.lines),
+          rec.lines)
+    check("no whole fob uid is in anything the screen reads",
+          not any(f["uid"] in json.dumps([r, eng.glass_data(
+              tok, "players", clock[0])[1]]) for f in hs.fobs()))
+    clock[0] += 2
+    tap1("DA4A0001")
+    check("with a new wait armed, another player's fob is still refused "
+          "and nothing moves",
+          wait() == waiting(18, "That fob belongs to Dana. Remove it from "
+                                "Dana first.") and floor(eng) == was, wait())
+    tap1("0FF1CE03")
+    check("a fob whose player was deleted is added like a fob with no "
+          "player", wait() == over("linked", "Fob added for Sam.")
+          and owner("0FF1CE03") == sam, wait())
+    clock[0] += 2
+    tap1("DA4A0001")
+    check("another player's fob in the 5 seconds after that is an ordinary "
+          "tap: a card switch, the admin out and Dana in",
+          card().get("uid") == "DA4A0001" and held() == [],
+          card())
+    tap1("DA4A0001")                    # Dana out
+    tap1("A1A00001")                    # AJ in again
+    tok = tok_of(eng, "M1")
+
+    print("— ADD FOB: the player goes, or becomes an admin, while the "
+          "reader waits")
+    for label, change in (("is deleted", store.delete),
+                          ("is made an admin",
+                           lambda aid: store.set_admin(aid, True))):
+        zed = player(eng, "Zed")
+        arm(zed)
+        change(zed)
+        was = floor(eng)
+        tap1("0E0F0003")
+        check(f"the player {label}: at the next tap the wait ends (That "
+              "player is not there any more.) and the fob is not added",
+              wait() == over("ended", GONE, zed, "Zed")
+              and hs.fob_get("0E0F0003") is None and floor(eng) == was,
+              wait())
+        tap1("0E0F0003")
+        check("...and the tap after that is an ordinary one",
+              not_known("0E0F0003") and floor(eng) == was
+              and wait() == over("ended", GONE, zed, "Zed"))
+
+    print("— ADD FOB: the admin loses the right while the reader waits")
+    arm(sam)
+    store.set_admin(aj, False)
+    before, was = books(eng), floor(eng)
+    tap1("0E0F0003")
+    check("the next tap is an ordinary tap: a fob the hub has never seen "
+          "is recorded, and is NOT registered or added",
+          not_known("0E0F0003") and books(eng) == before
+          and floor(eng) == was)
+    check("...and the hub holds no wait for the machine any more",
+          held() == [])
+    store.set_admin(aj, True)
+    before = books(eng)
+    tap1("0E0F0003")
+    check("the right coming back does not bring the wait back",
+          wait() is None and not_known("0E0F0003") and books(eng) == before)
+
+    print("— ADD FOB: a tap on another machine's reader")
+    t0 = clock[0] = clock[0] + 100
+    arm(sam)
+    before = books(eng)
+    tap_other("M4", "0E0F0003")
+    check("a fob the hub has never seen, tapped at another machine, is "
+          "recorded there and nothing else",
+          hs.fob_get("0E0F0003") is None
+          and last_tap("M4").get("uid") == "0E0F0003"
+          and last_tap("M4").get("known") is False and books(eng) == before)
+    tap_other("M4", "DA4A0001")
+    check("a player's fob tapped at another machine cards them in there, "
+          "as always",
+          card("M4").get("uid") == "DA4A0001"
+          and books(eng) == before)
+    tap_other("M4", "DEADBEEF")
+    report(eng, taps=[tap(0, uid="0E0F0003")], comp="companion-hub",
+           g2s=None)
+    check("a tap on a reader that is bound to no machine (the hub's own) "
+          "is recorded there and nothing else",
+          hs.fob_get("0E0F0003") is None and books(eng) == before
+          and eng.companion_snapshot()["companion-hub"]["lastTap"]["uid"]
+          == "0E0F0003")
+    check("...and none of it touched the wait at this machine",
+          wait() == waiting(20) and tok_of(eng, "M1") == tok, wait())
+    tap1("DA4A0001")
+    check("(a fob carded in elsewhere, tapped here, is still refused by "
+          "its owner's name)",
+          wait() == waiting(20, "That fob belongs to Dana. Remove it from "
+                                "Dana first."), wait())
+    tap_other("M4", "DA4A0001")         # Dana out
+
+    print("— ADD FOB: the 20 seconds, and the 2 more the hub allows")
+    clock[0] = t0 + 19
+    tap1("0E0F0003")
+    check("19 seconds after arming, a tap adds the fob",
+          wait() == over("linked", "Fob added for Sam.")
+          and owner("0E0F0003") == sam, wait())
+    t0 = clock[0] = clock[0] + 100
+    arm(sam)
+    clock[0] = t0 + 21
+    check("21 seconds after arming the count reads 0 and the hub is still "
+          "waiting", wait() == waiting(0), wait())
+    tap1("0E0F0004")
+    check("...and a tap then still adds the fob (it was made as the count "
+          "ran out)", wait() == over("linked", "Fob added for Sam.")
+          and owner("0E0F0004") == sam, wait())
+    clock[0] = t0 + 21 + 59.9
+    check("how a wait ended stays readable for a minute",
+          wait() == over("linked", "Fob added for Sam."), wait())
+    clock[0] = t0 + 21 + 60
+    check("...and then it is gone", wait() is None and held() == [], held())
+    t0 = clock[0] = clock[0] + 100
+    arm(sam)
+    before, was = books(eng), floor(eng)
+    clock[0] = t0 + 23
+    tap1("0E0F0005")
+    check("23 seconds after arming, a tap is an ordinary tap: the fob is "
+          "recorded, not added", not_known("0E0F0005")
+          and books(eng) == before and floor(eng) == was)
+    check("...and the wait reads ended: No fob was tapped.",
+          wait() == over("ended", "No fob was tapped."), wait())
+    t0 = clock[0] = clock[0] + 100
+    arm(sam)
+    clock[0] = t0 + 22
+    check("with no tap at all, the wait reads ended from 22 seconds on",
+          wait() == over("ended", "No fob was tapped."), wait())
+    clock[0] = t0 + 22 + 59.9
+    still = wait()
+    clock[0] = t0 + 22 + 60
+    check("...for a minute, then it is gone",
+          still == over("ended", "No fob was tapped.") and wait() is None
+          and held() == [], (still, held()))
+
+    print("— ADD FOB: CANCEL, a second ADD FOB, and the admin leaving")
+    arm(sam)
+    st, r = cancel()
+    check("CANCEL: ok, and the wait is gone at once",
+          (st, r) == (200, {"ok": True, "fobWait": None,
+                            "action": "plAddFobCancel", "egmId": "M1"})
+          and wait() is None and held() == [], (st, r))
+    tap1("0E0F0005")
+    check("...so the next tap is an ordinary tap", not_known("0E0F0005")
+          and books(eng) == before and floor(eng) == was)
+    st, r = cancel()
+    check("CANCEL with nothing armed is fine",
+          (st, r.get("ok"), r.get("fobWait", 0)) == (200, True, None), r)
+    arm(sam)
+    st, r = arm(dana)
+    check("a second ADD FOB replaces the first: one wait, for the player "
+          "picked last", r.get("fobWait") == waiting(20, aid=dana,
+                                                     name="Dana")
+          and held() == ["M1"], r)
+    tap1("0E0F0005")
+    check("...and the fob tapped next goes to that player, not the first",
+          wait() == over("linked", "Fob added for Dana.", dana, "Dana")
+          and owner("0E0F0005") == dana, wait())
+    st, r = cancel()
+    clock[0] += 2
+    was = floor(eng)
+    tap1("0E0F0005")
+    check("leaving the page right after a fob was added takes the result "
+          "off the screen, and the new fob tapped again still does nothing",
+          r.get("fobWait", 0) is None and wait() is None
+          and floor(eng) == was and tok_of(eng, "M1") == tok, (r, wait()))
+
+    def link_then_rearm(req, by=None):
+        arm(dana)           # the admin picks another player at that moment
+        return real_pa(req, by=by)
+    arm(sam)
+    eng.player_action = link_then_rearm
+    tap1("0E0F0006")
+    eng.player_action = real_pa
+    check("a result is written only to the wait the tap belonged to: one "
+          "armed in the meantime is not marked done",
+          wait() == waiting(20, aid=dana, name="Dana")
+          and owner("0E0F0006") == sam, wait())
+    cancel()
+
+    lock = eng.companion_lock = WatchedLock()
+    seen_at = []
+    real_get, real_live = store.get, eng.glass_sessions.still_live
+    arm(sam)
+    eng.player_action = lambda req, by=None: \
+        seen_at.append(("link", lock.held)) or real_pa(req, by=by)
+    store.get = lambda aid: seen_at.append(("account", lock.held)) \
+        or real_get(aid)
+    eng.glass_sessions.still_live = lambda egm, t: \
+        seen_at.append(("live", lock.held)) or real_live(egm, t)
+    tap1("0E0F0007")
+    eng.player_action, store.get = real_pa, real_get
+    eng.glass_sessions.still_live = real_live
+    eng.companion_lock = threading.Lock()
+    check("the wait and \"is its token still the machine's live one\" are "
+          "read in one lock hold; the accounts are read and the fob is "
+          "linked outside it",
+          ("live", True) in seen_at and ("link", False) in seen_at
+          and ("account", False) in seen_at
+          and all(not h for what, h in seen_at if what != "live")
+          and owner("0E0F0007") == sam, seen_at)
+
+    before = books(eng)
+    for label, leave in (
+            ("the admin presses LOG OUT",
+             lambda: act(eng, tok_of(eng, "M1"), "logout")),
+            ("the admin is logged out from the hub's web page",
+             lambda: eng.card_out(eng.associations["M1"])),
+            ("someone logs in at the machine by PIN",
+             lambda: eng.pin_login("M1", "771234"))):
+        arm(sam)
+        armed = held()
+        leave()
+        check(f"{label} while the reader waits: the wait ends with the "
+              "card session", armed == ["M1"] and held() == []
+              and card().get("uid")
+              != "A1A00001", (armed, held()))
+        if eng.card_sessions.get("M1"):
+            eng._glass_card_out("M1")
+        was = floor(eng)
+        tap1("0E0F0008")
+        check("...and the next tap is an ordinary tap",
+              not_known("0E0F0008") and books(eng) == before
+              and floor(eng) == was)
+        tap1("A1A00001")                # AJ in again
+    tok = tok_of(eng, "M1")
+    arm(sam)
+    tok2 = eng.glass_sessions.mint("M1", "player", "A1A00001", "AJ")
+    st, r = cancel(tok2)
+    check("a wait belongs to the token that armed it: another token on "
+          "the machine reads none, and cannot cancel it",
+          eng.glass_data(tok2, "players", clock[0])[0] == 200
+          and wait(tok2) is None and r.get("ok") is True
+          and held() == ["M1"], (wait(tok2), held()))
+    was = floor(eng)
+    tap1("0E0F0008")
+    check("the token that armed the wait is no longer the machine's live "
+          "one: the next tap is an ordinary tap and the wait is dropped",
+          not_known("0E0F0008") and books(eng) == before
+          and floor(eng) == was and held() == [])
+
+    print("— ADD FOB: after all of that, taps do what they always did")
+    eng._glass_card_out("M1")
+    sent = len(eng.sent)
+    tap1("0E0F0008")
+    check("a fob the hub has never seen: recorded, NOTHING else",
+          not_known("0E0F0008") and eng.card_sessions.get("M1") is None
+          and len(eng.sent) == sent and books(eng) == before)
+    tap1("DA4A0001")
+    check("a player's fob: card IN",
+          card().get("uid") == "DA4A0001"
+          and card().get("accountId") == dana
+          and len(eng.sent) == sent + 1
+          and eng.sent[-1][1].startswith("setIdValidation(present=True"))
+    tap1("A1A00001")
+    check("an admin's fob over a carded player: a tap-over, the player "
+          "stays carded in",
+          (eng.admin_overlays.get("M1") or {}).get("uid") == "A1A00001"
+          and card().get("uid") == "DA4A0001"
+          and len(eng.sent) == sent + 1)
+    tap1("0FF1CE01")
+    check("any tap hands the screen back",
+          eng.admin_overlays.get("M1") is None
+          and card().get("uid") == "DA4A0001")
+    tap1("0FF1CE01")
+    check("another player's fob (the one added for Sam): a card switch, "
+          "out then in",
+          card().get("uid") == "0FF1CE01"
+          and card().get("name") == "Sam"
+          and len(eng.sent) == sent + 3
+          and eng.sent[-2][1].startswith("setIdValidation(present=False")
+          and eng.sent[-1][1].startswith("setIdValidation(present=True"))
+    tap1("0FF1CE01")
+    check("the same fob again: card OUT",
+          eng.card_sessions.get("M1") is None and tok_of(eng, "M1") is None
+          and len(eng.sent) == sent + 4)
+    tap1("DEADBEEF")
+    q = list(eng.sas_commands.get("smib-M1") or [])
+    check("a reset fob: one handpay reset queued for the machine's SAS "
+          "side (none was queued while the reader was armed)",
+          [c.get("type") for c in q] == ["handpay_reset"]
+          and len(eng.sent) == sent + 4, q)
+    check("...and nothing in this section moved any money",
+          all(e.get("note") == "seed" for e in rows(eng))
+          and cash(eng, sam) == 5000000)
+
+
 def admin_menus():
     admin_menu_callers()
     admin_menu_service()
     admin_menu_logs()       # runs the money, PIN, name and fob checks first
+    admin_menu_add_fob()
 
 
 def main():

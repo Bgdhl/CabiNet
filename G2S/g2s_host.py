@@ -329,9 +329,9 @@ TOURNAMENT_G2S_WON_METERS = ("G2S_egmPaidGameWonAmt",
 #     session, never from the request.
 #   * GLASS_PLAYERS_ACTIONS: only for an admin carded in NORMALLY (the
 #     token belongs to the machine's own card session). They act on the
-#     player the request names. The two ADD FOB names are listed here so
-#     they are refused for the wrong caller; the work behind them is the
-#     fob-tap wait.
+#     player the request names. plAddFob arms this machine's reader for
+#     one new fob (G2SHost._fob_wait_arm: the next tap there is the fob,
+#     not a card-in) and plAddFobCancel calls that off.
 # Which of the three callers a token is (player, admin, service) is decided
 # in one place: G2SHost._glass_caller.
 GLASS_BASE_ACTIONS = ("logout", "hideGlass")
@@ -392,6 +392,17 @@ GLASS_ADMIN_MAX_CENTS = 10_000_000
 GLASS_NAME_MAX = 16
 # ADD FOB: how long the screen counts down for a tap on the reader.
 ADD_FOB_WAIT_SEC = 20
+# ...and how much longer the hub still takes a tap as the new fob. A tap
+# reaches the hub a moment after it is made, so one made as the count
+# reaches 0 must not be taken as a card-in.
+ADD_FOB_GRACE_SEC = 2
+# After a fob is added, a second tap of it on that reader does nothing for
+# this long. The fob is an ordinary player fob from the moment it is
+# added, so without this a "did it take?" tap would be a card switch: the
+# admin logged out and the new player carded in on the admin's screen.
+ADD_FOB_SETTLE_SEC = 5
+# How long the screen that armed a wait can still read how it ended.
+ADD_FOB_KEEP_SEC = 60
 # 0x74 "available transfers" bit 1 (SAS 6.02 Table 8.2b): a transfer FROM
 # the gaming machine might be accepted right now. It gates the host-initiated
 # PULL (cashOutNow). It says nothing about the machine's CASH OUT button:
@@ -8119,6 +8130,8 @@ class G2SHost:
     # on the bound EGM, reset queues a SAS handpay_reset on the bound SMIB.
     # Unknown fobs are RECORDED ONLY (the UI offers registration) — a
     # credential is never auto-created from this unauthenticated wire.
+    # (One exception, and only while an admin carded in at that machine has
+    # asked for it from its screen: ADD FOB, see _process_companion_tap.)
 
     #: registry bound (hobby floor — a couple of Zeros, never hundreds)
     COMPANION_MAX = 16
@@ -8391,7 +8404,7 @@ class G2SHost:
                            sat_id=comp_id)
         return {"ok": True, "ackTapId": ack}
 
-    def _process_companion_tap(self, comp, tap):
+    def _process_companion_tap(self, comp, tap, now=None):
         """One deduped tap -> the fob action. Unknown fobs are recorded in
         lastTap (known=False) and NOTHING else — never auto-created, and
         register-from-tap is HUB-READER-ONLY (AJ house rule: a floor tap is
@@ -8399,7 +8412,17 @@ class G2SHost:
         "claim this card" meaning — the UI only mines the loopback-peer
         hub reader for enrollment). Known fobs dispatch by tier:
         player/attendant/manager = carded session, reset = SAS handpay
-        key-off (the physical attendant-key moment)."""
+        key-off (the physical attendant-key moment).
+
+        The ONE exception to both rules is ADD FOB: an admin carded in at
+        this machine has armed its reader for one new fob from the players
+        menu on its screen (_fob_wait_arm). While that wait stands, a tap
+        on a reader bound to THAT machine is the fob being added and
+        nothing else (_fob_wait_tap): nobody is carded in or out, no
+        tap-over is raised, no handpay reset is sent, and an unknown fob
+        is registered as a player fob and linked. A tap on any other
+        machine's reader, and every tap once the wait is over, is handled
+        as described above. `now` is the wait's clock, for the checks."""
         raw_uid = tap.get("uid") or ""
         uid = _norm_fob_uid(raw_uid)
         if uid is None:
@@ -8413,6 +8436,10 @@ class G2SHost:
                                "known": fob is not None,
                                "tier": (fob or {}).get("tier"),
                                "label": (fob or {}).get("label")}
+        # ADD FOB: BEFORE the unknown-fob return and the tier dispatch (the
+        # fob being added is usually one the hub has never seen)
+        if self._fob_wait_tap(comp, uid, fob, now):
+            return
         if fob is None:
             log.info("💳 [companion:%s] unknown fob %s — record-only; cards "
                      "register at the hub's reader (💳 The Players ▸ "
@@ -8833,6 +8860,17 @@ class G2SHost:
             # admin token, if still live, is revoked by the token revoke below
             # (expect_tok path) or revoke_egm (the None path).
             self.admin_overlays.pop(egm_id, None)
+            # ADD FOB: a wait armed from this machine's screen ends with
+            # the card session, in the SAME lock hold: the reader must not
+            # stay armed for an admin who has left. (A fob added a moment
+            # ago loses its settle time with it: the machine is free, and
+            # that fob cards in like any other.)
+            fob_wait = self._fob_waits.pop(egm_id, None) \
+                if self._fob_waits else None
+        if fob_wait is not None and fob_wait.get("state") == "waiting":
+            log.info("💳 [%s] ADD FOB for %s (%s) ended: the card session "
+                     "is over", egm_id, fob_wait.get("name"),
+                     fob_wait.get("accountId"))
         if expect_tok is None:
             self.glass_sessions.revoke_egm(egm_id)
         # Glass cashOutToWallet pin dies with the session (glass destub v1):
@@ -10468,7 +10506,7 @@ class G2SHost:
         return {"tok": tok, "rec": rec, "egmId": egm_id, "kind": kind,
                 "own": own, "card": card}
 
-    def glass_data(self, tok, view):
+    def glass_data(self, tok, view, now=None):
         """GET /api/glass/data backend: the screen's token-resolved reads.
         Returns (httpStatus, dict); the HTTP edge wraps this for the
         never-500 rule. 401 for a token that is unknown, expired or no
@@ -10479,7 +10517,9 @@ class G2SHost:
                    own wallet. Refused (403) for a tap-over token: it
                    would answer the ADMIN's wallet on the friend's screen.
           handpay  an admin carded in normally, and a tap-over.
-          players  an admin carded in normally only.
+          players  an admin carded in normally only. It also carries
+                   `fobWait`: how the ADD FOB wait this token armed is
+                   going (_fob_wait_view; `now` is that wait's clock).
         Any other name is 400 "unknown view"."""
         who = self._glass_caller(tok)
         if who is None:
@@ -10499,7 +10539,7 @@ class G2SHost:
             return 403, {"ok": False, "error": "not authorized", "view": view,
                          "egmId": egm_id}
         if view == "players":
-            return 200, self._glass_data_players(egm_id)
+            return 200, self._glass_data_players(egm_id, who["tok"], now)
         with self.assoc_lock:
             assoc = self.associations.get(egm_id)
         if view == "cashout":
@@ -11032,11 +11072,13 @@ class G2SHost:
                                  str(r.get("id") or "")))
         return rows, True
 
-    def _glass_data_players(self, egm_id):
+    def _glass_data_players(self, egm_id, tok=None, now=None):
         """players view: every player with their balances and fobs, for the
         companion screen's players menu. A failed read answers ok:false
         with no `players` key, so the page can tell it from an empty
-        list."""
+        list. `fobWait` is the ADD FOB wait that `tok` armed on this
+        machine, None when it armed none (the page polls this view once a
+        second while it shows a wait)."""
         rows, readable = self._glass_player_rows()
         if not readable:
             return {"ok": False, "view": "players", "egmId": egm_id,
@@ -11046,7 +11088,7 @@ class G2SHost:
                 "limits": {"maxCents": GLASS_ADMIN_MAX_CENTS,
                            "nameMax": GLASS_NAME_MAX,
                            "fobWaitSec": ADD_FOB_WAIT_SEC},
-                "fobWait": None}
+                "fobWait": self._fob_wait_view(egm_id, tok, now)}
 
     # Sentences a screen shows as they come. The hub writes every one, so
     # the two pages never word a refusal themselves.
@@ -11221,6 +11263,11 @@ class G2SHost:
         The page always sends a positive amount of whole cents and the hub
         sets the sign; one action moves at most GLASS_ADMIN_MAX_CENTS.
         Those three and plCreate carry a request id (_glass_once).
+
+        ADD FOB (plAddFob) does not add a fob itself: it arms this
+        machine's reader, and the next tap there is the fob
+        (_fob_wait_arm, _fob_wait_tap). Its reply and the players view
+        carry `fobWait`, which says how that is going.
 
         Every action is logged with who asked and at which machine
         (_glass_by), and money carries it in both ledger notes. A new PIN
@@ -11494,9 +11541,308 @@ class G2SHost:
             return 200, with_target(
                 {"ok": True, "msg": f"Fob removed from {name}."}, aid)
 
-        # plAddFob, plAddFobCancel: the wait for a tap on this machine's
-        # reader is not built into this endpoint yet
-        return no("not yet", 403)
+        if action == "plAddFob":
+            return self._fob_wait_arm(who, aid, acct, by, now)
+        # plAddFobCancel
+        return self._fob_wait_cancel(who)
+
+    # ------------------------------------------------------------- ADD FOB
+    # The players menu on a companion screen: an admin carded in NORMALLY
+    # picks a player and arms the reader of THAT machine for one new fob.
+    # The next tap there, inside the wait, is the fob: it is linked to the
+    # player instead of carding anyone in (_process_companion_tap asks
+    # _fob_wait_tap before it does anything else with a tap). One wait per
+    # machine, kept in memory only: a hub restart ends it, like the
+    # session that armed it.
+    #
+    # A wait is {tok, adminUid, adminTier, accountId, name, by, armedTs,
+    # state, note, msg} and, once it is over, endTs (and linkedUid when a
+    # fob was added). state is "waiting", then "linked" or "ended".
+    # It is over: when a fob is added; ADD_FOB_WAIT_SEC + ADD_FOB_GRACE_SEC
+    # after it was armed; on plAddFobCancel; when another is armed on the
+    # machine; when the machine's card session ends (_glass_card_out); and
+    # at the next tap, if the token that armed it is no longer the
+    # machine's live one or its admin has lost the right since.
+    # Everything here is read and written under companion_lock; the stores
+    # and player_action are never called while holding it.
+
+    _fob_waits = None       # {egmId: wait}; made on first use (a test
+    #                         engine has no __init__), None = none ever armed
+
+    @staticmethod
+    def _fob_wait_now(now=None):
+        """The one place the ADD FOB wait reads the clock."""
+        return time.time() if now is None else now
+
+    @staticmethod
+    def _fob_wait_over(wait, now):
+        """Close a wait whose time has run out. True when this call closed
+        it. Call it holding companion_lock."""
+        end = wait["armedTs"] + ADD_FOB_WAIT_SEC + ADD_FOB_GRACE_SEC
+        if wait["state"] != "waiting" or now < end:
+            return False
+        wait.update(state="ended", note="", msg="No fob was tapped.",
+                    endTs=end)
+        return True
+
+    def _fob_wait_view(self, egm_id, tok, now=None):
+        """`fobWait` as a screen reads it: None unless THIS token armed a
+        wait on this machine, else
+          {"state", "secondsLeft", "accountId", "name", "note", "msg"}
+        state "waiting": secondsLeft is what is left of the count the
+            screen shows (whole seconds, 0 during the grace), and note
+            says why the fob tapped last was not taken ("" when none was).
+        state "linked" / "ended": msg says how it ended; it stays readable
+            for ADD_FOB_KEEP_SEC, then this is None again.
+        A whole fob uid is never in it."""
+        now = self._fob_wait_now(now)
+        with self.companion_lock:
+            wait = (self._fob_waits or {}).get(egm_id)
+            if wait is None or not tok or wait["tok"] != tok:
+                return None
+            timed_out = self._fob_wait_over(wait, now)
+            w = dict(wait)
+            if w["state"] != "waiting" \
+                    and now - w["endTs"] >= ADD_FOB_KEEP_SEC:
+                del self._fob_waits[egm_id]
+        if timed_out:
+            log.info("💳 [%s] ADD FOB for %s (%s) ended: no fob was tapped "
+                     "in time", egm_id, w["name"], w["accountId"])
+        if w.get("hidden") or (w["state"] != "waiting"
+                               and now - w["endTs"] >= ADD_FOB_KEEP_SEC):
+            return None
+        left = 0
+        if w["state"] == "waiting":
+            # rounded UP: the count reads 20 when armed and 0 only once
+            # the 20 seconds are over
+            left = ADD_FOB_WAIT_SEC - (now - w["armedTs"])
+            left = min(ADD_FOB_WAIT_SEC, max(0, -int(-left // 1)))
+        return {"state": w["state"], "secondsLeft": left,
+                "accountId": w["accountId"], "name": w["name"],
+                "note": w["note"], "msg": w["msg"]}
+
+    def _fob_wait_arm(self, who, aid, acct, by, now=None):
+        """plAddFob: arm this machine's reader for one new fob for the
+        player `aid` (an existing player; the caller is an admin carded in
+        normally: glass_admin_action checked both). Returns (httpStatus,
+        dict). Refused in words for an admin's account (that would make a
+        new admin fob from a screen) and when no reader bound to this
+        machine is answering. A new wait replaces the machine's earlier
+        one."""
+        egm_id = who["egmId"]
+        name = str(acct.get("name") or "")
+        if acct.get("admin"):
+            return 200, {"ok": False, "error": (
+                f"{name} is an admin. Add an admin's fob on the Players "
+                "web page.")}
+        rec = who["rec"]
+        wait = {"tok": who["tok"], "adminUid": rec.get("uid"),
+                "adminTier": rec.get("tier"), "accountId": aid,
+                "name": name, "by": by,
+                "armedTs": self._fob_wait_now(now),
+                "state": "waiting", "note": "", "msg": ""}
+        # a reader's report is stamped on the wall clock (as /api/status
+        # judges it), whatever clock the wait is given
+        wall = time.time()
+        with self.companion_lock:
+            reader = any(
+                (c.get("bindings") or {}).get("g2sEgmId") == egm_id
+                and c.get("readerOk")
+                and wall - (c.get("lastSeen") or 0)
+                <= self.COMPANION_STALE_SEC
+                for c in self.companions.values())
+            if reader:
+                if self._fob_waits is None:
+                    self._fob_waits = {}
+                self._fob_waits[egm_id] = wait
+        if not reader:
+            return 200, {"ok": False, "error":
+                         "This machine's fob reader is not answering."}
+        log.info("💳 [%s] ADD FOB armed for %s (%s) — by %s; waiting %d s "
+                 "for a tap", egm_id, name, aid, by, ADD_FOB_WAIT_SEC)
+        return 200, {"ok": True, "fobWait": self._fob_wait_view(
+            egm_id, who["tok"], wait["armedTs"])}
+
+    def _fob_wait_cancel(self, who):
+        """plAddFobCancel: call off the wait this token armed on its
+        machine. Fine when there is none; always (200, fobWait None). A
+        wait that is already over is only taken off the screen: a fob
+        added a moment ago keeps its settle time."""
+        egm_id, dropped = who["egmId"], None
+        with self.companion_lock:
+            wait = (self._fob_waits or {}).get(egm_id)
+            if wait is not None and wait["tok"] == who["tok"]:
+                if wait["state"] == "waiting":
+                    dropped = self._fob_waits.pop(egm_id)
+                else:
+                    wait["hidden"] = True
+        if dropped is not None:
+            log.info("💳 [%s] ADD FOB for %s (%s) cancelled — by %s",
+                     egm_id, dropped["name"], dropped["accountId"],
+                     dropped["by"])
+        return 200, {"ok": True, "fobWait": None}
+
+    def _fob_wait_tap(self, comp, uid, fob, now=None):
+        """Is this tap the fob of an ADD FOB wait? True when it was used
+        up here and _process_companion_tap must do NOTHING more with it;
+        False when it is an ordinary tap. `uid` is the canonical uid and
+        `fob` its row in the fobs table (None for a fob the hub does not
+        know).
+
+        The tap is the wait's when the reader is bound to a machine whose
+        wait is still waiting, inside its time, armed by the token that
+        is still that machine's live one, for an admin who still has the
+        right. A wait that fails the last two is dropped here and the tap
+        is an ordinary one: an admin action must not outlive the admin.
+        From there on nothing falls through to the ordinary handling,
+        whatever _fob_wait_take does with the fob, even a fault.
+
+        For ADD_FOB_SETTLE_SEC after a fob was added, a tap of THAT fob
+        on a reader of THAT machine is also used up here, and does
+        nothing."""
+        egm_id = (comp.get("bindings") or {}).get("g2sEgmId")
+        if not egm_id or not self._fob_waits:
+            return False                # no wait was ever armed here
+        now = self._fob_wait_now(now)
+        live = again = False
+        w = carded = None
+        with self.companion_lock:
+            wait = self._fob_waits.get(egm_id)
+            if wait is None:
+                return False
+            timed_out = self._fob_wait_over(wait, now)
+            state = wait["state"]
+            if state == "waiting":
+                # the one allowed nesting (_glass_caller does the same)
+                live = self.glass_sessions.still_live(egm_id, wait["tok"])
+                if not live:
+                    del self._fob_waits[egm_id]
+                w = dict(wait)
+                # who is carded in where, read in this same hold: a fob in
+                # use at a machine is not handed to another player
+                carded = {}
+                for held in (self.card_sessions, self.admin_overlays):
+                    for egm, s in held.items():
+                        carded.setdefault(str(s.get("uid") or "").upper(),
+                                          egm)
+            elif state == "linked":
+                again = wait.get("linkedUid") == uid \
+                    and now - wait["endTs"] < ADD_FOB_SETTLE_SEC
+        if state != "waiting":
+            if timed_out:
+                log.info("💳 [%s] ADD FOB for %s (%s) ended: no fob was "
+                         "tapped in time", egm_id, wait["name"],
+                         wait["accountId"])
+            if again:
+                log.info("💳 [%s] fob %s tapped again just after it was "
+                         "added: ignored", egm_id, uid)
+            return again
+        if not live:
+            log.info("💳 [%s] ADD FOB for %s (%s) dropped: the session "
+                     "that armed it is over — fob %s is an ordinary tap",
+                     egm_id, w["name"], w["accountId"], uid)
+            return False
+        try:
+            if not self._session_is_admin(w["adminUid"], w["adminTier"]):
+                with self.companion_lock:
+                    if self._fob_waits.get(egm_id) is wait:
+                        del self._fob_waits[egm_id]
+                log.info("💳 [%s] ADD FOB for %s (%s) dropped: %s is not "
+                         "an admin any more — fob %s is an ordinary tap",
+                         egm_id, w["name"], w["accountId"], w["by"], uid)
+                return False
+            self._fob_wait_take(egm_id, wait, w, uid, fob, carded, now)
+        except Exception as e:  # noqa: BLE001 — a wait's tap never becomes
+            #                     a card-in, a card-out or a tap-over
+            log.error("💳 [%s] ADD FOB: the tap of fob %s failed on the "
+                      "hub side (%s)", egm_id, uid, type(e).__name__)
+        return True
+
+    def _fob_wait_take(self, egm_id, wait, w, uid, fob, carded, now):
+        """The tap that belongs to an ADD FOB wait: add the fob, or say
+        why not. `wait` is the machine's wait itself (touched only under
+        companion_lock), `w` the copy made in the hold that found it, and
+        `carded` {uid: egmId} of every card session and tap-over then.
+        First match wins:
+          1  the player is gone, or has become an admin   the wait ends
+          2  the fob the admin carded in with             refused
+          3  a reset fob (no handpay reset is sent)       refused
+          4  any other fob that is not a player fob       refused
+          5  already this player's                        refused
+          6  another player's (nothing is moved)          refused
+          7  carded in at a machine right now             refused
+          8  a fob the hub does not know, or a player fob with no player:
+             player_action linkFob (registers an unknown one as a player
+             fob and links it). The store refusing is a refusal too.
+        A refused fob does NOT end the wait: the screen shows the reason
+        (`note`) and keeps counting, so another fob can be tapped. Nobody
+        is carded in or out by any of these. The result is written only
+        if this is still the machine's wait and still waiting."""
+        aid, by = w["accountId"], w["by"]
+        acct = self.account_store.get(aid)
+        gone = acct is None or acct.get("kind") != "player" \
+            or bool(acct.get("admin"))
+        name = str((acct or {}).get("name") or w["name"])
+        tier = (fob or {}).get("tier")
+        note, linked = "", False
+        if gone:
+            pass
+        elif uid == str(w["adminUid"] or "").upper():
+            note = "That is the fob you carded in with."
+        elif fob is not None and tier == "reset":
+            note = "That is a reset fob. It can't be a player's fob."
+        elif fob is not None and tier != "player":
+            # attendant, manager, or a tier this build does not know
+            note = "That is a staff fob. It can't be a player's fob."
+        else:
+            owner_id = str((fob or {}).get("accountId") or "").strip()
+            owner = self.account_store.get(owner_id) if owner_id else None
+            if owner_id == aid:
+                note = f"That fob is already {name}'s."
+            elif owner is not None:
+                other = str(owner.get("name") or owner_id)
+                note = (f"That fob belongs to {other}. Remove it from "
+                        f"{other} first.")
+            elif uid in carded:
+                note = (f"That fob is carded in at "
+                        f"{self._glass_machine_name(carded[uid])}. Card "
+                        "out there first.")
+            else:
+                r = self.player_action({"action": "linkFob",
+                                        "accountId": aid, "uid": uid},
+                                       by=by)
+                if r.get("ok"):
+                    linked = True
+                    # this tap is the fob's first: a fob the hub did not
+                    # know had no row to stamp when the tap came in
+                    self.hub_store.fob_touch(uid, now_iso())
+                elif "registry full" in str(r.get("error") or ""):
+                    # fob_set's own words for a full fobs table
+                    note = ("The fob list is full. Remove a fob on the "
+                            "hub's web page first.")
+                else:
+                    note = "That fob could not be added. Try again."
+        with self.companion_lock:
+            mine = (self._fob_waits or {}).get(egm_id) is wait \
+                and wait["state"] == "waiting"
+            if mine and gone:
+                wait.update(state="ended", note="", endTs=now,
+                            msg=self.GLASS_SAY_GONE)
+            elif mine and linked:
+                wait.update(state="linked", note="", endTs=now,
+                            linkedUid=uid, msg=f"Fob added for {name}.")
+            elif mine:
+                wait["note"] = note
+        if gone:
+            log.info("💳 [%s] ADD FOB for %s (%s) ended at the tap of fob "
+                     "%s: the player is gone or is an admin now — by %s",
+                     egm_id, name, aid, uid, by)
+        elif linked:
+            log.info("💳 [%s] ADD FOB: fob %s added for %s (%s) — by %s",
+                     egm_id, uid, name, aid, by)
+        else:
+            log.info("💳 [%s] ADD FOB: fob %s not taken for %s (%s): %s "
+                     "— by %s", egm_id, uid, name, aid, note, by)
 
     @staticmethod
     def sas_from_egm_ready(entry):
