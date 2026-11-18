@@ -35,12 +35,17 @@ Covers:
     override, and /api/command cardOut is the UI's explicit logout.
   * reset-tier fob — the queued handpay_reset matches _handle_sas_command's
     exact entry shape ({id, type} + _queuedAt, no amount).
+  * the admin menus on a machine's screen — who may ask for what (a player,
+    an admin carded in normally, a tap-over), the service screen's reach
+    (the friend at this machine and nobody else), money booked once, PINs,
+    names, the players view, REMOVE FOB, and what reaches the logs.
 
 Run from G2S/:  python3 tools/test_companion_rfid.py
 Must end "RESULT: N passed, 0 failed".
 """
 
 import getpass
+import http.client
 import itertools
 import json
 import logging
@@ -767,6 +772,1680 @@ def glass_window_picker():
     check("an unknown code is still reported, never swallowed",
           gh.content_exception_words(7)
           == "the cabinet refused the content (exception 7)")
+
+
+# ---------------------------------------------------------------- admin menus
+# The admin menus on a machine's screen (glass.html, smib.html): the quick
+# service screen of a tap-over, and the players menu of an admin carded in
+# normally. These checks use the REAL AccountStore and the REAL HubStore on
+# temp files (the fakes above have no adjust, create, set_pin, fob_set or
+# fobs), and the lean engine for everything else.
+
+class Screen:
+    """The hub's two screen POST handlers on a lean engine, with the reply
+    handed back instead of written to a socket."""
+    _handle_glass_action = gh.G2SRequestHandler._handle_glass_action
+    _handle_glass_admin = gh.G2SRequestHandler._handle_glass_admin
+
+    def __init__(self, eng):
+        self.host_engine = eng
+
+    def _send(self, status, body, ctype=None, soap=False, **kw):
+        return status, json.loads(body)
+
+
+class WatchedLock:
+    """companion_lock that can say whether it is held right now."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.held = False
+
+    def __enter__(self):
+        self._lock.acquire()
+        self.held = True
+        return self
+
+    def __exit__(self, *exc):
+        self.held = False
+        self._lock.release()
+
+
+def menu_engine(*egms):
+    """A lean engine with real stores and one online machine per id."""
+    tmp = tempfile.mkdtemp(prefix="cabinet-adminmenu-")
+    eng = make_engine()
+    eng.account_store = gh.AccountStore(
+        os.path.join(tmp, "account_state.json"))
+    eng.hub_store = HubStore(os.path.join(tmp, "hub.db"))
+    eng._taps = {}
+    for e in egms:
+        a = FakeAssoc(egm_id=e)
+        a.handpays_pending = {}
+        a.meters = {}
+        eng.associations[e] = a
+    return eng
+
+
+def player(eng, name, uid=None, admin=False, cents=0, free=0):
+    """A player account, with a fob, the admin flag and money as asked."""
+    acct, _ = eng.account_store.create(name)
+    aid = acct["id"]
+    if admin:
+        eng.account_store.set_admin(aid, True)
+    if uid:
+        eng.hub_store.fob_set(uid, tier="player", account_id=aid)
+    if cents or free:
+        eng.account_store.adjust(aid, d_cash=cents * 1000,
+                                 d_non=free * 1000, note="seed")
+    return aid
+
+
+def tap_at(eng, egm, uid):
+    """One tap of a fob on the reader of that machine."""
+    n = eng._taps.get(egm, -1) + 1
+    eng._taps[egm] = n
+    return report(eng, taps=[tap(n, uid=uid)], comp="companion-" + egm,
+                  g2s=egm)
+
+
+def tok_of(eng, egm):
+    return eng.glass_sessions.peek_egm(egm)[0]
+
+
+def adm(eng, tok, action, **body):
+    """POST /api/glass/admin, without a server."""
+    return eng.glass_admin_action(dict(body, sess=tok, action=action))
+
+
+def act(eng, tok, action, **body):
+    """POST /api/glass/action, without a server."""
+    return Screen(eng)._handle_glass_action(
+        json.dumps(dict(body, sess=tok, action=action)))
+
+
+def cash(eng, aid):
+    return eng.account_store.get(aid)["cashableMillicents"]
+
+
+def free(eng, aid):
+    return eng.account_store.get(aid)["nonCashMillicents"]
+
+
+def rows(eng):
+    return list(eng.account_store.state["ledger"])
+
+
+def books(eng):
+    """Everything an admin action could change, to compare before and
+    after. Never printed: it holds PIN hashes."""
+    fobs = sorted((f["uid"], f["tier"], f["accountId"])
+                  for f in eng.hub_store.fobs())
+    return json.dumps([eng.account_store.state, fobs], sort_keys=True)
+
+
+_rid = itertools.count(1)
+
+
+def rid():
+    return "rid%05d" % next(_rid)
+
+
+GONE = "That player is not there any more."
+UNSURE = ("That may not have gone through. Check the balance before "
+          "trying again.")
+SVC = ("svcFund", "svcSetPin")
+PL = ("plFund", "plTake", "plSetPin", "plClearPin", "plRename", "plCreate",
+      "plAddFob", "plAddFobCancel", "plRemoveFob")
+WALLET = ("walletFund", "cashOutToWallet", "cashOutNow")
+GONE_VIEWS = ("tickets", "games", "settings")
+
+
+def admin_menu_callers():
+    print("— admin menus: the action names the hub knows")
+    check("clearHandpay is the only admin action left on /api/glass/action",
+          gh.GLASS_ADMIN_ACTIONS == ("clearHandpay",))
+    check("the service actions and the players actions are the ones the "
+          "pages use",
+          gh.GLASS_SERVICE_ACTIONS == SVC and gh.GLASS_PLAYERS_ACTIONS == PL)
+    check("the limits: $100,000.00 per action, 16 letters in a name, a "
+          "20 second ADD FOB count",
+          gh.GLASS_ADMIN_MAX_CENTS == 10_000_000 and gh.GLASS_NAME_MAX == 16
+          and gh.ADD_FOB_WAIT_SEC == 20)
+
+    eng = menu_engine("M_PLAYER", "M_PIN", "M_ADMIN", "M_ATT", "M_TAP",
+                      "M_GONE")
+    rescans = []
+    eng.refresh_game_play_status = lambda assoc: rescans.append(assoc) or {}
+    sam = player(eng, "Sam", "51A00001", cents=5000)
+    pia = player(eng, "Pia", admin=True)
+    aj = player(eng, "AJ", "A1A00001", admin=True, cents=2000)
+    eng.hub_store.fob_set("A77E0001", tier="attendant", label="Floor key")
+    chris = player(eng, "Christopher", "C4150001", cents=1000)
+    dana = player(eng, "Dana", "DA4A0001", admin=True)
+    vic = player(eng, "Vic", "B1C00001", cents=10000)
+    eng.account_store.set_pin(pia, "771234")
+    eng.account_store.set_pin(vic, "990011")
+
+    tap_at(eng, "M_PLAYER", "51A00001")
+    eng.pin_login("M_PIN", "771234")
+    tap_at(eng, "M_ADMIN", "A1A00001")
+    tap_at(eng, "M_ATT", "A77E0001")
+    tap_at(eng, "M_TAP", "C4150001")
+    tap_at(eng, "M_TAP", "DA4A0001")            # Dana taps over Christopher
+    tap_at(eng, "M_GONE", "B1C00001")
+    gone_tok = tok_of(eng, "M_GONE")
+    eng._glass_card_out("M_GONE")       # a token from before a card-out
+    check("the cast is on the floor: a player, a PIN login, two admins "
+          "carded in normally, and a tap-over",
+          all(tok_of(eng, m) for m in ("M_PLAYER", "M_PIN", "M_ADMIN",
+                                       "M_ATT", "M_TAP"))
+          and (eng.admin_overlays.get("M_TAP") or {}).get("uid") == "DA4A0001"
+          and (eng.card_sessions.get("M_TAP") or {}).get("uid") == "C4150001"
+          and tok_of(eng, "M_GONE") is None and bool(gone_tok))
+
+    # What each action would do if it got through, aimed at Vic (who is
+    # not at any machine): a caller who may not ask must leave no trace.
+    def full():
+        return {"svcFund": {"cents": 500, "rid": rid()},
+                "svcSetPin": {"pin": "482913"},
+                "plFund": {"accountId": vic, "cents": 500, "rid": rid()},
+                "plTake": {"accountId": vic, "cents": 500, "rid": rid()},
+                "plSetPin": {"accountId": vic, "pin": "482913"},
+                "plClearPin": {"accountId": vic},
+                "plRename": {"accountId": vic, "name": "Changed"},
+                "plCreate": {"name": "Intruder", "rid": rid()},
+                "plAddFob": {"accountId": vic},
+                "plAddFobCancel": {},
+                "plRemoveFob": {"accountId": vic, "fob": "C00001"}}
+
+    def refused(tok, names, want=(403, "not authorized")):
+        bad = []
+        for name in names:
+            if name in SVC + PL:
+                st, r = adm(eng, tok, name, **full()[name])
+            else:
+                st, r = act(eng, tok, name, cents=500)
+            if (st, r.get("error")) != want or r.get("ok") is not False:
+                bad.append((name, st, r.get("error")))
+        return bad
+
+    def views(tok, names, want):
+        bad = []
+        for name in names:
+            st, r = eng.glass_data(tok, name)
+            if (st, r.get("error")) != want:
+                bad.append((name, st, r.get("error")))
+        return bad
+
+    def everyone(who, tok):
+        st, r = act(eng, tok, "refreshGames")
+        check(f"{who}: refreshGames is gone (403 not yet) and starts no "
+              "rescan of the machine's games",
+              (st, r.get("error")) == (403, "not yet") and rescans == [],
+              (st, r, len(rescans)))
+        check(f"{who}: the tickets, games and settings views are gone "
+              "(400 unknown view)",
+              views(tok, GONE_VIEWS, (400, "unknown view")) == [],
+              views(tok, GONE_VIEWS, (400, "unknown view")))
+        st, r = adm(eng, tok, "makeAdmin", accountId=vic)
+        check(f"{who}: an action /api/glass/admin does not know is 403 "
+              "not yet",
+              (st, r.get("error")) == (403, "not yet"), (st, r))
+
+    print("— admin menus: no token, a made-up token, a token from before "
+          "a card-out")
+    before = books(eng)
+    for who, tok in (("no token", None), ("an empty token", ""),
+                     ("a made-up token", "gs_" + "0" * 24),
+                     ("a token that is not text", ["gs_x"]),
+                     ("a token from before a card-out", gone_tok)):
+        bad = refused(tok, SVC + PL + ("clearHandpay", "refreshGames")
+                      + WALLET, want=(401, "unknown session"))
+        check(f"{who}: every action is 401 unknown session", bad == [], bad)
+        bad = views(tok, ("players", "handpay", "cashout") + GONE_VIEWS,
+                    (401, "unknown session"))
+        check(f"{who}: every data view is 401 unknown session",
+              bad == [], bad)
+    check("...and none of it changed an account, a PIN, a fob or the "
+          "ledger", books(eng) == before and rescans == [])
+
+    print("— admin menus: a player who is not an admin")
+    for who, egm in (("a player with a wallet", "M_PLAYER"),
+                     ("an admin account logged in by PIN, with admin by "
+                      "PIN switched off", "M_PIN")):
+        tok = tok_of(eng, egm)
+        before = books(eng)
+        bad = refused(tok, SVC + PL + ("clearHandpay",))
+        check(f"{who}: every service action, every players action and "
+              "clearHandpay is 403 not authorized", bad == [], bad)
+        bad = views(tok, ("players", "handpay"), (403, "not authorized"))
+        check(f"{who}: the players and handpay views are 403", bad == [], bad)
+        check(f"{who}: nothing changed", books(eng) == before)
+        st, r = eng.glass_data(tok, "cashout")
+        check(f"{who}: their own cash-out figures still answer",
+              st == 200 and r.get("ok") is True
+              and r.get("walletMc") == cash(eng, sam if egm == "M_PLAYER"
+                                            else pia), (st, r))
+        everyone(who, tok)
+
+    print("— admin menus: an admin carded in normally")
+    for who, egm in (("an admin with a player fob", "M_ADMIN"),
+                     ("an attendant fob with no account", "M_ATT")):
+        tok = tok_of(eng, egm)
+        before = books(eng)
+        bad = refused(tok, SVC)
+        check(f"{who}: the service actions are 403 not authorized (they "
+              "are for a tap-over)", bad == [], bad)
+        check(f"{who}: ...and nothing changed", books(eng) == before)
+        got = {n: adm(eng, tok, n) for n in PL}
+        check(f"{who}: every players action is let in (none answers 401 "
+              "or not authorized)",
+              all(st in (200, 400, 403) and r.get("error") != "not authorized"
+                  and r.get("error") != "unknown session"
+                  for st, r in got.values())
+              and all(got[n][0] != 403 for n in PL
+                      if n not in ("plAddFob", "plAddFobCancel")),
+              {n: (st, r.get("error")) for n, (st, r) in got.items()})
+        check(f"{who}: a players action with nothing in it is refused in "
+              "words and changes nothing",
+              got["plFund"] == (200, {"ok": False, "error": GONE,
+                                      "action": "plFund", "egmId": egm})
+              and got["plCreate"][1].get("error") == "Type a name."
+              and books(eng) == before,
+              (got["plFund"], got["plCreate"]))
+        st, r = act(eng, tok, "clearHandpay")
+        check(f"{who}: clearHandpay is let in (nothing is pending here)",
+              st == 200 and r.get("ok") is False
+              and r.get("error") == "no pending handpay", (st, r))
+        st, r = eng.glass_data(tok, "players")
+        check(f"{who}: the players view answers",
+              st == 200 and r.get("ok") is True
+              and [p["name"] for p in r["players"]] == [
+                  "AJ", "Christopher", "Dana", "Pia", "Sam", "Vic"], (st, r))
+        st, r = eng.glass_data(tok, "handpay")
+        check(f"{who}: the handpay view answers",
+              st == 200 and r.get("pending") == [], (st, r))
+        st, r = eng.glass_data(tok, "cashout")
+        check(f"{who}: their own cash-out figures still answer",
+              st == 200 and r.get("ok") is True
+              and r.get("walletMc") == (cash(eng, aj) if egm == "M_ADMIN"
+                                        else None), (st, r))
+        everyone(who, tok)
+
+    print("— admin menus: an admin on a tap-over")
+    tok = tok_of(eng, "M_TAP")
+    who = "a tap-over"
+    before = books(eng)
+    bad = refused(tok, PL)
+    check(f"{who}: every players action is 403 not authorized", bad == [],
+          bad)
+    bad = refused(tok, WALLET, want=(
+        403, "wallet actions are disabled while supervising another player"))
+    check(f"{who}: the three wallet actions are still 403", bad == [], bad)
+    bad = views(tok, ("players", "cashout"), (403, "not authorized"))
+    check(f"{who}: the players view and the cash-out view are 403",
+          bad == [], bad)
+    st, r = eng.glass_data(tok, "cashout")
+    check(f"{who}: the refused cash-out view holds no wallet figure",
+          not any(k in r for k in ("walletMc", "walletCredits",
+                                   "walletRestrictedMc", "machineCreditsMc")),
+          r)
+    check(f"{who}: nothing changed", books(eng) == before)
+    got = {n: adm(eng, tok, n) for n in SVC}
+    check(f"{who}: the service actions are let in",
+          got["svcFund"] == (200, {"ok": False, "error": "Enter an amount.",
+                                   "action": "svcFund", "egmId": "M_TAP"})
+          and got["svcSetPin"][1].get("error") == "A PIN is digits only.",
+          got)
+    st, r = act(eng, tok, "clearHandpay")
+    check(f"{who}: clearHandpay is let in",
+          st == 200 and r.get("error") == "no pending handpay", (st, r))
+    st, r = eng.glass_data(tok, "handpay")
+    check(f"{who}: the handpay view answers",
+          st == 200 and r.get("pending") == [], (st, r))
+    everyone(who, tok)
+
+    print("— admin menus: that admin after their admin flag is cleared, "
+          "same token")
+    eng.account_store.set_admin(dana, False)
+    who = "a tap-over whose admin lost the right"
+    before = books(eng)
+    bad = refused(tok, SVC + PL + ("clearHandpay",))
+    check(f"{who}: every service action, every players action and "
+          "clearHandpay is 403 not authorized", bad == [], bad)
+    bad = views(tok, ("players", "handpay", "cashout"),
+                (403, "not authorized"))
+    check(f"{who}: the players, handpay and cash-out views are 403",
+          bad == [], bad)
+    bad = refused(tok, WALLET, want=(
+        403, "wallet actions are disabled while supervising another player"))
+    check(f"{who}: the wallet actions are still 403", bad == [], bad)
+    check(f"{who}: nothing changed", books(eng) == before)
+    everyone(who, tok)
+    check("in all of that, nothing started a rescan of a machine's games",
+          rescans == [])
+
+    print("— admin menus: an admin logged in by PIN, once admin by PIN is "
+          "switched on")
+    tok = tok_of(eng, "M_PIN")
+    eng.hub_store.set_host_setting("pin_admin_allowed", "1")
+    st, r = eng.glass_data(tok, "players")
+    check("the same PIN session is an admin carded in normally: the "
+          "players view answers, the service actions do not",
+          st == 200 and r.get("ok") is True
+          and refused(tok, SVC) == []
+          and adm(eng, tok, "plFund")[1].get("error") == GONE, (st, r))
+
+
+def admin_menu_service():
+    print("— service screen: a tap-over reaches the friend and nobody else")
+    eng = menu_engine("M1", "M2")
+    eng.hub_store.set_nickname("M1", "Bluebird 2", protocol="g2s")
+    chris = player(eng, "Christopher", "C4150001", cents=1000)
+    vic = player(eng, "Vic", "B1C00001", cents=10000)
+    player(eng, "Dana", "DA4A0001", admin=True)
+    tap_at(eng, "M1", "C4150001")
+    tap_at(eng, "M1", "DA4A0001")
+    tok = tok_of(eng, "M1")
+    n0 = len(rows(eng))
+    house0 = cash(eng, "house")
+    st, r = adm(eng, tok, "svcFund", cents=2000, rid=rid(), accountId=vic,
+                egmId="M2")
+    check("svcFund naming another player and another machine in its body "
+          "credits the friend at THIS machine",
+          st == 200 and r.get("ok") is True and r.get("egmId") == "M1"
+          and r.get("msg") == "Added $20.00 to Christopher's wallet."
+          and cash(eng, chris) == 3000000 and cash(eng, vic) == 10000000,
+          (st, r))
+    new = rows(eng)[n0:]
+    by = " — by Dana at Bluebird 2 (service)"
+    check("one svcFund of 2000 is the friend +2000 and the House -2000, "
+          "two ledger rows under one ref",
+          cash(eng, "house") == house0 - 2000000
+          and [(e["accountId"], e["deltaMillicents"]) for e in new]
+          == [(chris, 2000000), ("house", -2000000)]
+          and new[0]["ref"] == new[1]["ref"] and bool(new[0]["ref"]), new)
+    check("both notes say which admin did it, at which machine, from the "
+          "service screen",
+          [e["note"] for e in new] == ["house fund" + by,
+                                       f"fund {chris}" + by], new)
+    check("the reply carries the friend's new figures for the screen",
+          r.get("service") == dict(
+              eng.glass_state("M1").get("service") or {"none": 1})
+          and (r.get("service") or {}).get("walletMc") == 3000000
+          and (r.get("service") or {}).get("wallet") == "$30.00"
+          and (r.get("service") or {}).get("name") == "Christopher", r)
+    st, r = adm(eng, tok, "svcSetPin", pin="482913", accountId=vic,
+                egmId="M2")
+    check("svcSetPin naming another player sets the FRIEND's PIN",
+          st == 200 and r.get("ok") is True
+          and r.get("msg") == "Christopher's PIN is set."
+          and eng.account_store.get(chris)["hasPin"] is True
+          and eng.account_store.get(vic)["hasPin"] is False
+          and (r.get("service") or {}).get("hasPin") is True, (st, r))
+    check("...and the PIN is not in the reply", "482913" not in json.dumps(r))
+
+    print("— service screen: who the friend is, is read with the lock held")
+    # A card switch the instant after the tap-over was proven must not hand
+    # the action the next player: the friend is the copy made in that hold.
+    real_admin = eng._session_is_admin
+
+    def switch_then_answer(uid, tier):
+        with eng.companion_lock:
+            eng.card_sessions["M1"] = dict(eng.card_sessions["M1"],
+                                           uid="B1C00001", name="Vic",
+                                           accountId=vic)
+        return real_admin(uid, tier)
+    eng._session_is_admin = switch_then_answer
+    st, r = adm(eng, tok, "svcFund", cents=700, rid=rid())
+    eng._session_is_admin = real_admin
+    check("a card session that changes right after the check does not "
+          "redirect the money",
+          st == 200 and r.get("ok") is True
+          and cash(eng, chris) == 3700000 and cash(eng, vic) == 10000000,
+          (st, r, cash(eng, chris), cash(eng, vic)))
+    with eng.companion_lock:
+        eng.card_sessions["M1"].update(uid="C4150001", name="Christopher",
+                                       accountId=chris)
+    lock = eng.companion_lock = WatchedLock()
+    held = []
+    real_live = eng.glass_sessions.still_live
+    eng.glass_sessions.still_live = \
+        lambda egm, t: held.append(lock.held) or real_live(egm, t)
+    adm(eng, tok, "svcFund")
+    eng.glass_data(tok, "handpay")
+    eng.glass_sessions.still_live = real_live
+    eng.companion_lock = threading.Lock()
+    check("the token is tested for being the machine's live one in the "
+          "same lock hold that reads the card session",
+          held == [True, True], held)
+
+    print("— service screen: the friend's figures ride the state poll")
+    a1 = eng.associations["M1"]
+    a1.meters = {"G2S_cabinet/1/G2S_playerCashableAmt": "4750000000"}
+    a1.handpays_pending = {"77": {
+        "transactionId": "77", "deviceId": "1", "handpayType": "G2S_gameWin",
+        "pendingCashableAmt": "125000000", "pendingPromoAmt": "0",
+        "pendingNonCashAmt": "0", "handpayDateTime": "2026-11-18T03:00:00Z"}}
+    eng.account_store.adjust(chris, d_cash=107886070000 - cash(eng, chris),
+                             d_non=15100000, note="seed")
+    st_ = eng.glass_state("M1")
+    check("the service object: name, wallet, Free Slot Play, PIN, machine "
+          "credits, the pending handpay and the most one action can add",
+          st_.get("service") == {
+              "name": "Christopher", "hasWallet": True,
+              "walletMc": 107886070000, "wallet": "$1,078,860.70",
+              "freePlayMc": 15100000, "freePlay": "$151.00",
+              "hasPin": True,
+              "machineMc": 4750000000, "machine": "$47,500.00",
+              "handpay": {"pending": True, "amount": "$1,250.00",
+                          "type": "G2S_gameWin", "canClear": True,
+                          "more": 0},
+              "maxCents": 10000000}, st_.get("service"))
+    check("the admin's identity and the tap-over flags are as before",
+          st_.get("overlay") is True and st_.get("admin") is True
+          and st_.get("name") == "Dana" and st_.get("sess") == tok
+          and st_.get("supervising") == "Christopher")
+    check("the friend's money is still NOT in the top-level fields (an old "
+          "page must not paint it as the admin's own)",
+          not any(k in st_ for k in ("credits", "creditsMc",
+                                     "restrictedMc")), sorted(st_))
+    a1.handpays_pending = {}
+    check("no handpay pending: the handpay part says so and nothing else",
+          eng.glass_state("M1")["service"]["handpay"] == {"pending": False})
+    eng.account_store.adjust(chris, d_non=-15100000, note="seed")
+    check("Free Slot Play is sent even when it is 0",
+          eng.glass_state("M1")["service"].get("freePlayMc") == 0
+          and eng.glass_state("M1")["service"].get("freePlay") == "$0.00")
+    real_block = eng._glass_service_block
+    eng._glass_service_block = lambda *a: (_ for _ in ()).throw(
+        RuntimeError("boom"))
+    try:
+        st_ = eng.glass_state("M1")
+    except RuntimeError as e:
+        st_ = {"the poll raised": str(e)}
+    eng._glass_service_block = real_block
+    check("a fault building the service object leaves it out and the poll "
+          "still answers",
+          st_.get("ok") is True and st_.get("overlay") is True
+          and st_.get("sess") == tok and "service" not in st_, st_)
+
+    print("— service screen: the wallet shown is the wallet that is funded")
+    eng.hub_store.fob_set("C4150001", account_id=vic)   # re-linked mid-session
+    blk = eng.glass_state("M1")["service"]
+    check("after the friend's fob is linked to another player, the screen "
+          "shows that player's wallet",
+          blk.get("name") == "Vic" and blk.get("walletMc") == 10000000, blk)
+    c0 = cash(eng, chris)
+    st, r = adm(eng, tok, "svcFund", cents=300, rid=rid())
+    check("...and svcFund credits the same one",
+          r.get("ok") is True and cash(eng, vic) == 10300000
+          and cash(eng, chris) == c0
+          and (r.get("service") or {}).get("walletMc") == 10300000
+          and r.get("msg") == "Added $3.00 to Vic's wallet.", r)
+    eng.hub_store.fob_set("C4150001", account_id=chris)
+
+    print("— service screen: DONE, and a new friend")
+    st, r = act(eng, tok, "logout")
+    check("DONE ends the tap-over and the friend stays carded in",
+          st == 200 and r.get("overlayEnded") is True
+          and eng.admin_overlays == {}
+          and (eng.card_sessions.get("M1") or {}).get("uid") == "C4150001",
+          (st, r))
+    st, r = adm(eng, tok, "svcFund", cents=500, rid=rid())
+    check("the tap-over's token is 401 after DONE",
+          (st, r.get("error")) == (401, "unknown session"), (st, r))
+    friend_tok = tok_of(eng, "M1")
+    st, r = eng.glass_data(friend_tok, "cashout")
+    check("the friend's own token reads their cash-out figures again",
+          st == 200 and r.get("walletMc") == cash(eng, chris), (st, r))
+    check("no service object once the tap-over is over",
+          "service" not in eng.glass_state("M1")
+          and eng.glass_state("M1").get("creditsMc") == cash(eng, chris))
+    tap_at(eng, "M1", "DA4A0001")               # Dana taps over Christopher
+    first = tok_of(eng, "M1")
+    tap_at(eng, "M1", "DA4A0001")               # any tap ends the tap-over
+    tap_at(eng, "M1", "C4150001")               # Christopher cards out
+    tap_at(eng, "M1", "B1C00001")               # Vic cards in
+    tap_at(eng, "M1", "DA4A0001")               # Dana taps over Vic
+    v0 = cash(eng, vic)
+    st, r = adm(eng, first, "svcFund", cents=500, rid=rid())
+    check("a new friend under a new tap-over: the first tap-over's token "
+          "is 401 and the new friend is untouched",
+          (st, r.get("error")) == (401, "unknown session")
+          and cash(eng, vic) == v0
+          and (eng.card_sessions.get("M1") or {}).get("uid") == "B1C00001",
+          (st, r))
+    st, r = adm(eng, tok_of(eng, "M1"), "svcFund", cents=500, rid=rid())
+    check("the new tap-over's token credits the new friend",
+          r.get("ok") is True and cash(eng, vic) == v0 + 500000, r)
+
+    print("— service screen: a friend whose fob has no player")
+    eng.hub_store.fob_set("0F0B0001", tier="player", label="spare fob")
+    tap_at(eng, "M2", "0F0B0001")
+    tap_at(eng, "M2", "DA4A0001")
+    tok2 = tok_of(eng, "M2")
+    n0 = len(rows(eng))
+    blk = eng.glass_state("M2").get("service") or {}
+    check("the service object says there is no wallet, and holds no "
+          "wallet field",
+          blk.get("hasWallet") is False and blk.get("name") == "spare fob"
+          and not any(k in blk for k in ("walletMc", "wallet", "freePlayMc",
+                                         "freePlay", "hasPin"))
+          and blk.get("maxCents") == 10000000 and "machineMc" in blk, blk)
+    st, r = adm(eng, tok2, "svcFund", cents=500, rid=rid())
+    st2, r2 = adm(eng, tok2, "svcSetPin", pin="482913")
+    check("both service actions say the fob is not linked to a player, "
+          "and no ledger row is written",
+          (st, r.get("error")) == (200, "This fob is not linked to a player.")
+          and (st2, r2.get("error"))
+          == (200, "This fob is not linked to a player.")
+          and r.get("ok") is False and len(rows(eng)) == n0, (r, r2))
+
+    print("— service screen: the two moments a tap-over token has no "
+          "tap-over on record")
+    # _admin_overlay_push mints the admin's token BEFORE it records the
+    # tap-over, and _admin_overlay_pop drops the record BEFORE the friend's
+    # token is minted again. In both, the token must not pass as an admin
+    # carded in normally.
+    eng3 = menu_engine("M1")
+    sam = player(eng3, "Sam", "51A00001", cents=5000)
+    vic3 = player(eng3, "Vic", "B1C00001", cents=10000)
+    player(eng3, "Dana", "DA4A0001", admin=True)
+    eng3.account_store.set_pin(vic3, "990011")
+    tap_at(eng3, "M1", "51A00001")
+
+    def gap_bodies():
+        return {"plFund": {"accountId": vic3, "cents": 500, "rid": rid()},
+                "plTake": {"accountId": vic3, "cents": 500, "rid": rid()},
+                "plSetPin": {"accountId": vic3, "pin": "482913"},
+                "plClearPin": {"accountId": vic3},
+                "plRename": {"accountId": vic3, "name": "Changed"},
+                "plCreate": {"name": "Intruder", "rid": rid()},
+                "plAddFob": {"accountId": vic3},
+                "plAddFobCancel": {},
+                "plRemoveFob": {"accountId": vic3, "fob": "C00001"},
+                "svcFund": {"cents": 500, "rid": rid()},
+                "svcSetPin": {"pin": "482913"}}
+
+    def gap(label, tok):
+        before = books(eng3)
+        got = {n: adm(eng3, tok, n, **b) for n, b in gap_bodies().items()}
+        check(f"{label}: every players action and every service action is "
+              "403 not authorized",
+              all((st, r.get("error")) == (403, "not authorized")
+                  for st, r in got.values()),
+              {n: (st, r.get("error")) for n, (st, r) in got.items()})
+        st, r = eng3.glass_data(tok, "players")
+        st2, r2 = act(eng3, tok, "clearHandpay")
+        check(f"{label}: the players view and clearHandpay are 403 too",
+              (st, r.get("error")) == (403, "not authorized")
+              and "players" not in r
+              and (st2, r2.get("error")) == (403, "not authorized"),
+              (st, r, st2, r2))
+        check(f"{label}: nothing changed", books(eng3) == before)
+
+    minted = eng3.glass_sessions.mint("M1", "player", "DA4A0001", "Dana")
+    gap("the admin's token minted over a friend, the tap-over not recorded "
+        "yet", minted)
+    eng3._admin_overlay_push("M1", {"companionId": "companion-M1"},
+                             "DA4A0001", "player", "Dana", "1")
+    tok3 = tok_of(eng3, "M1")
+    check("(the same token is a tap-over once the record is there)",
+          adm(eng3, tok3, "svcFund")[1].get("error") == "Enter an amount.")
+    with eng3.companion_lock:
+        eng3.admin_overlays.pop("M1")
+    gap("the tap-over's record dropped, its token still live", tok3)
+
+    eng3._admin_overlay_push("M1", {"companionId": "companion-M1"},
+                             "DA4A0001", "player", "Dana", "1")
+    aj3 = player(eng3, "AJ", "A1A00001", admin=True)
+    other = eng3.glass_sessions.mint("M1", "player", "A1A00001", "AJ")
+    gap("a tap-over on record that names another token than this admin's",
+        other)
+    check("(AJ is an admin, and that token is the machine's live one)",
+          eng3.account_store.get(aj3)["admin"] is True
+          and tok_of(eng3, "M1") == other)
+    with eng3.companion_lock:
+        eng3.admin_overlays.pop("M1")
+
+    print("— service screen: an admin who taps over their own card session")
+    # Sam carded in as a player and was made an admin afterwards; his own
+    # fob then raises a tap-over over himself. It is still a tap-over: the
+    # players menu and his own cash-out figures stay shut.
+    eng3.glass_sessions.mint("M1", "player", "51A00001", "Sam")
+    eng3.account_store.set_admin(sam, True)
+    tap_at(eng3, "M1", "51A00001")
+    own_tok = tok_of(eng3, "M1")
+    before = books(eng3)
+    got = {n: adm(eng3, own_tok, n, **b) for n, b in gap_bodies().items()
+           if n in PL}
+    st, r = eng3.glass_data(own_tok, "cashout")
+    st2, r2 = eng3.glass_data(own_tok, "players")
+    check("the players actions, the players view and the cash-out view "
+          "are 403, and nothing changed",
+          (eng3.admin_overlays.get("M1") or {}).get("uid") == "51A00001"
+          and all((s, x.get("error")) == (403, "not authorized")
+                  for s, x in got.values())
+          and (st, r.get("error")) == (403, "not authorized")
+          and "walletMc" not in r
+          and (st2, r2.get("error")) == (403, "not authorized")
+          and books(eng3) == before, (got, r, r2))
+    check("the service actions are let in",
+          adm(eng3, own_tok, "svcFund")[1].get("error")
+          == "Enter an amount.")
+    eng3.account_store.set_admin(sam, False)
+    eng3.glass_state("M1")              # the poll hands the screen back
+
+    print("— service screen: a token that is no longer the machine's own")
+    eng3._admin_overlay_push("M1", {"companionId": "companion-M1"},
+                             "DA4A0001", "player", "Dana", "1")
+    tok4 = tok_of(eng3, "M1")
+    store = eng3.glass_sessions
+    store._by_egm["M1"] = "gs_" + "1" * 24      # another token holds the slot
+    before = books(eng3)
+    st, r = adm(eng3, tok4, "svcFund", cents=500, rid=rid())
+    st2, r2 = eng3.glass_data(tok4, "handpay")
+    st3, r3 = act(eng3, tok4, "clearHandpay")
+    check("a token that still resolves but is not the machine's live one "
+          "is 401 for an action, a data view and clearHandpay",
+          store.resolve(tok4) is not None
+          and (st, r.get("error")) == (401, "unknown session")
+          and (st2, r2.get("error")) == (401, "unknown session")
+          and (st3, r3.get("error")) == (401, "unknown session")
+          and books(eng3) == before, (st, r, st2, r2, st3, r3))
+    store._by_egm["M1"] = tok4
+
+    print("— service screen: the 120 second hand-back")
+    idle = lambda: store.idle_sec("M1", tok4)              # noqa: E731
+    store._by_tok[tok4]["lastSeen"] = time.time() - 100
+    for _ in range(10):
+        eng3.glass_state("M1")
+    check("ten state polls do not move the tap-over's idle clock",
+          idle() >= 100, idle())
+    adm(eng3, tok4, "svcFund")                  # refused, but it is an action
+    check("a service action does move it", idle() < 5, idle())
+    eng3.sweep_admin_overlays(now=time.time() + 100)
+    check("...so the sweep leaves a tap-over that was used 100 s ago",
+          (eng3.admin_overlays.get("M1") or {}).get("tok") == tok4)
+    store._by_tok[tok4]["lastSeen"] = time.time() - 100
+    for _ in range(10):
+        eng3.glass_state("M1")
+    eng3.sweep_admin_overlays(now=time.time() + 25)
+    check("...and still hands the screen back at 120 s when only the poll "
+          "touched it",
+          eng3.admin_overlays == {}
+          and (eng3.card_sessions.get("M1") or {}).get("uid") == "51A00001")
+
+    print("— service screen: the handpay shown is the one CLEAR resets")
+    eng4 = menu_engine("M1", "M2")
+    player(eng4, "Sam", "51A00001")
+    player(eng4, "Dana", "DA4A0001", admin=True)
+    tap_at(eng4, "M1", "51A00001")
+    tap_at(eng4, "M1", "DA4A0001")
+    tok5 = tok_of(eng4, "M1")
+    a = eng4.associations["M1"]
+
+    def lockup(txn, cashable=0, non=0):
+        return {"transactionId": txn, "deviceId": "1",
+                "handpayType": "G2S_gameWin", "remoteCredit": "true",
+                "pendingCashableAmt": str(cashable), "pendingPromoAmt": "0",
+                "pendingNonCashAmt": str(non),
+                "handpayDateTime": "2026-11-18T03:00:0%sZ" % txn[-1]}
+
+    def cleared():
+        eng4.sent.clear()
+        st, r = act(eng4, tok5, "clearHandpay")
+        return r.get("hpId"), attr(eng4.sent[-1][0], "transactionId") \
+            if eng4.sent else None
+
+    a.handpays_pending = {"11": lockup("11", cashable=125000000),
+                          "12": lockup("12", non=500000)}
+    hp = eng4.glass_state("M1")["service"]["handpay"]
+    check("one handpay in two records (cashable, then one that is not): "
+          "the cashable amount is shown, with 1 more waiting",
+          hp == {"pending": True, "amount": "$1,250.00",
+                 "type": "G2S_gameWin", "canClear": True, "more": 1}, hp)
+    check("...and that is the record clearHandpay resets",
+          cleared() == ("11", "11"))
+    a.handpays_pending = {"21": lockup("21", cashable=1000000),
+                          "22": lockup("22", cashable=2000000)}
+    hp = eng4.glass_state("M1")["service"]["handpay"]
+    listed = eng4.glass_data(tok5, "handpay")[1].get("pending") or []
+    check("two handpays of the same kind: the list is oldest first, the "
+          "service screen shows the newer one, which is the one CLEAR "
+          "resets",
+          [x["amount"] for x in listed] == ["$10.00", "$20.00"]
+          and hp.get("amount") == "$20.00" and hp.get("more") == 1
+          and cleared() == ("22", "22"), (listed, hp))
+    a.comms_state = "offline"
+    check("a machine that is not online: the handpay is shown and cannot "
+          "be cleared from the screen",
+          eng4.glass_state("M1")["service"]["handpay"].get("canClear")
+          is False)
+    a.comms_state = "onLine"
+    a.handpays_pending = {}
+    eng4.sas_links["M1"] = "smib-bb2/1"
+    eng4.sas_machines["smib-bb2/1"] = {
+        "smibId": "smib-bb2", "online": True, "receivedAt": time.time(),
+        "meters": {"0x1A": 4750000},
+        "pendingHandpay": {"amountMc": 125000000, "kind": "win",
+                           "since": "2026-11-18T03:00:00Z"}}
+    blk = eng4.glass_state("M1")["service"]
+    check("a machine with a SAS side: its one handpay, by its SAS name, "
+          "0 more; machine credits off the SAS meter",
+          blk["handpay"] == {"pending": True, "amount": "$1,250.00",
+                             "type": "Game win", "canClear": True, "more": 0}
+          and blk.get("machine") == "$47,500.00", blk)
+    eng4.sas_machines["smib-bb2/1"]["pendingHandpay"] = {"kind": "win"}
+    check("a handpay with no amount known reads as the word Handpay",
+          eng4.glass_state("M1")["service"]["handpay"].get("amount")
+          == "Handpay")
+    st, r = act(eng4, tok5, "clearHandpay")
+    q = list(eng4.sas_commands.get("smib-bb2") or [])
+    check("clearHandpay from the service screen goes over SAS on that "
+          "machine",
+          st == 200 and r.get("ok") is True and r.get("via") == "sas"
+          and len(q) == 1 and q[0].get("type") == "handpay_reset", (st, r, q))
+
+
+def admin_menu_money():
+    print("— adding and taking back: one path, booked once")
+    eng = menu_engine("M1", "M2")
+    eng.hub_store.set_nickname("M1", "Bluebird 2", protocol="g2s")
+    chris = player(eng, "Christopher", "C4150001", cents=1000)
+    sam = player(eng, "Sam", "51A00001", cents=5000)
+    aj = player(eng, "AJ", "A1A00001", admin=True)
+    player(eng, "Dana", "DA4A0001", admin=True)
+    tap_at(eng, "M1", "C4150001")
+    tap_at(eng, "M1", "DA4A0001")               # M1: Dana over Christopher
+    tap_at(eng, "M2", "A1A00001")               # M2: AJ carded in normally
+    svc, adm_tok = tok_of(eng, "M1"), tok_of(eng, "M2")
+    by_svc = " — by Dana at Bluebird 2 (service)"
+    by_adm = " — by AJ at M2 (admin menu)"
+
+    n0 = len(rows(eng))
+    c0, f0 = cash(eng, chris), free(eng, chris)
+    eng.hub_store.set_host_setting("house_allow_negative", "off")
+    st, r = adm(eng, svc, "svcFund", cents=1500, restricted=True, rid=rid())
+    new = rows(eng)[n0:]
+    check("ADD FREE SLOT PLAY moves the Free Slot Play balance, not the "
+          "cash wallet",
+          st == 200 and r.get("ok") is True
+          and r.get("msg") == "Added $15.00 Free Slot Play for Christopher."
+          and free(eng, chris) == f0 + 1500000 and cash(eng, chris) == c0
+          and (r.get("service") or {}).get("freePlayMc") == f0 + 1500000,
+          (st, r))
+    check("...its ledger notes say restricted promotional and who did it",
+          [e["note"] for e in new]
+          == ["house fund (restricted promotional)" + by_svc,
+              f"fund {chris} (restricted promotional)" + by_svc]
+          and all(e["kind"] == "nonCash" for e in new), new)
+    check("...and it is not refused when the House may not go negative "
+          "(the House has no cash here)", cash(eng, "house") <= 0)
+
+    print("— adding and taking back: the House is out of credits")
+    n0 = len(rows(eng))
+    short = rid()
+    st, r = adm(eng, svc, "svcFund", cents=2000, rid=short)
+    check("cash from a House that may not go negative and is short: the "
+          "screen's own sentence, and no ledger row",
+          st == 200 and r.get("ok") is False and r.get("error")
+          == ("The House is out of credits. Top up the House bankroll on "
+              "the hub's Options page.")
+          and len(rows(eng)) == n0 and cash(eng, chris) == c0, (st, r))
+    eng.hub_store.set_host_setting("house_allow_negative", "on")
+    st, r = adm(eng, svc, "svcFund", cents=2000, rid=short)
+    check("a refused request, then the same request id once the cause is "
+          "fixed: it goes through",
+          st == 200 and r.get("ok") is True and "repeat" not in r
+          and cash(eng, chris) == c0 + 2000000
+          and len(rows(eng)) == n0 + 2, (st, r))
+
+    print("— adding and taking back: a second CONFIRM cannot pay twice")
+    st2, r2 = adm(eng, svc, "svcFund", cents=2000, rid=short)
+    check("the same request id again: the same reply, marked repeat, and "
+          "still two ledger rows",
+          st2 == 200 and r2.get("repeat") is True
+          and {k: v for k, v in r2.items() if k != "repeat"} == r
+          and len(rows(eng)) == n0 + 2
+          and cash(eng, chris) == c0 + 2000000, (st2, r2))
+    st, r = adm(eng, svc, "svcFund", cents=2000, rid=rid())
+    check("a different request id pays again: four rows",
+          r.get("ok") is True and "repeat" not in r
+          and len(rows(eng)) == n0 + 4
+          and cash(eng, chris) == c0 + 4000000, r)
+    n0, c0 = len(rows(eng)), cash(eng, chris)
+    for label, bad in (("no request id", {}),
+                       ("a 3-character request id", {"rid": "abc"}),
+                       ("a request id with a space in it",
+                        {"rid": "abcd efgh"}),
+                       ("a request id that is a number", {"rid": 12345678}),
+                       ("a 33-character request id", {"rid": "a" * 33})):
+        st, r = adm(eng, svc, "svcFund", cents=2000, **bad)
+        check(f"{label}: 400 request id missing, no ledger row",
+              (st, r.get("error")) == (400, "request id missing")
+              and len(rows(eng)) == n0, (st, r))
+    st, r = adm(eng, adm_tok, "plCreate", name="Nora")
+    check("NEW PLAYER without a request id: 400, nobody made",
+          (st, r.get("error")) == (400, "request id missing")
+          and eng.glass_data(adm_tok, "players")[1]["players"][-1]["name"]
+          == "Sam", (st, r))
+    # the same request id from another session, or for another action, is
+    # not the same dialog: a stored reply holds a player's figures
+    st, r = adm(eng, adm_tok, "plFund", accountId=sam, cents=100, rid=short)
+    check("a request id is remembered for the session and the action that "
+          "used it: another session with the same id is a new request",
+          r.get("ok") is True and "repeat" not in r
+          and (r.get("player") or {}).get("id") == sam
+          and "service" not in r, r)
+
+    n0, s0 = len(rows(eng)), cash(eng, sam)
+    both = rid()
+    st, r = adm(eng, adm_tok, "plFund", accountId=sam, cents=300, rid=both)
+    st2, r2 = adm(eng, adm_tok, "plTake", accountId=sam, cents=100, rid=both)
+    check("...and so is the same id on the same machine for another "
+          "action: an add is not answered with a take-back's reply",
+          r.get("ok") is True and r2.get("ok") is True
+          and "repeat" not in r2
+          and r2.get("msg") == "Took $1.00 back from Sam's wallet."
+          and cash(eng, sam) == s0 + 200000 and len(rows(eng)) == n0 + 4,
+          (r, r2))
+    again = rid()
+    adm(eng, svc, "svcFund", cents=100, rid=again)
+    c1 = cash(eng, chris)
+    act(eng, svc, "logout")                     # DONE
+    tap_at(eng, "M1", "DA4A0001")               # a new tap-over, a new token
+    check("(a new tap-over has a new token)",
+          tok_of(eng, "M1") not in (None, svc))
+    svc = tok_of(eng, "M1")
+    st, r = adm(eng, svc, "svcFund", cents=100, rid=again)
+    check("...and the same id under a new session on the same machine: "
+          "that session's own request, not the old session's reply",
+          r.get("ok") is True and "repeat" not in r
+          and cash(eng, chris) == c1 + 100000, r)
+
+    print("— adding and taking back: two at once, and the memory's limits")
+    n0, c0 = len(rows(eng)), cash(eng, chris)
+    real_pa = eng.player_action
+    inside, go = threading.Event(), threading.Event()
+
+    def slow(req, by=None):
+        inside.set()
+        go.wait(5)
+        return real_pa(req, by=by)
+    eng.player_action = slow
+    twice, out = rid(), {}
+    t = threading.Thread(target=lambda: out.update(
+        first=adm(eng, svc, "svcFund", cents=900, rid=twice)))
+    t.start()
+    inside.wait(5)
+    st, r = adm(eng, svc, "svcFund", cents=900, rid=twice)
+    go.set()
+    t.join(5)
+    eng.player_action = real_pa
+    check("the same request while the first is still being worked on: "
+          "409 busy, in words",
+          st == 409 and r.get("busy") is True and r.get("ok") is False
+          and r.get("error") == "Still working on that. Wait a moment.",
+          (st, r))
+    check("...the first one pays, once",
+          out["first"][1].get("ok") is True
+          and cash(eng, chris) == c0 + 900000
+          and len(rows(eng)) == n0 + 2, out)
+    st, r = adm(eng, svc, "svcFund", cents=900, rid=twice)
+    check("...and after it has finished the same request gets its reply "
+          "again, with no third row",
+          r.get("repeat") is True and len(rows(eng)) == n0 + 2, r)
+    t0 = time.time()
+    old = rid()
+    st, r = eng.glass_admin_action({"sess": svc, "action": "svcFund",
+                                    "cents": 100, "rid": old}, now=t0)
+    st, r = eng.glass_admin_action({"sess": svc, "action": "svcFund",
+                                    "cents": 100, "rid": old}, now=t0 + 599)
+    check("a request id is remembered for 10 minutes",
+          r.get("repeat") is True, r)
+    st, r = eng.glass_admin_action({"sess": svc, "action": "svcFund",
+                                    "cents": 100, "rid": old}, now=t0 + 601)
+    check("...and no longer", r.get("ok") is True and "repeat" not in r, r)
+    for _ in range(70):
+        adm(eng, svc, "svcFund", cents=1, rid=rid())
+    check("at most 64 request ids are kept per machine",
+          len(eng._glass_rids["M1"]) == 64, len(eng._glass_rids["M1"]))
+
+    print("— adding and taking back: the amount")
+    n0, c0 = len(rows(eng)), cash(eng, chris)
+    for bad in (0, -5, 1.5, "20", True, None, 20.0):
+        st, r = adm(eng, svc, "svcFund", cents=bad, rid=rid())
+        check(f"an amount of {bad!r} is refused: Enter an amount.",
+              (st, r.get("error")) == (200, "Enter an amount.")
+              and r.get("ok") is False and len(rows(eng)) == n0, (st, r))
+    st, r = adm(eng, svc, "svcFund", cents=10_000_001, rid=rid())
+    check("one cent over the ceiling is refused, and says the ceiling",
+          (st, r.get("error")) == (200, "The most you can add at once is "
+                                        "$100,000.00.")
+          and len(rows(eng)) == n0, (st, r))
+    st, r = adm(eng, adm_tok, "plTake", accountId=sam, cents=10_000_001,
+                rid=rid())
+    check("the same for TAKE BACK, in its own words",
+          (st, r.get("error")) == (200, "The most you can take back at "
+                                        "once is $100,000.00.")
+          and len(rows(eng)) == n0, (st, r))
+    st, r = adm(eng, svc, "svcFund", cents=10_000_000, rid=rid())
+    check("the ceiling itself goes through",
+          r.get("ok") is True and cash(eng, chris) == c0 + 10_000_000_000
+          and r.get("msg") == "Added $100,000.00 to Christopher's wallet.",
+          r)
+    n0 = len(rows(eng))
+    for bad in ("true", 1, None, "false"):
+        st, r = adm(eng, svc, "svcFund", cents=500, restricted=bad,
+                    rid=rid())
+        check(f"restricted of {bad!r} is a page fault: 400, no ledger row",
+              (st, r.get("error")) == (400, "restricted must be true or "
+                                            "false")
+              and len(rows(eng)) == n0, (st, r))
+    st, r = adm(eng, svc, "svcFund", cents=500, restricted=False, rid=rid())
+    check("restricted false is cash",
+          r.get("ok") is True and rows(eng)[-1]["kind"] == "cashable", r)
+
+    print("— adding and taking back: the players menu")
+    n0, s0, h0 = len(rows(eng)), cash(eng, sam), cash(eng, "house")
+    st, r = adm(eng, adm_tok, "plFund", accountId=sam, cents=2500, rid=rid())
+    new = rows(eng)[n0:]
+    check("ADD FUNDS for a chosen player: their wallet up, the House down, "
+          "two rows, the notes say the admin menu",
+          st == 200 and r.get("msg") == "Added $25.00 to Sam's wallet."
+          and cash(eng, sam) == s0 + 2500000
+          and cash(eng, "house") == h0 - 2500000
+          and [e["note"] for e in new] == ["house fund" + by_adm,
+                                           f"fund {sam}" + by_adm], (r, new))
+    row = dict(r.get("player") or {})
+    fobs = row.pop("fobs", None)
+    check("...the reply carries that player's row, their fob by its last "
+          "6 characters",
+          row == {"id": sam, "name": "Sam", "admin": False, "hasPin": False,
+                  "walletMc": s0 + 2500000,
+                  "wallet": f"${(s0 + 2500000) / 100000:,.2f}",
+                  "freePlayMc": 0, "freePlay": "$0.00"}
+          and [f.get("tail") for f in fobs or []] == ["A00001"],
+          r.get("player"))
+    st, r = adm(eng, adm_tok, "plFund", accountId=sam, cents=400,
+                restricted=True, rid=rid())
+    check("ADD FREE SLOT PLAY for a chosen player",
+          r.get("msg") == "Added $4.00 Free Slot Play for Sam."
+          and free(eng, sam) == 400000
+          and (r.get("player") or {}).get("freePlay") == "$4.00", r)
+    n0, s0, h0 = len(rows(eng)), cash(eng, sam), cash(eng, "house")
+    st, r = adm(eng, adm_tok, "plTake", accountId=sam, cents=1000,
+                restricted=True, rid=rid())
+    new = rows(eng)[n0:]
+    check("TAKE BACK takes from the cash wallet and credits the House, "
+          "whatever restricted says",
+          r.get("msg") == "Took $10.00 back from Sam's wallet."
+          and cash(eng, sam) == s0 - 1000000
+          and cash(eng, "house") == h0 + 1000000
+          and free(eng, sam) == 400000
+          and [(e["accountId"], e["kind"], e["deltaMillicents"], e["note"])
+               for e in new]
+          == [(sam, "cashable", -1000000, "pull back to house" + by_adm),
+              ("house", "cashable", 1000000, f"pull back {sam}" + by_adm)],
+          (r, new))
+    n0, s0 = len(rows(eng)), cash(eng, sam)
+    st, r = adm(eng, adm_tok, "plTake", accountId=sam, cents=99_999_00,
+                rid=rid())
+    check("taking back more than the wallet holds is refused in the "
+          "store's words, with no ledger row",
+          st == 200 and r.get("ok") is False
+          and r.get("error") == f"Sam has ${s0 / 100000:,.2f} — can't take "
+                                "$99,999.00. Try a smaller amount."
+          and len(rows(eng)) == n0 and cash(eng, sam) == s0, (st, r))
+    st, r = adm(eng, adm_tok, "plTake", accountId=sam, cents=-500, rid=rid())
+    check("a negative amount for TAKE BACK is refused: the hub sets the "
+          "sign, not the page",
+          (st, r.get("error")) == (200, "Enter an amount.")
+          and cash(eng, sam) == s0 and len(rows(eng)) == n0, (st, r))
+
+    eng.hub_store.set_nickname("M2", "The Very Long Named Machine Nine",
+                               protocol="g2s")
+    adm(eng, adm_tok, "plFund", accountId=sam, cents=100, rid=rid())
+    check("the machine's nickname in the note is cut to 24 characters",
+          rows(eng)[-1]["note"]
+          == f"fund {sam} — by AJ at The Very Long Named Mach (admin menu)",
+          rows(eng)[-1]["note"])
+    eng.hub_store.set_nickname("M2", "", protocol="g2s")
+
+    print("— the players menu: the player named must be a player")
+    eng.account_store.set_pin(sam, "990011")
+    before = books(eng)
+    for label, who in (("the House", "house"), ("an unknown id", "p999"),
+                       ("an id that is not text", 7),
+                       ("an id with a space before it", " " + sam),
+                       ("no id", None)):
+        got = {}
+        for name, body in (("plFund", {"cents": 500, "rid": rid()}),
+                           ("plTake", {"cents": 500, "rid": rid()}),
+                           ("plSetPin", {"pin": "482913"}),
+                           ("plClearPin", {}),
+                           ("plRename", {"name": "Changed"}),
+                           ("plAddFob", {}),
+                           ("plRemoveFob", {"fob": "A00001"})):
+            if who is not None:
+                body = dict(body, accountId=who)
+            got[name] = adm(eng, adm_tok, name, **body)
+        check(f"{label}: every players action says the player is not "
+              "there any more",
+              all((st, r.get("error"), r.get("ok")) == (200, GONE, False)
+                  for st, r in got.values()),
+              {n: (st, r.get("error")) for n, (st, r) in got.items()})
+    check("...and none of it changed anything (the House cannot be "
+          "funded, renamed or given a PIN from a screen)",
+          books(eng) == before)
+
+    print("— adding and taking back: when the hub faults half way")
+    calls = []
+
+    def boom(req, by=None):
+        calls.append(req.get("action"))
+        raise RuntimeError("typed 482913")
+    eng.player_action = boom
+    n0, c0, bad = len(rows(eng)), cash(eng, chris), rid()
+    st, r = adm(eng, svc, "svcFund", cents=700, rid=bad)
+    st2, r2 = adm(eng, svc, "svcFund", cents=700, rid=bad)
+    eng.player_action = real_pa
+    check("a fault during an add: the screen is told it may not have gone "
+          "through",
+          (st, r.get("error"), r.get("ok")) == (200, UNSURE, False), (st, r))
+    check("...the same request again gets the same sentence, and the work "
+          "is not tried a second time",
+          (st2, r2.get("error")) == (200, UNSURE)
+          and r2.get("repeat") is True and calls == ["fund"], (r2, calls))
+    st, r = adm(eng, svc, "svcFund", cents=700, rid=bad)
+    check("...not even once the fault is gone: a new dialog is needed",
+          r.get("error") == UNSURE and cash(eng, chris) == c0
+          and len(rows(eng)) == n0, r)
+
+    real_adjust = eng.account_store.adjust
+
+    def house_leg_fails(account_id, *a, **k):
+        if account_id == "house":
+            return None, "the House row is locked"
+        return real_adjust(account_id, *a, **k)
+    eng.account_store.adjust = house_leg_fails
+    r = eng.player_action({"action": "fund", "accountId": chris,
+                           "cents": 100})
+    check("player_action marks the one refusal that comes after money "
+          "moved (the House leg failed)",
+          r.get("ok") is False and r.get("partial") is True
+          and cash(eng, chris) == c0 + 100000, r)
+    n0, c0, half = len(rows(eng)), cash(eng, chris), rid()
+    st, r = adm(eng, svc, "svcFund", cents=700, rid=half)
+    st2, r2 = adm(eng, svc, "svcFund", cents=700, rid=half)
+    eng.account_store.adjust = real_adjust
+    st3, r3 = adm(eng, svc, "svcFund", cents=700, rid=half)
+    mine = [e for e in rows(eng)[n0:] if e["accountId"] == chris]
+    check("the House leg failing after the player was credited: the "
+          "screen is told it may not have gone through",
+          (st, r.get("error")) == (200, UNSURE), (st, r))
+    check("...and the same request again does not credit the player a "
+          "second time (one player row, not two)",
+          r2.get("error") == UNSURE and r3.get("error") == UNSURE
+          and len(mine) == 1 and cash(eng, chris) == c0 + 700000,
+          (r2, r3, mine))
+
+    print("— the players menu: a player deleted while the action runs")
+    zed = player(eng, "Zed")
+
+    def delete_first(req, by=None):
+        eng.account_store.delete(zed)
+        return real_pa(req, by=by)
+    eng.player_action = delete_first
+    n0 = len(rows(eng))
+    st, r = adm(eng, adm_tok, "plFund", accountId=zed, cents=500, rid=rid())
+    eng.player_action = real_pa
+    check("the player goes between the check and the money: the screen's "
+          "own sentence (not the store's), and no ledger row",
+          (st, r.get("error"), r.get("ok")) == (200, GONE, False)
+          and len(rows(eng)) == n0, (st, r))
+
+    print("— the Players web page is unchanged")
+    n0 = len(rows(eng))
+    r = eng.player_action({"action": "fund", "accountId": sam, "cents": 100,
+                           "by": "Mallory at the door"})
+    new = rows(eng)[n0:]
+    check("a fund from the web page writes its notes without a by, and a "
+          "by in its body changes nothing",
+          r.get("ok") is True
+          and [e["note"] for e in new] == ["house fund", f"fund {sam}"], new)
+    return eng, svc, adm_tok, chris, sam, aj
+
+
+def admin_menu_pins_names_fobs():
+    eng, svc, adm_tok, chris, sam, aj = admin_menu_money()
+    store = eng.account_store
+    real_pa = eng.player_action
+
+    print("— SET PIN from a screen")
+    store.clear_pin(sam)
+    store.clear_pin(chris)
+    set_calls = []
+    real_set = store.set_pin
+
+    def counting(*a, **k):
+        set_calls.append(1)
+        return real_set(*a, **k)
+    store.set_pin = counting
+    for least in (6, 4):
+        eng.hub_store.set_host_setting("pin_min_digits", str(least))
+        for name, tok, body, whose in (
+                ("svcSetPin", svc, {}, chris),
+                ("plSetPin", adm_tok, {"accountId": sam}, sam)):
+            for pin, want in (
+                    ("12ab56", "A PIN is digits only."),
+                    ("", "A PIN is digits only."),
+                    ("١٢٣٤٥٦", "A PIN is digits only."),
+                    ("123456 ", "A PIN is digits only."),
+                    (" 123456", "A PIN is digits only."),
+                    ("123456\n", "A PIN is digits only."),
+                    (123456, "A PIN is digits only."),
+                    (None, "A PIN is digits only."),
+                    ("1" * (least - 1),
+                     f"A PIN needs at least {least} digits."),
+                    ("123456789", "A PIN can have at most 8 digits.")):
+                st, r = adm(eng, tok, name, pin=pin, **body)
+                check(f"{name}, minimum {least}: {pin!r} is refused: {want}",
+                      (st, r.get("error"), r.get("ok")) == (200, want, False)
+                      and store.get(whose)["hasPin"] is False, (st, r))
+    check("none of those reached the store",
+          set_calls == [] and store.get(chris)["hasPin"] is False
+          and store.get(sam)["hasPin"] is False, len(set_calls))
+    store.set_pin = real_set
+    st, r = adm(eng, adm_tok, "plSetPin", accountId=sam, pin="4829")
+    check("with the minimum at 4, four digits are a PIN",
+          r.get("ok") is True and r.get("msg") == "Sam's PIN is set."
+          and (r.get("player") or {}).get("hasPin") is True, r)
+    eng.hub_store.set_host_setting("pin_min_digits", "6")
+    st, r = adm(eng, adm_tok, "plSetPin", accountId=sam, pin="482913")
+    check("a good PIN: ok, a sentence, the player's row, and no PIN in "
+          "the reply",
+          st == 200 and r.get("ok") is True
+          and r.get("msg") == "Sam's PIN is set."
+          and (r.get("player") or {}).get("hasPin") is True
+          and "482913" not in json.dumps(r), (st, r))
+    eng.associations["M3"] = FakeAssoc(egm_id="M3")
+    lg = eng.pin_login("M3", "482913")
+    check("that PIN cards that player in",
+          lg.get("ok") is True and lg.get("name") == "Sam"
+          and (eng.card_sessions.get("M3") or {}).get("accountId") == sam,
+          lg)
+    eng._glass_card_out("M3")
+    check("the PIN it replaced no longer works",
+          eng.pin_login("M3", "4829").get("ok") is False
+          and eng.card_sessions.get("M3") is None)
+    eng._pin_lockouts = {}
+    st, r = adm(eng, svc, "svcSetPin", pin="482913")
+    check("a PIN another player has: Pick a different PIN.",
+          (st, r.get("error"), r.get("ok"))
+          == (200, "Pick a different PIN.", False)
+          and store.get(chris)["hasPin"] is False, (st, r))
+    check("...and the first player keeps it",
+          (store.find_by_pin("482913") or {}).get("id") == sam)
+    st, r = adm(eng, svc, "svcSetPin", pin="13572468")
+    check("eight digits are a PIN; setting it ends nobody's session",
+          r.get("ok") is True and r.get("msg") == "Christopher's PIN is set."
+          and tok_of(eng, "M1") == svc and tok_of(eng, "M2") == adm_tok, r)
+    st, r = adm(eng, adm_tok, "plSetPin", accountId=aj, pin="246813")
+    check("SET PIN for an admin's account is allowed",
+          r.get("ok") is True and store.get(aj)["hasPin"] is True, r)
+    zed = player(eng, "Zed")
+
+    def delete_first(req, by=None):
+        store.delete(zed)
+        return real_pa(req, by=by)
+    eng.player_action = delete_first
+    st, r = adm(eng, adm_tok, "plSetPin", accountId=zed, pin="975310")
+    eng.player_action = real_pa
+    check("the player goes while the PIN is being set: the player is not "
+          "there any more", (st, r.get("error")) == (200, GONE), (st, r))
+
+    def boom(req, by=None):
+        raise RuntimeError("could not hash 975310")
+    eng.player_action = boom
+    st, r = adm(eng, adm_tok, "plSetPin", accountId=sam, pin="975310")
+    eng.player_action = real_pa
+    check("a fault while setting a PIN: a plain sentence, no fault text",
+          (st, r.get("error"), r.get("ok"))
+          == (200, "That did not work. Try again.", False)
+          and "975310" not in json.dumps(r), (st, r))
+
+    print("— CLEAR PIN from a screen")
+    st, r = adm(eng, adm_tok, "plClearPin", accountId=sam)
+    check("CLEAR PIN: the player has no PIN",
+          r.get("ok") is True and r.get("msg") == "Sam's PIN is cleared."
+          and (r.get("player") or {}).get("hasPin") is False
+          and store.get(sam)["hasPin"] is False, r)
+    check("...and the old PIN no longer logs in",
+          eng.pin_login("M3", "482913").get("ok") is False
+          and eng.card_sessions.get("M3") is None)
+    eng._pin_lockouts = {}
+    st, r = adm(eng, adm_tok, "plClearPin", accountId=sam)
+    check("clearing a PIN that is not set is fine",
+          r.get("ok") is True and r.get("msg") == "Sam's PIN is cleared.", r)
+
+    print("— names typed on a screen: NEW PLAYER and RENAME")
+    before = books(eng)
+    for name, want in (
+            ("", "Type a name."), ("   ", "Type a name."),
+            (None, "Type a name."), (42, "Type a name."),
+            ("A" * 17, "A name can have at most 16 letters."),
+            ("Zoë", "Use letters, numbers, spaces, - and ' only."),
+            ("Mary_Ann", "Use letters, numbers, spaces, - and ' only."),
+            ("Tom\tTom", "Use letters, numbers, spaces, - and ' only."),
+            ("<b>Al</b>", "Use letters, numbers, spaces, - and ' only."),
+            ("Сэм", "Use letters, numbers, spaces, - and ' only."),
+            ("sam", "There is already a player called Sam."),
+            (" SAM ", "There is already a player called Sam.")):
+        st, r = adm(eng, adm_tok, "plCreate", name=name, rid=rid())
+        st2, r2 = adm(eng, adm_tok, "plRename", accountId=chris, name=name)
+        check(f"a name of {name!r} is refused for a new player and for a "
+              f"rename: {want}",
+              (st, r.get("error"), r.get("ok")) == (200, want, False)
+              and (st2, r2.get("error"), r2.get("ok")) == (200, want, False),
+              (r, r2))
+    check("none of those made or renamed anybody", books(eng) == before)
+    one = rid()
+    st, r = adm(eng, adm_tok, "plCreate", name="  Mary   Ann  ", rid=one)
+    mary = (r.get("player") or {}).get("id")
+    check("NEW PLAYER: the name is tidied (ends stripped, one space "
+          "between words), and the reply carries the new player's row",
+          st == 200 and r.get("ok") is True
+          and r.get("msg") == "Mary Ann is set up."
+          and r.get("player") == {
+              "id": mary, "name": "Mary Ann", "admin": False,
+              "hasPin": False, "walletMc": 0, "wallet": "$0.00",
+              "freePlayMc": 0, "freePlay": "$0.00", "fobs": []}
+          and store.get(mary)["name"] == "Mary Ann", (st, r))
+    count = len(store.snapshot()["accounts"])
+    st, r2 = adm(eng, adm_tok, "plCreate", name="  Mary   Ann  ", rid=one)
+    check("NEW PLAYER twice with one request id makes one player",
+          r2.get("repeat") is True
+          and (r2.get("player") or {}).get("id") == mary
+          and len(store.snapshot()["accounts"]) == count, r2)
+    st, r = adm(eng, adm_tok, "plCreate", name="O'Neil-Smith 2nd", rid=rid())
+    check("a 16-character name with a hyphen, an apostrophe and a digit "
+          "passes",
+          r.get("ok") is True and r.get("msg") == "O'Neil-Smith 2nd is set "
+                                                  "up.", r)
+
+    def boom_create(req, by=None):
+        raise RuntimeError("disk full")
+    eng.player_action = boom_create
+    lost = rid()
+    st, r = adm(eng, adm_tok, "plCreate", name="Nora", rid=lost)
+    eng.player_action = real_pa
+    st2, r2 = adm(eng, adm_tok, "plCreate", name="Nora", rid=lost)
+    check("a fault while making a player: it may not have gone through, "
+          "and the same request is not tried again",
+          r.get("error") == UNSURE and r2.get("error") == UNSURE
+          and r2.get("repeat") is True
+          and not any(a["name"] == "Nora"
+                      for a in store.snapshot()["accounts"]), (r, r2))
+    st, r = adm(eng, adm_tok, "plRename", accountId=sam, name="SAM")
+    check("a player may be renamed to their own name in another case",
+          r.get("ok") is True and r.get("msg") == "Renamed to SAM."
+          and store.get(sam)["name"] == "SAM"
+          and (r.get("player") or {}).get("name") == "SAM", r)
+    st, r = adm(eng, adm_tok, "plRename", accountId=sam,
+                name="  Sam   the  2nd ")
+    check("RENAME tidies the name it saves",
+          r.get("msg") == "Renamed to Sam the 2nd."
+          and store.get(sam)["name"] == "Sam the 2nd", r)
+    adm(eng, adm_tok, "plRename", accountId=sam, name="Sam")
+    house_name = store.get("house")["name"]
+    st, r = adm(eng, adm_tok, "plRename", accountId="house", name="Mine")
+    check("the House cannot be renamed from a screen",
+          (st, r.get("error")) == (200, GONE)
+          and store.get("house")["name"] == house_name, (st, r))
+
+    print("— the players menu: when the store says no")
+    for name, body in (("plRename", {"name": "Zed the 2nd"}),
+                       ("plClearPin", {})):
+        zed = player(eng, "Zed")
+        eng.player_action = delete_first
+        st, r = adm(eng, adm_tok, name, accountId=zed, **body)
+        eng.player_action = real_pa
+        check(f"{name}: the player goes while it runs: the player is not "
+              "there any more",
+              (st, r.get("error"), r.get("ok")) == (200, GONE, False),
+              (st, r))
+    eng.player_action = lambda req, by=None: {"ok": False,
+                                              "error": "the store said no"}
+    got = [adm(eng, adm_tok, "plRename", accountId=sam, name="Sam Too"),
+           adm(eng, adm_tok, "plClearPin", accountId=sam),
+           adm(eng, adm_tok, "plCreate", name="Nell", rid=rid())]
+    eng.player_action = real_pa
+    check("RENAME, CLEAR PIN and NEW PLAYER refused by the store for any "
+          "other reason: a plain sentence, not the store's words",
+          all((st, r.get("error"), r.get("ok"))
+              == (200, "That did not work. Try again.", False)
+              for st, r in got), got)
+
+    print("— the players view")
+    eng.hub_store.fob_set("51B00002", tier="player", account_id=sam,
+                          label="blue fob")
+    uno = player(eng, "bo", "0A0B0C0D")
+    st, v = eng.glass_data(adm_tok, "players")
+    names = [p["name"] for p in v.get("players") or []]
+    check("every player, sorted by name without regard to case, and no "
+          "House row",
+          st == 200 and v.get("ok") is True and v.get("view") == "players"
+          and v.get("egmId") == "M2"
+          and names == sorted(names, key=str.lower)
+          and names[:3] == ["AJ", "bo", "Christopher"]
+          and set(names) == {a["name"] for a in store.snapshot()["accounts"]
+                             if a["kind"] == "player"}
+          and "house" not in [p["id"] for p in v["players"]], names)
+    row = next(p for p in v["players"] if p["id"] == sam)
+    check("a row: id, name, admin, PIN, wallet, Free Slot Play, and the "
+          "fobs in uid order by their last 6 characters",
+          {k: row[k] for k in row if k != "fobs"} == {
+              "id": sam, "name": "Sam", "admin": False, "hasPin": False,
+              "walletMc": cash(eng, sam),
+              "wallet": f"${cash(eng, sam) / 100000:,.2f}",
+              "freePlayMc": 400000, "freePlay": "$4.00"}
+          and [(f["tail"], f["label"]) for f in row["fobs"]]
+          == [("A00001", ""), ("B00002", "blue fob")]
+          and all(set(f) == {"tail", "label", "lastSeen"}
+                  for f in row["fobs"]), row)
+    check("no whole fob uid anywhere in the view",
+          not any(f["uid"] in json.dumps(v) for f in eng.hub_store.fobs()))
+    check("the limits the page needs, and no ADD FOB wait",
+          v.get("limits") == {"maxCents": 10000000, "nameMax": 16,
+                              "fobWaitSec": 20}
+          and "fobWait" in v and v["fobWait"] is None, v.get("limits"))
+    real_snap = store.snapshot
+    store.snapshot = lambda: (_ for _ in ()).throw(RuntimeError("db"))
+    st, v = eng.glass_data(adm_tok, "players")
+    store.snapshot = real_snap
+    check("when the players cannot be read the view says so, and sends no "
+          "list (an empty list would read as no players)",
+          st == 200 and v == {"ok": False, "view": "players", "egmId": "M2",
+                              "error": "players not readable"}, (st, v))
+
+    print("— REMOVE FOB")
+    eng.hub_store.fob_set("77B00002", tier="player", account_id=chris)
+    eng.hub_store.fob_set("88B00002", tier="player", account_id=chris)
+
+    def links():
+        return sorted((f["uid"], f["accountId"])
+                      for f in eng.hub_store.fobs())
+    before = links()
+    for label, body, want in (
+            # bo has ONE fob: every uid "ends with" an empty string, so a
+            # page fault sending none would remove the only one
+            ("an empty fob", {"accountId": uno, "fob": ""},
+             "That fob is not on bo any more."),
+            ("no fob", {"accountId": uno},
+             "That fob is not on bo any more."),
+            ("a fob that is not text", {"accountId": uno, "fob": 0},
+             "That fob is not on bo any more."),
+            ("a fob that is not hex", {"accountId": uno, "fob": "0C0D.."},
+             "That fob is not on bo any more."),
+            ("a fob that is not hex (a wildcard)",
+             {"accountId": uno, "fob": "*"},
+             "That fob is not on bo any more."),
+            ("a fob longer than 32", {"accountId": uno, "fob": "0" * 33},
+             "That fob is not on bo any more."),
+            ("another player's fob", {"accountId": sam, "fob": "150001"},
+             "That fob is not on Sam any more."),
+            ("a tail two of the player's fobs share",
+             {"accountId": chris, "fob": "B00002"},
+             "Remove that fob on the Players web page."),
+            ("the fob this admin carded in with",
+             {"accountId": aj, "fob": "A00001"},
+             "That is the fob you carded in with."),
+            ("a fob that is carded in at a machine",
+             {"accountId": chris, "fob": "150001"},
+             "That fob is carded in at Bluebird 2. Card out there first.")):
+        st, r = adm(eng, adm_tok, "plRemoveFob", **body)
+        check(f"REMOVE FOB, {label}: {want}",
+              (st, r.get("error"), r.get("ok")) == (200, want, False)
+              and links() == before, (st, r))
+    dana_fob = next(f for f in eng.hub_store.fobs() if f["uid"] == "DA4A0001")
+    st, r = adm(eng, adm_tok, "plRemoveFob", accountId=dana_fob["accountId"],
+                fob="4A0001")
+    check("REMOVE FOB, the fob of an admin who is on a tap-over: carded "
+          "in there",
+          (st, r.get("error")) == (200, "That fob is carded in at Bluebird "
+                                        "2. Card out there first.")
+          and links() == before, (st, r))
+    check("the admin who was refused their own fob is still an admin, "
+          "still carded in",
+          eng.glass_state("M2").get("admin") is True
+          and tok_of(eng, "M2") == adm_tok)
+    real_fob_set = eng.hub_store.fob_set
+    eng.hub_store.fob_set = lambda *a, **k: (None, "db is read-only")
+    st, r = adm(eng, adm_tok, "plRemoveFob", accountId=sam, fob="B00002")
+    eng.hub_store.fob_set = real_fob_set
+    check("REMOVE FOB when the hub cannot write it: could not be removed",
+          (st, r.get("error")) == (200, "That fob could not be removed. "
+                                        "Try again.")
+          and links() == before, (st, r))
+    st, r = adm(eng, adm_tok, "plRemoveFob", accountId=sam, fob="b00002")
+    fob = eng.hub_store.fob_get("51B00002")
+    check("a good removal (the tail in either case): the link is cleared "
+          "and the fob stays known to the hub as a player fob",
+          st == 200 and r.get("ok") is True
+          and r.get("msg") == "Fob removed from Sam."
+          and fob is not None and fob["accountId"] == ""
+          and fob["tier"] == "player"
+          and [f["tail"] for f in (r.get("player") or {}).get("fobs")
+               or []] == ["A00001"], (r, fob))
+    st, r = adm(eng, adm_tok, "plRemoveFob", accountId=sam, fob="B00002")
+    check("removing it again: it is not on that player any more",
+          r.get("error") == "That fob is not on Sam any more.", r)
+
+    print("— ADD FOB: not built into the endpoint yet")
+    st, r = adm(eng, adm_tok, "plAddFob", accountId=sam)
+    st2, r2 = adm(eng, adm_tok, "plAddFobCancel")
+    check("plAddFob and plAddFobCancel answer 403 not yet for an admin "
+          "(the wait for a tap is the next piece of work)",
+          (st, r.get("error")) == (403, "not yet")
+          and (st2, r2.get("error")) == (403, "not yet"), (r, r2))
+    return eng, svc, adm_tok, chris, sam
+
+
+class Records(logging.Handler):
+    """Every record the hub's two loggers write, as the text a file gets."""
+
+    def __init__(self):
+        super().__init__(logging.DEBUG)
+        self.lines = []
+
+    def emit(self, record):
+        self.lines.append(record.getMessage())
+        if record.exc_info:
+            self.lines.append(logging.Formatter().formatException(
+                record.exc_info))
+
+
+def admin_menu_logs():
+    eng, svc, adm_tok, chris, sam = admin_menu_pins_names_fobs()
+    store = eng.account_store
+    real_pa = eng.player_action
+    print("— who did it and where: the hub log; and no PIN in any log")
+    rec = Records()
+    host_log, wire_log = logging.getLogger("g2s_host"), \
+        logging.getLogger("g2s_wire")
+    levels = (host_log.level, wire_log.level)
+    for lg in (host_log, wire_log):
+        lg.addHandler(rec)
+        lg.setLevel(logging.DEBUG)
+    logging.disable(logging.NOTSET)
+    srv = None
+    try:
+        eng.associations["M1"].handpays_pending = {}
+        adm(eng, svc, "svcSetPin", pin="864201")              # set
+        adm(eng, adm_tok, "plSetPin", accountId=sam, pin="864201")   # taken
+        adm(eng, adm_tok, "plSetPin", accountId=sam, pin="86420")    # short
+        adm(eng, adm_tok, "plSetPin", accountId=sam, pin="864209")   # set
+
+        def boom(req, by=None):
+            # the text of a fault can quote what was typed
+            raise RuntimeError("could not store 864207 for " + str(req)
+                               if req.get("action") == "setPin"
+                               else "could not store 864217")
+        eng.player_action = boom
+        adm(eng, adm_tok, "plSetPin", accountId=sam, pin="864207")   # fault
+        adm(eng, adm_tok, "plFund", accountId=sam, cents=100,
+            rid=rid())                                        # fault, money
+        eng.player_action = real_pa
+        adm(eng, adm_tok, "plClearPin", accountId=sam)
+        adm(eng, adm_tok, "plRename", accountId=sam, name="Sammy")
+        adm(eng, adm_tok, "plRename", accountId=sam, name="Sam")
+        adm(eng, adm_tok, "plCreate", name="Logan", rid=rid())
+        adm(eng, adm_tok, "plFund", accountId=sam, cents=100, rid=rid())
+        eng.hub_store.fob_set("51C00003", tier="player", account_id=sam)
+        adm(eng, adm_tok, "plRemoveFob", accountId=sam, fob="C00003")
+        adm(eng, adm_tok, "864205", pin="864205")   # in the wrong field
+        act(eng, svc, "clearHandpay")
+        act(eng, adm_tok, "clearHandpay")
+
+        # the same over a real socket: the wire logger sees these bodies
+        eng.status_cache_lock = threading.Lock()
+        eng.status_state_seq = 0
+
+        class H(gh.G2SRequestHandler):
+            host_engine = eng
+        srv = gh.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+        def post(path, body):
+            c = http.client.HTTPConnection("127.0.0.1",
+                                           srv.server_address[1], timeout=10)
+            c.request("POST", path, body=json.dumps(body).encode(),
+                      headers={"Content-Type": "application/json"})
+            resp = c.getresponse()
+            out = resp.status, json.loads(resp.read().decode())
+            c.close()
+            return out
+        h1 = post("/api/glass/admin", {"sess": adm_tok, "action": "plSetPin",
+                                       "accountId": sam, "pin": "864211"})
+        h2 = post("/api/glass/pinlogin", {"egm": "M3", "pin": "864211"})
+        h3 = post("/api/players", {"action": "setPin", "accountId": chris,
+                                   "pin": "864213"})
+        h4 = post("/api/players", {"action": "setPin", "accountId": chris,
+                                   "pin": "86"})
+        h5 = post("/api/glass/admin", {"sess": adm_tok, "action": "plFund",
+                                       "accountId": sam, "cents": 100,
+                                       "rid": rid()})
+        h6 = post("/api/players", {"action": "fund", "accountId": sam,
+                                   "cents": 100})
+        raw = b'{"sess": "' + adm_tok.encode() + b'", "pin": "864215"'
+        c = http.client.HTTPConnection("127.0.0.1", srv.server_address[1],
+                                       timeout=10)
+        c.request("POST", "/api/glass/admin", body=raw,
+                  headers={"Content-Type": "application/json"})
+        h7 = c.getresponse()
+        h7 = h7.status, json.loads(h7.read().decode())
+        c.close()
+        real_action = eng.glass_admin_action
+        eng.glass_admin_action = lambda req: (_ for _ in ()).throw(
+            RuntimeError("could not read " + str(req)))
+        h8 = post("/api/glass/admin", {"sess": adm_tok, "action": "plSetPin",
+                                       "accountId": sam, "pin": "864219"})
+        eng.glass_admin_action = real_action
+    finally:
+        if srv is not None:
+            srv.shutdown()
+            srv.server_close()
+        eng.player_action = real_pa
+        logging.disable(logging.CRITICAL)
+        for lg, lvl in zip((host_log, wire_log), levels):
+            lg.removeHandler(rec)
+            lg.setLevel(lvl)
+    text = "\n".join(rec.lines)
+    check("over a real socket: POST /api/glass/admin reaches the engine "
+          "and sets the PIN; the PIN login and the web page's setPin work "
+          "as before",
+          h1[0] == 200 and h1[1].get("msg") == "Sam's PIN is set."
+          and h2[0] == 200 and h2[1].get("ok") is True
+          and h2[1].get("name") == "Sam"
+          and h3[0] == 200 and h3[1].get("ok") is True
+          and h4[0] == 400 and h5[0] == 200 and h5[1].get("ok") is True
+          and h6[0] == 200 and h7 == (400, {"ok": False,
+                                            "error": "invalid JSON"}),
+          (h1, h2, h3, h4, h5, h6, h7))
+    check("a fault the engine did not catch still answers the screen in "
+          "words, never a 500",
+          h8 == (200, {"ok": False,
+                       "error": "That did not work. Try again."})
+          and "glass admin action failed on the hub side (RuntimeError)"
+          in text, h8)
+    pins = ("864201", "86420", "864209", "864207", "864205", "864211",
+            "864213", "864215", "864217", "864219")
+    check("the hub wrote something to both logs during all that",
+          "IN  <<< POST /api/glass/admin" in text
+          and "player setPin" in text and len(rec.lines) > 20,
+          len(rec.lines))
+    check("no PIN that was set, refused, faulted on, logged in with or "
+          "typed into the wrong field is in any log record",
+          not any(p in text for p in pins),
+          [i for i, p in enumerate(pins) if p in text])
+    check("no session token is in any log record",
+          svc not in text and adm_tok not in text)
+    wire = [ln for ln in rec.lines if ln.startswith("IN  <<< POST")]
+    check("the wire log names the three kinds of PIN-carrying request "
+          "and withholds their bodies",
+          sum("/api/glass/admin" in ln and "body withheld" in ln
+              and "\n" not in ln for ln in wire) == 4
+          and sum("/api/glass/pinlogin" in ln and "body withheld" in ln
+                  and "\n" not in ln for ln in wire) == 1
+          and sum("/api/players" in ln and "body withheld" in ln
+                  and "\n" not in ln for ln in wire) == 2, wire)
+    check("...and still records the body of a web page request that "
+          "carries no PIN",
+          any("/api/players" in ln and '"action": "fund"' in ln
+              for ln in wire), wire)
+    check("a fault is logged by its class, never its text",
+          "[glass:M2] plSetPin failed on the hub side (RuntimeError)" in text
+          and "[glass:M2] plFund failed on the hub side (RuntimeError)"
+          in text and "could not store" not in text)
+    by = " — by AJ at M2 (admin menu)"
+    check("SET PIN, CLEAR PIN, RENAME, NEW PLAYER, REMOVE FOB and money "
+          "are each logged with which admin and which machine",
+          all(any(what in ln and ln.endswith(by) for ln in rec.lines)
+              for what in ("player setPin", "player clearPin",
+                           "player rename", "player create", "unlinked",
+                           "player fund"))
+          and any("player setPin" in ln and ln.endswith(
+              " — by Dana at Bluebird 2 (service)") for ln in rec.lines),
+          [ln for ln in rec.lines if " — by " in ln])
+    check("a handpay clear is logged with who asked, from which screen",
+          any(ln.endswith("[M1] handpay clear asked by Dana at Bluebird 2 "
+                          "(service)") for ln in rec.lines)
+          and any(ln.endswith("[M2] handpay clear asked by AJ at M2 (admin "
+                              "menu)") for ln in rec.lines),
+          [ln for ln in rec.lines if "handpay clear" in ln])
+    check("every refusal is logged with its machine, action, status and "
+          "the words the screen got",
+          "[glass:M2] plSetPin refused (200): Pick a different PIN." in text
+          and "[glass:M2] plSetPin refused (200): A PIN needs at least 6 "
+              "digits." in text
+          and "[glass:M2] plSetPin refused (200): That did not work. Try "
+              "again." in text, [ln for ln in rec.lines if "refused" in ln])
+    check("an action name this endpoint does not know is not written to "
+          "the log",
+          "[glass:M2] (unknown) refused (403): not yet" in text)
+    check("a web page fund is logged without a by",
+          any("player fund" in ln and " — by " not in ln
+              for ln in rec.lines))
+
+
+def admin_menus():
+    admin_menu_callers()
+    admin_menu_service()
+    admin_menu_logs()       # runs the money, PIN, name and fob checks first
 
 
 def main():
@@ -1583,6 +3262,7 @@ def main():
 
     devices_fold()
     glass_window_picker()
+    admin_menus()
 
     print(f"\nRESULT: {_p} passed, {_f} failed")
     return 1 if _f else 0

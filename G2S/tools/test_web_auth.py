@@ -107,6 +107,10 @@ def pure():
             ("/G2S", "<soap/>", P), ("/anything", "", P),
             ("/api/sas/report", "{}", P), ("/api/companion/report", "{}", P),
             ("/api/glass/pinlogin", "{}", P), ("/api/glass/action", "{}", P),
+            # the admin menus on a machine's screen: the screen has no web
+            # login, the session token decides (g2s_host.glass_admin_action)
+            ("/api/glass/admin", "{}", P),
+            ("/api/glass/admin", j({"action": "plFund"}), P),
             ("/api/auth/login", "{}", P), ("/api/auth/logout", "{}", P),
             ("/api/auth/touch", "{}", N), ("/api/auth/password", "{}", N),
             ("/api/auth/logins", "{}", A), ("/api/auth/config", "{}", A),
@@ -489,7 +493,8 @@ def _make_handler(engine):
               "_handle_fobs", "_handle_set_name", "_handle_game_name",
               "_handle_sas_forget", "_handle_g2s_forget",
               "_handle_fleet_check", "_handle_fleet_fix",
-              "_handle_glass_pin_login", "_handle_glass_action"):
+              "_handle_glass_pin_login", "_handle_glass_action",
+              "_handle_glass_admin"):
         setattr(H, n, reached(n))
     return H
 
@@ -562,13 +567,20 @@ def http_layer():
         ("/api/tito/commit", {"smibId": "smib-1"}),
         ("/api/tito/sync", {"smibId": "smib-1"}),
         ("/api/tito/void", {"smibId": "smib-1"}),
-        ("/api/glass/pinlogin", {}), ("/api/glass/action", {}))
+        ("/api/glass/pinlogin", {}), ("/api/glass/action", {}),
+        ("/api/glass/admin", {}))
 
     print("\n== lock OFF: nothing changes for anyone ==")
     for path, body in OPERATOR_POSTS + MACHINE_POSTS:
         st, js, _, _ = anon.post(path, body)
         check(f"open: POST {path} {json.dumps(body)[:30]} reaches its "
               "handler", st == 200 and js and "reached" in js, (st, js))
+    for path, want in (("/api/glass/admin", "_handle_glass_admin"),
+                       ("/api/glass/action", "_handle_glass_action"),
+                       ("/api/glass/pinlogin", "_handle_glass_pin_login")):
+        st, js, _, _ = anon.post(path, {})
+        check(f"open: POST {path} is answered by {want}",
+              st == 200 and js == {"reached": want}, (st, js))
     st, js, raw, _ = anon.get("/api/status")
     check("open: /api/status is the full body",
           st == 200 and "secretMeter" in raw and "loginRequired" not in raw)
