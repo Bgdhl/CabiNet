@@ -21,6 +21,14 @@ items.
   the day it is printed". For "never" the hub sets the most days the
   machine says it allows; where the machine has not said, its own
   setting is left as it is. A number of days is sent as before.
+- **The ticket expiry is set on a machine every time it joins**, the
+  way the header already was. It used to go out only when the setting
+  was saved, so a machine that had been re-imaged or memory-cleared
+  went back to its own number of days and stayed there. This applies
+  when the hub is set to a number of days; "never" is still sent only
+  on Save. An expiry saved together with a header change is now held
+  until the header change is done, then sent; it used to be refused and
+  dropped.
 - **A ticket's own expiry date is used only when the machine says it
   applies.** A machine can print a date on a ticket record that means
   nothing unless a second flag is set; the hub enforced it regardless.

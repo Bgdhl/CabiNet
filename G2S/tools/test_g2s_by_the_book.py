@@ -3322,6 +3322,157 @@ def item_54_never_expires():
 
 
 
+def apply_change(host, egm, txn, then):
+    """The machine validates, is authorized, and applies the option change
+    the host last sent; `then` is the optionList it answers the host's
+    read-back with."""
+    cfg = [r["attrs"].get("configurationId")
+           for r in egm.assoc.sent_requests.values()
+           if r["command"] == "setOptionChange"][-1]
+    answer_to(egm, "optionConfig", "setOptionChange",
+              change_status(cfg, txn, "G2S_pending"))
+    answer_to(egm, "optionConfig", "authorizeOptionChange",
+              change_status(cfg, txn, "G2S_applied"))
+    return answer_to(egm, "optionConfig", "getOptionList", then)
+
+
+def changed_options(cmds):
+    """The optionId of every setOptionChange in there."""
+    return [o.get(f"{{{gh.SCHEMA_NS}}}optionId")
+            for _c, name, _a, el in cmds if name == "setOptionChange"
+            for o in el.iter() if gh.localname(o.tag) == "option"]
+
+
+def the_expiry_follows_the_machine():
+    print("— the ticket expiry is re-applied when a machine joins, as the "
+          "header is (a machine that has been memory-cleared is back on "
+          "its own number of days)")
+    set_text = {"G2S_propName": "The Den"}
+    days180 = {"propName": "The Den", "line1": None, "line2": None,
+               "titleCash": None, "expireDays": 180, "rev": 1}
+    host = make_host()
+    host.ticket_header = lambda: dict(days180)
+    egm = online(joined(host, "BTB_expiry_join"))
+    a = egm.assoc
+    other = online(joined(host, "BTB_expiry_other"))   # on 30 days too
+    other.send("optionConfig", voucher_options(set_text, THIRTY_DAYS,
+                                               definitions=False))
+    host._maybe_push_ticket_header_on_join(a)
+    drain(host, a)
+    mark = len(host.sent)
+    answer_to(egm, "optionConfig", "getOptionList",
+              voucher_options(set_text, THIRTY_DAYS))
+    drain(host, other.assoc)
+    sent = values_sent(sent_since(host, mark)) or {}
+    check("the hub is set to 180 days and the machine holds 30: 180 is "
+          "sent at the join (it went only when the setting was saved), to "
+          "the machine that joined and no other",
+          changed_options(sent_since(host, mark)) == ["G2S_voucherOptions"]
+          and sent.get("G2S_expireCashPromo") == "180"
+          and sent.get("G2S_expireNonCash") == "180", sent)
+
+    host = make_host()
+    host.ticket_header = lambda: dict(days180)
+    egm = online(joined(host, "BTB_expiry_same"))
+    a = egm.assoc
+    host._maybe_push_ticket_header_on_join(a)
+    drain(host, a)
+    mark = len(host.sent)
+    answer_to(egm, "optionConfig", "getOptionList", voucher_options(
+        set_text, {"G2S_expireCashPromo": "180", "G2S_expireNonCash": "180"}))
+    check("a machine already on the hub's days: nothing is sent",
+          changed_options(sent_since(host, mark)) == [])
+
+    print("— header and expiry both differ: one change at a time")
+    host = make_host()
+    host.ticket_header = lambda: dict(days180)
+    egm = online(joined(host, "BTB_expiry_both"))
+    a = egm.assoc
+    host._maybe_push_ticket_header_on_join(a)
+    drain(host, a)
+    mark = len(host.sent)
+    answer_to(egm, "optionConfig", "getOptionList",
+              voucher_options(FACTORY_TEXT, THIRTY_DAYS))
+    check("the header goes first and the expiry is held (the second "
+          "change was refused and never sent)",
+          changed_options(sent_since(host, mark))
+          == ["G2S_voucherTextFields"] and a.ticket_expiry_pending is True,
+          changed_options(sent_since(host, mark)))
+    mark = len(host.sent)
+    apply_change(host, egm, "41", voucher_options(
+        dict(FACTORY_TEXT, G2S_propName="The Den", G2S_propLine1="",
+             G2S_titleCash="CASHOUT VOUCHER"), THIRTY_DAYS))
+    sent = values_sent(sent_since(host, mark)) or {}
+    check("once the header change has applied, the expiry follows",
+          changed_options(sent_since(host, mark)) == ["G2S_voucherOptions"]
+          and sent.get("G2S_expireCashPromo") == "180"
+          and a.ticket_expiry_pending is False, sent)
+
+    print("— saved together from the Settings page")
+    host = make_host()
+    host.ticket_header = lambda: dict(days180)
+    egm = online(joined(host, "BTB_expiry_save"))
+    a = egm.assoc
+    egm.send("optionConfig", voucher_options(FACTORY_TEXT, THIRTY_DAYS,
+                                             definitions=False))
+    mark = len(host.sent)
+    host.push_ticket_header_g2s()
+    verdicts = host.push_ticket_expiration_g2s()
+    drain(host, a)
+    check("the expiry is held behind the header, and said so",
+          changed_options(sent_since(host, mark))
+          == ["G2S_voucherTextFields"] and verdicts
+          and verdicts[0].get("deferred") is True, verdicts)
+    mark = len(host.sent)
+    apply_change(host, egm, "42", voucher_options(
+        dict(FACTORY_TEXT, G2S_propName="The Den", G2S_propLine1="",
+             G2S_titleCash="CASHOUT VOUCHER"), THIRTY_DAYS,
+        definitions=False))
+    check("and sent when the header is done",
+          changed_options(sent_since(host, mark)) == ["G2S_voucherOptions"],
+          changed_options(sent_since(host, mark)))
+
+    print("— a hub with days set and no header, and a hub set to \"never\"")
+    host = make_host()
+    host.ticket_header = lambda: dict(days180, propName=None)
+    egm = online(joined(host, "BTB_expiry_nohdr"))
+    a = egm.assoc
+    mark = len(host.sent)
+    host._maybe_push_ticket_header_on_join(a)
+    drain(host, a)
+    check("days set, no name: the machine's ticket options are still read "
+          "at the join", reads(sent_since(host, mark))
+          == [("G2S_voucher", "true")], reads(sent_since(host, mark)))
+    mark = len(host.sent)
+    answer_to(egm, "optionConfig", "getOptionList",
+              voucher_options(FACTORY_TEXT, THIRTY_DAYS))
+    check("and the days are sent, the text left alone",
+          changed_options(sent_since(host, mark)) == ["G2S_voucherOptions"],
+          changed_options(sent_since(host, mark)))
+    host = make_host()
+    host.ticket_header = lambda: dict(days180, propName=None, expireDays=0)
+    egm = online(joined(host, "BTB_expiry_never"))
+    mark = len(host.sent)
+    host._maybe_push_ticket_header_on_join(egm.assoc)
+    drain(host, egm.assoc)
+    check("no name and \"never\" (what a hub nobody has configured "
+          "holds): nothing is read and nothing is changed at a join",
+          sent_since(host, mark) == [], names(sent_since(host, mark)))
+    host = make_host()
+    host.ticket_header = lambda: dict(days180, expireDays=0)
+    egm = online(joined(host, "BTB_expiry_never_hdr"))
+    a = egm.assoc
+    host._maybe_push_ticket_header_on_join(a)
+    drain(host, a)
+    mark = len(host.sent)
+    answer_to(egm, "optionConfig", "getOptionList", voucher_options(
+        set_text, THIRTY_DAYS, days_max={"G2S_expireCashPromo": 9999,
+                                         "G2S_expireNonCash": 9999}))
+    check("a name and \"never\": the header is checked, the days are left "
+          "to the Save", changed_options(sent_since(host, mark)) == [],
+          changed_options(sent_since(host, mark)))
+
+
 def main():
     logging.basicConfig(level=logging.CRITICAL + 1)
     logging.getLogger("g2s_host").setLevel(logging.CRITICAL + 1)
@@ -3362,6 +3513,7 @@ def main():
     item_57_why_a_ticket_was_refused()
     item_23_a_header_longer_than_a_ticket_takes()
     item_54_never_expires()
+    the_expiry_follows_the_machine()
     print("=" * 50)
     print(f"RESULT: {_p} passed, {_f} failed")
     return 1 if _f else 0

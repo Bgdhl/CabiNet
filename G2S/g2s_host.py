@@ -1544,6 +1544,8 @@ CEREMONY_MODE_TTL_MS = 300000
 # its voucher device is requiredForPlay the whole machine is out of play.
 # The hub therefore remembers, on disk, that it has done so until it has
 # SEEN the device enabled again, and until then asks and re-enables.
+#: optionconfig_stage values during which a second option change is refused
+OPTION_CHANGE_BUSY = ("setting", "authorizing", "cancelling")
 VOUCHER_ENABLE_RESEND_SEC = 20    # the enable is sent again this long after
 #                                   the last, while the device still says off
 VOUCHER_RECHECK_TRIES = 15        # status reads before the hub says, loudly,
@@ -1756,6 +1758,9 @@ class EgmAssociation:
         # re-pushes at most once per join, never per message.
         self.ticket_push_epoch = -1
         self.ticket_push_pending = False
+        # the ticket expiry is to be sent to this machine as soon as the
+        # option change now in hand is done (two changes cannot run at once)
+        self.ticket_expiry_pending = False
         # Remote-handpay re-arm (2026-07-29, the $192,500 lesson): same law
         # as the ticket header above — a RAM clear silently resets
         # G2S_enabledRemoteCredit to false, and every handpay born after is
@@ -18827,8 +18832,16 @@ class G2SHost:
 
         Safe by construction: the push itself skips params already at target
         via option_values_equal, so the common case — a machine that did NOT
-        RAM-clear — costs one getOptionList and zero option-change cycles."""
-        if not self.ticket_header().get("propName"):
+        RAM-clear — costs one getOptionList and zero option-change cycles.
+
+        The ticket expiry rides the same read (v0.3.22): a machine that has
+        been memory-cleared or re-imaged is back on its own number of days
+        as well, and until now the hub sent its own only when the setting
+        was saved. A number of days is re-applied at every join; "never"
+        (0, also what a hub that was never given a number holds) is left
+        to the Save, so a hub nobody has configured changes nothing."""
+        hdr = self.ticket_header()
+        if not hdr.get("propName") and not int(hdr.get("expireDays") or 0):
             return
         with assoc.lock:
             if assoc.ticket_push_epoch == assoc.epoch:
@@ -18868,6 +18881,35 @@ class G2SHost:
             else:
                 log.warning("🎫 [%s] join: ticket-header re-push FAILED — %s",
                             assoc.egm_id, v.get("error"))
+        if int(self.ticket_header().get("expireDays") or 0) > 0:
+            for v in self.push_ticket_expiration_g2s(only=assoc):
+                if v.get("alreadyApplied"):
+                    log.info("🎫 [%s] join: ticket expiry already matches "
+                             "the machine — nothing to push", assoc.egm_id)
+                elif v.get("deferred"):
+                    log.info("🎫 [%s] join: ticket expiry (%sd) goes when "
+                             "the change in hand is done", assoc.egm_id,
+                             v.get("days"))
+                elif v.get("ok"):
+                    log.info("🎫 [%s] join: RE-APPLIED the ticket expiry "
+                             "(%sd, params %s) — the machine was on another "
+                             "number of days", assoc.egm_id, v.get("days"),
+                             v.get("params"))
+                else:
+                    log.warning("🎫 [%s] join: ticket-expiry re-push FAILED "
+                                "— %s", assoc.egm_id, v.get("error"))
+
+    def _ticket_expiry_after_option_list(self, assoc):
+        """An optionList answer landed. If a ticket expiry was held back
+        for this machine because another option change was running, and
+        none is now, send it. (The read-back the hub makes after a change
+        applies is such an answer.)"""
+        with assoc.lock:
+            if not getattr(assoc, "ticket_expiry_pending", False):
+                return
+            assoc.ticket_expiry_pending = False
+        # (a change still running refuses it again, and it is held again)
+        self.push_ticket_expiration_g2s(only=assoc)
 
     def _maybe_arm_remote_handpay_on_join(self, assoc):
         """Join twin of _maybe_push_ticket_header_on_join for the handpay
@@ -18928,9 +18970,10 @@ class G2SHost:
             log.warning("💰 [%s] join: remote key-off re-assert FAILED — %s",
                         assoc.egm_id, v.get("error"))
 
-    def push_ticket_expiration_g2s(self):
+    def push_ticket_expiration_g2s(self, only=None):
         """Fan the hub ticket-expiration setting (days, 0 = never) to every
-        ONLINE G2S EGM via the same proven option-change cycle as
+        ONLINE G2S EGM (or to `only`, the join path) via the same proven
+        option-change cycle as
         push_ticket_header_g2s — but into the voucher device's PARAMS
         option (G2S_voucherOptions/G2S_voucherOptions, a complexValue
         block), touching only G2S_expireCashPromo / G2S_expireNonCash and
@@ -18953,8 +18996,11 @@ class G2SHost:
         dc, di = "G2S_voucher", "1"
         gid, oid = "G2S_voucherOptions", "G2S_voucherOptions"
         want = str(days)
-        with self.assoc_lock:
-            assocs = list(self.associations.values())
+        if only is not None:
+            assocs = [only]
+        else:
+            with self.assoc_lock:
+                assocs = list(self.associations.values())
         verdicts = []
         for a in assocs:
             with a.lock:
@@ -19006,6 +19052,18 @@ class G2SHost:
                         if v["ok"]:
                             v["configId"] = res.get("configId")
                             v["params"] = sorted(changes)
+                        elif res.get("stage") in OPTION_CHANGE_BUSY:
+                            # Refused because another option change is
+                            # running on this machine (the ticket header,
+                            # saved or re-applied in the same breath, is
+                            # one): two cannot run at once. That used to be
+                            # the end of it, so the expiry of a header saved
+                            # together with it never reached the machine.
+                            # It is held and sent when that change is done
+                            # (_ticket_expiry_after_option_list).
+                            with a.lock:
+                                a.ticket_expiry_pending = True
+                            v.update(ok=True, deferred=True)
                         else:
                             v["error"] = str(res.get("error"))[:200]
             verdicts.append(v)
@@ -22032,6 +22090,7 @@ class G2SHost:
                             f"{asked_attrs.get('deviceId')}")
                 self._ticket_push_after_option_list(assoc)
                 self._remote_handpay_arm_after_option_list(assoc)
+                self._ticket_expiry_after_option_list(assoc)
 
         elif cmd == "optionConfigModeStatus":
             # Response to enterOptionConfigMode/getOptionConfigModeStatus
