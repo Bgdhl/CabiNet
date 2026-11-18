@@ -10206,6 +10206,15 @@ class G2SHost:
         by hand must land somewhere it can be seen. One that went to the
         credit meter, was cancelled, or was never there books nothing.
 
+        TO LOOK AT AGAIN (the owner, 2026-11-18, on being told that the
+        handpay key at the machine ends up in the player's wallet: "okay
+        thats fine. i may revisit that in the future. leave a note for me
+        to look at it again"). The machines have two keys: one puts the
+        win on the credit meter, the other "usually clears it off to
+        nothing". The question to revisit is whether the second should
+        book to a wallet at all, go to the House always, or book nothing.
+        The G2S twin of this rule is in the keyedOff handler.
+
         Until v0.3.28 the satellite said only that a handpay was pending:
         a machine with no G2S side showed no amount and booked nothing.
         Booked once: the key is the machine, the moment the lockup began
