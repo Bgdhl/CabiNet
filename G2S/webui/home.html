@@ -1664,12 +1664,18 @@ async function sasLinkSet(egm,sel){
    leg has the lockup — the SAME banner + reset, never a fork. */
 function sasJackBanner(key,m,amtMc){
   const hp=(m||{}).pendingHandpay;
-  const amt=Number(amtMc)||0;   // linked tiles pass the G2S record's amount
+  /* the amount: the machine's own SAS handpay record (v0.3.28), else what
+     a linked tile passes from the G2S record (an older satellite sends
+     no amount) */
+  const amt=hp?(Number(hp.amountMc)||Number(amtMc)||0):0;
+  /* resetId 0: the machine will not put this one on the credit meter */
+  const byHand=hp&&hp.amount!=null&&hp.resetId===0;
   return hp?`<div class="jackpot">
       <div class="jt">JACKPOT · HANDPAY</div>
       ${amt>0?`<div class="ja">${esc(fmtAmt(amt))}</div>`:""}
       <div class="js">${chip("lockup","warn","SAS "+String(hp.code||"0x51"))}
         since ${clock(hp.since)} · machine is asking for a key-off</div>
+      ${byHand?`<div class="js">Too large for this machine's credit meter: it is keyed off at the machine and booked as paid by hand.</div>`:""}
       <button class="btn" onclick="sasHpClear('${jsq(key)}',this)">
         <span class="bl">🔑 Reset to Credits</span>
         <span class="ba">key off to the credit meter</span></button>

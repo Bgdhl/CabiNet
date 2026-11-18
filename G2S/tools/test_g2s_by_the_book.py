@@ -4688,9 +4688,9 @@ def linked_machines_use_sas():
         host.sas_machines[LEG]["denomCents"] = None
     code, reply = host.linked_command(
         "bonusAward", egm.egm_id, LEG, {"amountMillicents": 500_000})
-    check("and so is any bonus while the SAS side has not given its "
-          "denomination", reply.get("ok") is False
-          and len(over_sas(host)) == 1, reply)
+    check("with no denomination set for the machine a credit is a cent, "
+          "as for its credit meter: $5.00 is 500 credits",
+          reply.get("ok") is True and reply.get("credits") == 500, reply)
 
     print("— a G2S command on a subject SAS owns there is refused; what "
           "only G2S can do stays")
@@ -4723,6 +4723,155 @@ def linked_machines_use_sas():
           g2s_since(host, mark) == ["setIdValidation", "getOptionList"]
           and host.linked_leg(a) is None and over_sas(host) == [],
           g2s_since(host, mark))
+
+
+# ---------------------------------------------------------------------------
+# A handpay on a SAS machine (v0.3.28)
+
+def sas_handpays_have_an_amount_and_are_booked():
+    print("— a handpay on a SAS machine: the satellite reports the "
+          "machine's own record (long poll 1B) and how the handpay ended. "
+          "It used to say only that one was pending: no amount on the "
+          "hub, nothing booked when it was paid by hand")
+    WIN = {"since": "2026-11-16T16:41:56", "code": "0x51", "group": 0,
+           "level": 0, "amount": 1_075_000, "partial": 0, "resetId": 1,
+           "kind": "win", "inCents": False}
+
+    def report(host, pending=None, last=None, old_satellite=False,
+               smib="smib-x", **more):
+        payload = {"smibId": smib, "address": "1", "online": True,
+                   "meters": {"0x1A": 0}, "pendingHandpay": pending}
+        if not old_satellite:
+            payload["lastHandpay"] = last
+        payload.update(more)
+        host.sas_report(payload, "192.168.50.102" if smib == "smib-x"
+                        else "192.168.50.109")
+        with host.sas_lock:
+            return dict(host.sas_machines[smib + "/1"])
+
+    def ended(how, rec=WIN, **more):
+        out = dict(rec, how=how, by="test", seq=1,
+                   clearedAt="2026-11-16T16:42:15")
+        out.update(more)
+        return out
+
+    host = make_host()
+    start = cash(host, "house")
+    entry = report(host, pending=WIN)
+    hp = entry["pendingHandpay"]
+    check("a pending handpay carries its amount in money: 1,075,000 "
+          "credits on a machine with no denomination set is $10,750.00 "
+          "(the record a Bluebird 2 gave for that win)",
+          hp.get("amountMc") == 1_075_000_000 and hp.get("kind") == "win"
+          and hp.get("resetId") == 1 and hp.get("since") == WIN["since"],
+          hp)
+    host.hub_store.set_denom("smib-x/1", 25)
+    hp = report(host, pending=WIN)["pendingHandpay"]
+    check("valued at the denomination set for the machine, as its credit "
+          "meter is", hp.get("amountMc") == 1_075_000 * 25 * 1000, hp)
+    prog = dict(WIN, level=4, kind="progressive", inCents=True,
+                amount=1_220_000)
+    hp = report(host, pending=prog)["pendingHandpay"]
+    check("a progressive is given in cents whatever the denomination",
+          hp.get("amountMc") == 1_220_000_000, hp)
+    host.hub_store.set_denom("smib-x/1", None)
+    check("nothing is booked while it is pending",
+          cash(host, "house") == start)
+
+    print("— how it ended decides the booking")
+    report(host, last=ended("credit"))
+    report(host, last=ended("cancelled"))
+    report(host, last=ended("gone"))
+    check("put on the credit meter, cancelled, or never there: nothing "
+          "is booked", cash(host, "house") == start,
+          cash(host, "house") - start)
+    entry = report(host, last=ended("hand"))
+    check("paid by hand with nobody carded in: the House is credited the "
+          "$10,750.00", cash(host, "house") == start + 1_075_000_000
+          and entry["lastHandpay"].get("how") == "hand",
+          cash(host, "house") - start)
+    for _ in range(3):
+        report(host, last=ended("hand", seq=7))
+    check("the same handpay reported again, at every report and after a "
+          "satellite restart renumbers it, is booked once",
+          cash(host, "house") == start + 1_075_000_000,
+          cash(host, "house") - start)
+    again = dict(WIN, since="2026-11-16T19:00:00")
+    report(host, last=ended("hand", rec=again))
+    check("another handpay of the same amount, later, is another booking",
+          cash(host, "house") == start + 2 * 1_075_000_000,
+          cash(host, "house") - start)
+    start = cash(host, "house")
+    report(host, last=ended("hand"), smib="smib-y")
+    check("and one on another machine at the same second is its own",
+          cash(host, "house") == start + 1_075_000_000,
+          cash(host, "house") - start)
+    start = cash(host, "house")
+    later = dict(WIN, since="2026-11-17T22:12:50", amount=2_250_000)
+    acct, _ = host.account_store.create("Player One")
+    with host.companion_lock:
+        host.card_sessions["smib-x/1"] = {"accountId": acct["id"],
+                                          "name": "Player One"}
+    report(host, last=ended("hand", rec=later))
+    check("with a player carded in at the machine the win goes to their "
+          "wallet, not the House", cash(host, acct["id"]) == 2_250_000_000
+          and cash(host, "house") == start,
+          (cash(host, acct["id"]), cash(host, "house") - start))
+
+    print("— a machine with both sides")
+    host = make_host()
+    egm = joined(host, "BTB_hp_linked")
+    a = egm.assoc
+    host.sas_links[egm.egm_id] = "smib-x/1"
+    acct, _ = host.account_store.create("Player Two")
+    with host.companion_lock:
+        host.card_sessions[egm.egm_id] = {"accountId": acct["id"],
+                                          "name": "Player Two"}
+    start = cash(host, "house")
+    report(host, pending=WIN)
+    txn, _ = egm.handpay_request(request=1_075_000_000)
+    egm.keyed_off(txn, 1_075_000_000, how="G2S_localHandpay")
+    check("its G2S key-off, paid by hand, books nothing once the "
+          "satellite reports handpay records (it was the one place a "
+          "linked machine's books came from G2S)",
+          cash(host, acct["id"]) == 0 and cash(host, "house") == start,
+          (cash(host, acct["id"]), cash(host, "house") - start))
+    report(host, last=ended("hand"))
+    check("the SAS side books it, to the player carded in on the linked "
+          "machine", cash(host, acct["id"]) == 1_075_000_000
+          and cash(host, "house") == start, cash(host, acct["id"]))
+    host = make_host()
+    egm = joined(host, "BTB_hp_linked_old")
+    host.sas_links[egm.egm_id] = "smib-x/1"
+    start = cash(host, "house")
+    report(host, pending={"since": WIN["since"], "code": "0x51"},
+           old_satellite=True)
+    txn, _ = egm.handpay_request(request=1_075_000_000)
+    egm.keyed_off(txn, 1_075_000_000, how="G2S_localHandpay")
+    check("with a satellite older than this, which reports no records, "
+          "the G2S key-off still books it",
+          cash(host, "house") == start + 1_075_000_000,
+          cash(host, "house") - start)
+    entry = report(host, pending={"since": WIN["since"], "code": "0x51"},
+                   old_satellite=True)
+    check("and its pending handpay is shown without an amount, as before",
+          entry["pendingHandpay"] == {"since": WIN["since"],
+                                      "code": "0x51"}
+          and entry["lastHandpay"] is None
+          and entry["handpayRecords"] is False, entry["pendingHandpay"])
+
+    print("— what comes off the wire is held to its shape")
+    host = make_host()
+    start = cash(host, "house")
+    junk = dict(WIN, amount="1075000", kind="x" * 400, level="4",
+                resetId=7)
+    entry = report(host, pending=junk, last=ended("hand", rec=junk))
+    check("an amount that is not a number is no amount, and books "
+          "nothing", "amount" not in entry["pendingHandpay"]
+          and cash(host, "house") == start, entry["pendingHandpay"])
+    entry = report(host, last=ended("hand", rec=dict(WIN, amount=-5)))
+    check("nor is a negative one", cash(host, "house") == start
+          and "amount" not in entry["lastHandpay"], entry["lastHandpay"])
 
 
 def main():
@@ -4782,6 +4931,7 @@ def main():
     batch_7_transfers()
     batch_7_handpays()
     linked_machines_use_sas()
+    sas_handpays_have_an_amount_and_are_booked()
     print("=" * 50)
     print(f"RESULT: {_p} passed, {_f} failed")
     return 1 if _f else 0

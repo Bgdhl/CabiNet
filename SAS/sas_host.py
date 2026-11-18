@@ -307,6 +307,48 @@ def make_on_meter(stats):
     return on_meter
 
 
+def parse_handpay_record(data):
+    """One handpay record (long poll 1B, SAS 6.02 Table 7.8): progressive
+    group, level, amount (5 BCD), partial pay (2 BCD), reset ID, ten unused
+    bytes. `data` is what follows the command byte, without the CRC.
+    Returns {"group", "level", "amount", "partial", "resetId", "kind",
+    "inCents"}, or None for a record that is short, all zero (the queue
+    is drained, §7.8.1) or not BCD where it must be.
+
+    `amount` is the handpay as the machine gives it: in CENTS when part of
+    it is a progressive win (level 01 to 20), otherwise in the machine's
+    accounting denomination units ("inCents" says which). `kind`:
+    "progressive", "win" (level 00), "topWin" (40) or "cancelledCredits"
+    (80, a cash-out too big for the machine to pay). `resetId` 1 means
+    the machine can put this one on the credit meter (§14.1).
+
+    Checked against four records a WMS Bluebird 2 gave on 2026-11-16 and
+    17, the amounts known from the machine's own G2S side: 00 00 |
+    00 01 07 50 00 | 00 00 | 01 was the $10,750.00 win."""
+    data = bytes(data or b"")
+    if len(data) < 10 or not any(data[:10]):
+        return None
+
+    def bcd(chunk):
+        n = 0
+        for b in chunk:
+            hi, lo = b >> 4, b & 0x0F
+            if hi > 9 or lo > 9:
+                return None
+            n = n * 100 + hi * 10 + lo
+        return n
+    amount, partial = bcd(data[2:7]), bcd(data[7:9])
+    if amount is None or partial is None:
+        return None
+    level = data[1]
+    kind = ("progressive" if 0x01 <= level <= 0x20 else
+            {0x00: "win", 0x40: "topWin", 0x80: "cancelledCredits"}
+            .get(level, "win"))
+    return {"group": data[0], "level": level, "amount": amount,
+            "partial": partial, "resetId": data[9], "kind": kind,
+            "inCents": kind == "progressive"}
+
+
 class HandpayLatch:
     """C3 pendingHandpay latch — the HANDPAY banner state for the hub/UI.
 
@@ -327,8 +369,31 @@ class HandpayLatch:
     re-raised 0x51 while latched (the machine re-asks every 15 s, §7.8.1)
     neither re-logs nor resets the 'since' timestamp."""
 
-    def __init__(self):
-        self.pending = None   # {"since": iso-local, "code": "0x51"} | None
+    # WHAT BECAME OF IT (v0.3.28). The latch used to say only that a
+    # handpay was pending. A machine with no G2S side had no amount on
+    # the hub and nothing was booked when the win was paid by hand. The
+    # record the machine gives (long poll 1B) is now kept with the latch,
+    # and when the handpay ends `last` says how:
+    #   "credit"     put on the credit meter: by the hub's reset (A8 with
+    #                the credit-meter method, then 94), or at the machine,
+    #                seen as the credit meter rising by the amount;
+    #   "hand"       keyed off at the machine and not on the credit meter:
+    #                paid by hand. This is the one the hub books;
+    #   "cancelled"  the player cancelled the request (exception 55);
+    #   "gone"       the machine says it is in no handpay.
+    # A key-off at the machine is settled by the next credit-meter
+    # reading (on_credits), so `last` follows it by one meter sweep.
+
+    def __init__(self, denom_cents=None):
+        # denom_cents: a callable giving the machine's accounting
+        # denomination in cents (or None), for a record given in cents
+        self._denom_cents = denom_cents or (lambda: None)
+        self.pending = None   # {"since": iso-local, "code": "0x51", ...}
+        self.last = None      # the handpay that ended last, see above
+        self._seq = 0
+        self._credits = None        # newest 0x1A reading, in credits
+        self._resetting = False     # a hub reset is running
+        self._settling = None       # a key-off waiting for a credit reading
 
     def on_exception(self, code: int) -> None:
         """Feed every dispatched exception code through here (poll thread)."""
@@ -336,16 +401,74 @@ class HandpayLatch:
             if self.pending is None:
                 self.pending = {
                     "since": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                    "code": f"0x{HANDPAY_PENDING_EXCEPTION:02X}"}
+                    "code": f"0x{HANDPAY_PENDING_EXCEPTION:02X}",
+                    "creditsAtLockup": self._credits}
                 logger.info("🧾 handpay latch ON (0x51) — pending since {}",
                             self.pending["since"])
         elif code == HANDPAY_RESET_EXCEPTION and self.pending is not None:
-            self.pending = None
+            if self._resetting:
+                self._finish("credit", "the hub's reset")
+            else:
+                # keyed off at the machine: by hand, unless the credit
+                # meter shows it went there
+                self._settling, self.pending = self.pending, None
             logger.info("🧾 handpay latch cleared (0x52 handpay was reset)")
         elif code == HANDPAY_CANCELLED_EXCEPTION and self.pending is not None:
-            self.pending = None
+            self._finish("cancelled", "the player cancelled the request")
             logger.info("🧾 handpay latch cleared (0x55 the player cancelled "
                         "the handpay request)")
+
+    def on_info(self, record) -> None:
+        """The handpay record collected for the pending 0x51 (poll
+        thread). The first one stands: a re-asked 0x51 repeats it."""
+        if record and self.pending is not None \
+                and "amount" not in self.pending:
+            self.pending = dict(self.pending, **record)
+            logger.info("🧾 handpay record: {} {} {}{}", record["kind"],
+                        record["amount"],
+                        "cents" if record["inCents"] else "credits",
+                        "" if record["resetId"] else
+                        " (cannot go on the credit meter)")
+
+    def on_credits(self, credits) -> None:
+        """Every current-credits reading (long poll 1A), in credits."""
+        if not isinstance(credits, int) or isinstance(credits, bool):
+            return
+        self._credits = credits
+        rec = self._settling
+        if rec is None:
+            return
+        self._settling = None
+        before, amount = rec.get("creditsAtLockup"), rec.get("amount")
+        on_meter = False
+        if isinstance(amount, int) and amount > 0 and rec.get("inCents"):
+            denom = self._denom_cents()      # a progressive is in cents
+            amount = amount / denom if denom else None
+        if isinstance(before, int) and amount:
+            # More than half of it arrived on the meter: it was put
+            # there. (Half, not all: a bet placed between the reset and
+            # this reading takes a little off.)
+            on_meter = credits - before >= amount / 2
+        self._publish(rec, "credit" if on_meter else "hand",
+                      "keyed off at the machine")
+
+    def begin_reset(self) -> None:
+        """A hub handpay_reset is about to run: a 0x52 that arrives
+        inside it is that reset's, not a key at the machine."""
+        self._resetting = True
+
+    def end_reset(self) -> None:
+        self._resetting = False
+
+    def _finish(self, how, by) -> None:
+        rec, self.pending = self.pending, None
+        self._publish(rec, how, by)
+
+    def _publish(self, rec, how, by) -> None:
+        self._seq += 1
+        self.last = dict(rec, how=how, by=by, seq=self._seq,
+                         clearedAt=time.strftime("%Y-%m-%dT%H:%M:%S"))
+        logger.info("🧾 handpay ended: {} ({})", how, by)
 
     def on_reset_ok(self) -> None:
         """A handpay_reset hub command came back ok=true (poll thread).
@@ -353,7 +476,7 @@ class HandpayLatch:
         already cleared the latch — but a confirm-window miss must not
         leave a stale HANDPAY banner after a machine-acked reset."""
         if self.pending is not None:
-            self.pending = None
+            self._finish("credit", "the hub's reset")
             logger.info("🧾 handpay latch cleared (handpay_reset acked)")
 
     def on_no_handpay(self) -> None:
@@ -361,7 +484,7 @@ class HandpayLatch:
         handpay condition" (A8 or 94, code 02). That is its own word that
         there is nothing pending."""
         if self.pending is not None:
-            self.pending = None
+            self._finish("gone", "the machine says it is in no handpay")
             logger.info("🧾 handpay latch cleared (the machine says it is "
                         "not in a handpay)")
 
@@ -1306,6 +1429,12 @@ class HubReporter:
             "sasEnabled": enabled,
             "pendingHandpay": (self.handpay_latch.pending
                                if self.handpay_latch is not None else None),
+            # v0.3.28: the handpay that ended last (how it ended, and the
+            # machine's record of it), null until one has. Its `seq`
+            # counts from this process's start; the hub books on
+            # (since, amount), which a restart does not change.
+            "lastHandpay": (self.handpay_latch.last
+                            if self.handpay_latch is not None else None),
             # C2 ticket header: {"appliedRev": int|null, "detail": str}
             # in every state once wired (null on bare constructions).
             "ticketData": (self.ticket_header.snapshot()
@@ -1823,7 +1952,9 @@ def main():
     # polling. Boots ENABLED until the hub's report reply says otherwise.
     sas_enabled = threading.Event()
     sas_enabled.set()
-    hp_latch = HandpayLatch()          # the HANDPAY banner state (C3)
+    hp_latch = HandpayLatch(           # the HANDPAY banner state (C3)
+        denom_cents=lambda: (stats.get("machineInfo") or {})
+        .get("denomCodeCents"))
     ticket_header = TicketHeaderState()  # the C2 ticket-header push state
 
     # Machine-info + games-census scheduler (poll-thread only: the event
@@ -1876,7 +2007,12 @@ def main():
     # Meter ingest: on_meter deliveries (scalars + the 0x0F composite dict)
     # flatten into stats["last_meters"] via ingest_meter_reading — see the
     # REPORT KEY CONTRACT at POLLED_METERS.
-    on_meter = make_on_meter(stats)
+    _fold_meter = make_on_meter(stats)
+
+    def on_meter(addr, meter_code, value):
+        _fold_meter(addr, meter_code, value)
+        if meter_code == 0x1A:
+            hp_latch.on_credits(value)   # settles a key-off at the machine
 
     def on_handpay_reset(addr, result):
         logger.info("🔑 addr {} handpay reset: {}", addr, result)
@@ -1888,6 +2024,7 @@ def main():
         # log the RAW record for bench capture and surface it on the tape.
         logger.info("🧾 addr {} handpay info collected (0x1B): {} "
                     "[{} record bytes]", addr, info.raw.hex(), len(info.data))
+        hp_latch.on_info(parse_handpay_record(info.data))
         recent_events.appendleft({
             "code": "0x1B", "label": "handpay info collected (queue drained)",
             "when": time.strftime("%Y-%m-%dT%H:%M:%S")})
@@ -2148,7 +2285,11 @@ def main():
                 # SAS floor) is fine here. No parameters to validate —
                 # if the machine is not locked up, the MACHINE says so
                 # (typed no_handpay), so the button can fire blind.
-                res = poller.reset_handpay_to_credits()
+                hp_latch.begin_reset()
+                try:
+                    res = poller.reset_handpay_to_credits()
+                finally:
+                    hp_latch.end_reset()
                 if res.ok:
                     # C3: a machine-acked reset clears the HANDPAY banner
                     # (no-op if the 0x52 drained in the confirm window

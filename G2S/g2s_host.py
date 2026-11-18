@@ -125,7 +125,7 @@ if "tournament_names" not in _hub_store_mod.HOST_SETTING_KEYS:
 # the MINOR bump per the repo's version rule). Surfaced in engine_meta() ->
 # /api/status ["_engine"]["version"]; bump this and add a CHANGELOG.md
 # section on every commit with a user-visible change.
-CABINET_VERSION = "0.3.27"
+CABINET_VERSION = "0.3.28"
 
 WSDL_NS = "http://www.gamingstandards.com/wsdl/g2s/v1.0"
 SCHEMA_NS = "http://www.gamingstandards.com/g2s/schemas/v1.0.3"
@@ -6813,10 +6813,22 @@ class G2SHost:
         # pending handpay.
         ph = payload.get("pendingHandpay")
         if isinstance(ph, dict):
-            entry["pendingHandpay"] = {"since": _s(ph.get("since"), 32),
-                                       "code": _s(ph.get("code"), 8)}
+            entry["pendingHandpay"] = dict(
+                {"since": _s(ph.get("since"), 32),
+                 "code": _s(ph.get("code"), 8)},
+                **self.sas_handpay_record(ph))
         else:
             entry["pendingHandpay"] = None
+        # lastHandpay (v0.3.28): the handpay that ended last and how; the
+        # key is absent from a satellite older than that. It is what a
+        # win paid by hand is booked from (_sas_handpay_ended).
+        lh = payload.get("lastHandpay")
+        entry["handpayRecords"] = "lastHandpay" in payload
+        entry["lastHandpay"] = (dict(
+            {"since": _s(lh.get("since"), 32),
+             "clearedAt": _s(lh.get("clearedAt"), 32),
+             "how": _s(lh.get("how"), 16), "by": _s(lh.get("by"), 60)},
+            **self.sas_handpay_record(lh)) if isinstance(lh, dict) else None)
         # ticketData (C2/C4): the satellite's ticket-header applied-state —
         # {"appliedRev": int|null, "detail": str}. Rides the entry into
         # /api/status so the UI can flag "ticket header pending" when
@@ -6903,6 +6915,9 @@ class G2SHost:
         # AJ's penny BB2 is correctly valued at 1¢ either way; setting its denom
         # in Options clears the flag.
         entry["denomAssumed"] = self._sas_denom_cents(entry)[1]
+        for hp in (entry.get("pendingHandpay"), entry.get("lastHandpay")):
+            if hp and hp.get("amount") is not None:
+                hp["amountMc"] = self.sas_handpay_mc(hp, entry)
         # denomSuggest: the satellite's 0x1F denom code held up against the
         # operator-set denomCents — {code, cents, state, since} (see
         # _sas_denom_suggest for the states). Computed fresh per report so it
@@ -7051,6 +7066,8 @@ class G2SHost:
         # sas_lock (account_store has its own lock; idempotent on txnId).
         # Uses the RAW commandResults, not the stringified entry copy.
         self._settle_aft_credit_pushes(cr, key)
+        # A SAS handpay that ended paid by hand is booked here (v0.3.28).
+        self._sas_handpay_ended(key, entry)
         # Credit-on-confirm for any button-driven AFT host-cashout (EGM_TO_HOST)
         # this report confirmed — the machine->wallet RETURN leg, crediting the
         # echoed destination wallet (NO House fallback — an uncreditable home
@@ -8868,14 +8885,11 @@ class G2SHost:
         # bonusAward: a SAS bonus is a number of credits
         try:
             amount_mc = int(req.get("amountMillicents") or 0)
-            denom_c = int(entry.get("denomCents") or 0)
         except (TypeError, ValueError):
-            amount_mc, denom_c = 0, 0
-        if denom_c <= 0:
-            return 409, {"ok": False, "via": "sas", "egmId": egm_id,
-                         "error": "this machine has a SAS link and its SAS "
-                                  "side has not reported its denomination "
-                                  "yet, so a bonus cannot be sized"}
+            amount_mc = 0
+        # valued as its credit meter is: the denomination set for the
+        # machine in the hub, a cent while none is (_sas_denom_cents)
+        denom_c = self._sas_denom_cents(entry)[0]
         credits, rest = divmod(amount_mc, denom_c * 1000)
         if amount_mc <= 0 or rest or not \
                 1 <= credits <= self.SAS_BONUS_MAX_CREDITS:
@@ -10154,6 +10168,89 @@ class G2SHost:
         if view == "settings":
             return 200, self._glass_data_settings(egm_id, assoc, rec)
         return 400, {"ok": False, "error": "unknown view", "egmId": egm_id}
+
+    @staticmethod
+    def sas_handpay_record(rec):
+        """The machine's handpay record as the satellite reports it
+        (SAS 6.02 Table 7.8), taken off the wire into a small fixed shape;
+        {} when the satellite sent none (an older one, or a record it
+        could not read)."""
+        amount = rec.get("amount")
+        if isinstance(amount, bool) or not isinstance(amount, int) \
+                or not 0 <= amount <= 9_999_999_999:
+            return {}
+        level = rec.get("level")
+        return {"amount": amount,
+                "inCents": rec.get("inCents") is True,
+                "kind": str(rec.get("kind") or "win")[:20],
+                "level": level if isinstance(level, int)
+                and not isinstance(level, bool) else None,
+                "resetId": 1 if rec.get("resetId") == 1 else 0}
+
+    def sas_handpay_mc(self, rec, entry):
+        """A SAS handpay amount in millicents. A record with a
+        progressive part is in cents; any other is in the machine's
+        accounting denomination units, valued as the credit meter is
+        (_sas_denom_cents: the denomination set for the machine in the
+        hub, a cent while none is)."""
+        amount = int(rec.get("amount") or 0)
+        if rec.get("inCents"):
+            return amount * 1000
+        return amount * self._sas_denom_cents(entry)[0] * 1000
+
+    def _sas_handpay_ended(self, key, entry):
+        """Book a SAS handpay that ended PAID BY HAND: the win goes to
+        the wallet of whoever is carded in at the machine, the House when
+        nobody is. The same rule as a G2S machine's hand-paid key-off
+        (the keyedOff handler): the hub is the attendant, and money paid
+        by hand must land somewhere it can be seen. One that went to the
+        credit meter, was cancelled, or was never there books nothing.
+
+        Until v0.3.28 the satellite said only that a handpay was pending:
+        a machine with no G2S side showed no amount and booked nothing.
+        Booked once: the key is the machine, the moment the lockup began
+        and the amount, which a satellite or hub restart does not
+        change."""
+        rec = entry.get("lastHandpay")
+        if not rec or rec.get("how") != "hand":
+            return
+        mc = int(rec.get("amountMc") or 0)
+        if mc <= 0 or not rec.get("since"):
+            return
+        ref = f"hp:sas:{key}:{rec['since']}:{rec.get('amount')}"
+        sess = {}
+        with self.companion_lock:
+            for owner in [m for m, sk in self.sas_links.items()
+                          if sk == key] + [key]:
+                sess = self.card_sessions.get(owner) or {}
+                if sess:
+                    break
+        dest = sess.get("accountId") or "house"
+        who = sess.get("name") or "the House"
+        acct, err = self.account_store.adjust(
+            dest, mc, 0, 0, note=f"handpay paid by hand (SAS {key})",
+            ref=ref, once=True)
+        if err:
+            _, err2 = self.account_store.adjust(
+                "house", mc, 0, 0,
+                note=(f"handpay paid by hand (SAS {key}) — {dest!r} "
+                      f"refused ({err}), folded to House"),
+                ref=ref, once=True)
+            log.warning("💰 [sas:%s] handpay payout: %r refused (%s) — %s "
+                        "to the HOUSE instead%s", key, dest, err,
+                        denom_dollars(mc),
+                        f" (AND THAT FAILED: {err2})" if err2 else "")
+            return
+        booked = getattr(self, "_sas_handpays_booked", None)
+        if booked is None:
+            booked = self._sas_handpays_booked = set()
+        if ref not in booked:               # said once, not at every report
+            booked.add(ref)
+            log.info("=" * 64)
+            log.info("💰 [sas:%s] HANDPAY PAID BY HAND — %s → %s's wallet "
+                     "(%s, ref %s)", key, denom_dollars(mc), who,
+                     rec.get("kind"), ref)
+            log.info("=" * 64)
 
     @staticmethod
     def _sas_denom_cents(entry):
@@ -23818,8 +23915,34 @@ class G2SHost:
                 # (belt to the dup re-ack's braces). An unknown/refused
                 # destination folds to the House LOUDLY — hand-paid money
                 # must land somewhere auditable, never vanish.
-                if ko_type in ("G2S_remoteHandpay", "G2S_localHandpay") \
-                        and (kcash + kpromo + knon) > 0:
+                # A machine with a SAS link books its handpays from the
+                # SAS side (the owner's rule: with a link, the accounting
+                # is SAS's), once its satellite reports handpay records
+                # (v0.3.28). This message is then information only. A
+                # satellite older than that reports none, and the booking
+                # stays here.
+                sas_books, sas_quiet = False, False
+                leg = self.linked_leg(assoc)
+                if leg:
+                    with self.sas_lock:
+                        le = dict(self.sas_machines.get(leg) or {})
+                    sas_books = bool(le.get("handpayRecords"))
+                    sas_quiet = sas_books and (
+                        le.get("online") is False or time.time()
+                        - (le.get("receivedAt") or 0) > self.SAS_STALE_SEC)
+                hand_paid = ko_type in ("G2S_remoteHandpay",
+                                        "G2S_localHandpay") \
+                    and (kcash + kpromo + knon) > 0
+                if hand_paid and sas_books:
+                    log.log(logging.WARNING if sas_quiet else logging.INFO,
+                            "💰 [%s] paid by hand, %s: booked from the SAS "
+                            "side (%s)%s", assoc.egm_id,
+                            "${:,.2f}".format(
+                                (kcash + kpromo + knon) / 100000), leg,
+                            " — which is NOT REPORTING just now; if it "
+                            "does not book this one, add it by hand"
+                            if sas_quiet else "")
+                elif hand_paid:
                     with self.companion_lock:
                         sess = self.card_sessions.get(assoc.egm_id) or {}
                         hp_dest = sess.get("accountId") or "house"
