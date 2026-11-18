@@ -31,9 +31,10 @@ the hub sends no lock or unlock by itself.
   instead, and shows "not subscribed" in between.
 - **Game started and game ended are no longer kept by the machine until
   acknowledged.** A machine holds only so many unsent events for the
-  hub (35 by default). With the hub off and a machine being played,
-  those two filled it in about seventeen games, and the machine then
-  dropped events or switched its event handler off. The hub also now
+  hub (the document's minimum is 35; the AVP and the Bluebird 2 both
+  say 100). With the hub off and a machine being played, those two
+  filled it in about fifty games, and the machine then dropped events
+  or switched its event handler off. The hub also now
   says when a machine reports that its event log is full, and reads the
   log back when it clears.
 - **An event first seen in the machine's log is still handled when the
