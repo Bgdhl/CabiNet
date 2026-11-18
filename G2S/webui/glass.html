@@ -23,33 +23,60 @@
      How it knows what to show: it polls GET /api/glass/state?egm=... every
      1500ms (XHR + setTimeout re-arm, one request in flight — a slow hub
      must not stack requests). RFID taps at the Companion change HUB-side
-     session state; the next poll flips this page between attract and the ONE
-     stacked home menu. The hub is the ONLY access authority — the page
-     merely renders what the state says and presents the hub-minted "sess"
-     token (kept in a JS closure var, NEVER in the URL) on its one real
-     action, logout. The home is STACKED off the state's "admin" flag: every
-     account gets MY WALLET + CASH OUT + LOG OUT; an admin account additionally
-     gets the backend stack (MACHINE / TICKETS / HANDPAY / GAMES / SETTINGS) + an ADMIN
-     badge. MY WALLET is the two-way MONEY HUB: the live wallet balance (the
+     session state; the next poll flips this page between attract, the home
+     menu and the service screen. The hub is the ONLY access authority — the
+     page merely renders what the state says and presents the hub-minted
+     "sess" token (kept in a JS closure var, NEVER in the URL) with every
+     request it makes.
+
+     HOME (a normal card-in), one stack off the state's "admin" flag: every
+     account gets MY WALLET, CASH OUT, HIDE WINDOW and LOG OUT; an admin
+     account also gets HANDPAY and an ADMIN badge. This page is the basic
+     build: it has no keyboard and no player management (those are on the
+     companion screen, smib.html, and on the operator's web pages).
+       MY WALLET is the two-way MONEY HUB: the live wallet balance (the
      state poll's pre-formatted "credits") + what is on this machine, a chip
      pad -> ADD that funds the machine from the wallet (walletFund, money
      confirm), and a CASH OUT TO WALLET arm toggle that makes the machine's own
      CASH OUT button send credits back to the wallet (cashOutToWallet — native
      per protocol: WAT on the AVP, bench-gated SAS host-cashout on the BB2). It
      polls GET /api/glass/data?view=cashout (~2s) for the live numbers + arm
-     state. MACHINE is the real read-only machine info. This build DESTUBS the
-     rest against the hub: CASH OUT (base) shows live machine+wallet balances (GET
-     /api/glass/data?view=cashout, ~2s poll) and the cash-out DESTINATION toggle
-     (cashOutToWallet -> WAT/SAS mirror); funding moved to MY WALLET; TICKETS / HANDPAY /
-     GAMES / SETTINGS (admin) each GET their /api/glass/data view and render
-     compact rows -- HANDPAY adds CLEAR (clearHandpay, confirm), GAMES is a
-     two-level drill (a button per machine-enabled GAME -> its paytables;
-     the hub groups + filters, egm-disabled titles never arrive) with a
-     REFRESH (refreshGames), TICKETS/SETTINGS are read-only. Every action goes
-     through POST /api/glass/action carrying ONLY the sess token: the hub
-     re-resolves admin and forces egmId from the token (body egmId ignored).
+     state.
+       CASH OUT shows the same live machine + wallet balances (the same data
+     view and poll) and the cash-out DESTINATION toggle (cashOutToWallet).
+       HANDPAY (admin) lists this machine's pending handpays (GET
+     /api/glass/data?view=handpay, read once on open) with CLEAR
+     (clearHandpay, confirm).
+
+     SERVICE (a tap-over): an admin taps their fob while a friend is carded
+     in. The hub keeps the friend carded in, mints the admin a token and
+     sets state.overlay. The page then shows the service screen for that
+     friend and never the home: the friend's name, wallet, Free Slot Play
+     and machine credits (state.service, painted from the STATE poll — a
+     data poll would hold the tap-over open for ever), CLEAR HANDPAY (only
+     while one is pending), ADD TO WALLET, ADD FREE SLOT PLAY, SET PIN and
+     DONE. The hub decides who the friend is from the machine's card
+     session; the page never names a player. The two adds use the keypad
+     with three quick amounts and a money confirm (svcFund, House to the
+     friend); SET PIN is typed twice on the keypad with the digits hidden
+     (svcSetPin). DONE posts logout with the tap-over token and the hub
+     hands the screen back to the friend, who was never carded out.
+
+     Two write paths, both carrying ONLY the sess token (the hub re-resolves
+     who is asking and forces egmId from the token; a body egmId is
+     ignored): POST /api/glass/action for logout, hideGlass, walletFund,
+     cashOutToWallet and clearHandpay; POST /api/glass/admin for svcFund and
+     svcSetPin. A new PIN is sent nowhere else, and the hub's words (msg on
+     a success, error on a refusal) are shown as they come.
 
      Behavior contract (glass_nav_CONTRACT.md):
+       * a new sess token (a card-in, a tap-over starting or ending) or a
+         card-out closes the keypad, forgets anything typed and drops a
+         pending confirm before the new screen shows; a reply that comes
+         back after the token changed is ignored
+       * an idle poll writes nothing to the DOM (setText / setStyle /
+         setCls compare first, an empty line is never measured): the old
+         WebKit leaks on DOM churn
        * carded=false while a menu is up -> attract (hub-side card-out wins)
        * 4 consecutive poll failures -> attract + "Reconnecting" note, keep polling
        * uiBuild change -> location.reload() (live redeploys of this file)
@@ -72,20 +99,32 @@
        nav column: left 16 + width 224 + right 16            = 256  OK
        12px-inset rows: left 12 + width 232 + right 12       = 256  OK
        .nb buttons: 84px outer (>=64 touch rule) + 14 gap
-         8-button admin stack from y=180: 8*84 + 7*14 = 672+98=770 -> ends y=950
-       stacked home (admin build): hello y=40(+30), nick y=80(+16),
+         5-button admin stack from y=180: 5*84 + 4*14 = 420+56=476 -> ends y=656
+       stacked home (admin): hello y=40(+30), nick y=80(+16),
          credits y=104(+22), ADMIN badge y=132(+26), hairline y=168,
-         stack from y=180 -> ends y=950 < foot y=976          OK
+         stack from y=180 -> ends y=656 < foot y=976          OK
          with Free Slot Play: fsp y=128(+18), badge y=154, hairline y=190,
-         stack from y=202 (nine 76px admin buttons -> y=950)   OK
-         (non-admin build hides the 5 admin buttons -> WALLET+CASHOUT+LOGOUT)
+         stack from y=202 -> ends y=678                        OK
+         (not an admin: no badge and no HANDPAY -> WALLET + CASH OUT +
+         HIDE WINDOW + LOG OUT, four buttons, ends y=558 / 580)
+       service (tap-over): title y=40, name y=68(+32), WALLET y=112/128,
+         FREE SLOT PLAY y=164/180, ON THIS MACHINE y=216/232, hairline
+         y=272, handpay caption y=280(+16), column from y=300: four
+         buttons 4*84 + 3*14 = 378 -> ends y=678 (three, with no handpay
+         pending -> y=580), message 14 under them, four 16px lines
+         -> ends y=756 at most, DONE y=880, foot y=976        OK
        cashout: title y=40, machine-credits y=120/138, wallet y=214/232,
          destination sec y=340, toggle y=372(+84)->456, hint y=470,
          note y=630, BACK y=880                              OK
-       tickets/handpay list y=88, rows 46px, cap 12; games list y=100 rows
-         40px; handpay CLEAR + games REFRESH y=770(+84) < BACK y=880  OK
-       confirm (logout pattern): q y=300, sub y=348, YES y=430,
-         NO y=542, note y=650                                 OK
+       handpay: title y=40, list y=88(+640), rows 46px, cap 12 (552);
+         CLEAR y=770(+84)->854 < BACK y=880                   OK
+       confirm (logout pattern): q y=292 (two 32px lines -> 356; a word
+         wider than the lane is fitted, it cannot wrap), sub y=364 (three
+         20px lines -> 424), YES y=430, NO y=542, note y=650  OK
+       keypad (an overlay, not a view): quick amounts y=16(+64)->80 (only
+         when adding for a friend), title y=92, figure y=118(+52), message
+         y=180 (two 16px lines -> 212), keys from y=212: 72x84 at x
+         12/92/172, rows y=212/308/404/500, CANCEL y=596(+56)->652   OK
        wallet-view (money hub): title y=40, label y=80, bal y=100(+40),
          machine y=158/176, ADD sec y=226, chips y=258(+64), sel y=334,
          ADD y=386(+84)->470, CASHOUT sec y=500, toggle y=528(+84)->612,
@@ -170,7 +209,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
             border-radius: 6px; display: none; }
 #at-pin:active { background: #26364a; }
 
-/* --- stacked home (base for everyone, +admin backend stack) ------------ */
+/* --- stacked home (base for everyone, + HANDPAY for an admin) ---------- */
 .hd-hello { position: absolute; left: 12px; top: 40px; width: 232px;
             font-size: 26px; font-weight: bold; color: #f0f4f8;
             overflow: hidden; white-space: nowrap; }
@@ -184,7 +223,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
    credits line. Shown only when the player has some (html.fsp); the badge,
    the hairline and the button stack then sit 22px lower:
    fsp y=128(+18), badge y=154(+26), hairline y=190, stack from y=202
-   -> the nine 76px admin buttons end y=950 < foot y=976. */
+   -> an admin's five buttons end y=678 < foot y=976. */
 #ph-fsp   { position: absolute; left: 12px; top: 128px; width: 232px;
             font-size: 15px; font-weight: bold; color: #7fd0a8;
             overflow: hidden; white-space: nowrap; display: none; }
@@ -202,6 +241,49 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
 .foot     { position: absolute; left: 12px; top: 976px; width: 232px;
             text-align: center; font-size: 12px; color: #55708a;
             white-space: nowrap; overflow: hidden; }
+
+/* --- SERVICE: the tap-over screen (an admin tapped their fob while a
+   friend is carded in). The friend's name and three balances come from
+   state.service; under them one flow column: CLEAR HANDPAY (shown only
+   while one is pending), ADD TO WALLET, ADD FREE SLOT PLAY, SET PIN and
+   the message line. DONE sits in the BACK slot.
+     title y=40, name y=68(+32), WALLET y=112/128, FREE SLOT PLAY
+     y=164/180, ON THIS MACHINE y=216/232, hairline y=272, handpay caption
+     y=280(+16), column from y=300: four buttons end y=678 (three: y=580),
+     the message 14 under them (four 16px lines -> y=756 at most),
+     DONE y=880(+84), foot y=976.
+   The name, the figures, the handpay caption and the three long button
+   labels are one line each and are fitted to their lane (fitFigure), so a
+   renderer with wider letters shrinks the type and never cuts or wraps
+   it. ADD FREE SLOT PLAY starts smaller: it is too long for the standard
+   button type. */
+#sv-title { position: absolute; left: 12px; top: 40px; width: 232px;
+            font-size: 18px; font-weight: bold; letter-spacing: 3px;
+            color: #e8c266; }
+#sv-name  { position: absolute; left: 12px; top: 68px; width: 232px;
+            height: 32px; line-height: 32px; font-size: 26px;
+            font-weight: bold; color: #f0f4f8;
+            overflow: hidden; white-space: nowrap; }
+.sv-l { position: absolute; left: 12px; width: 232px; font-size: 11px;
+        letter-spacing: 2px; color: #55708a; }
+.sv-v { position: absolute; left: 12px; width: 232px; font-size: 22px;
+        font-weight: bold; overflow: hidden; white-space: nowrap; }
+#sv-wl-l { top: 112px; }   #sv-wl-v { top: 128px; color: #e8c266; }
+#sv-fp-l { top: 164px; }   #sv-fp-v { top: 180px; color: #7fd0a8; }
+#sv-mc-l { top: 216px; }   #sv-mc-v { top: 232px; color: #dfe7ef; }
+#sv-rule { top: 272px; }
+#sv-hp-cap { position: absolute; left: 12px; top: 280px; width: 232px;
+             height: 16px; line-height: 16px; font-size: 12px;
+             font-weight: bold; letter-spacing: 1px; color: #e8c266;
+             overflow: hidden; white-space: nowrap; }
+#sv-btns  { top: 300px; }
+#sv-btns .nb { white-space: nowrap; overflow: hidden; }
+#sv-fsp   { font-size: 15px; letter-spacing: 1px; }
+/* the hub's own sentence, with the friend's whole name in it: a bounded
+   box, so a long one can never run down onto DONE */
+#sv-msg   { width: 224px; height: 64px; overflow: hidden;
+            text-align: center; font-size: 12px; line-height: 16px;
+            color: #c98a4f; }
 
 /* --- stub ("coming soon") ---------------------------------------------- */
 #st-glyph { position: absolute; left: 0; top: 250px; width: 256px;
@@ -307,16 +389,6 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
             text-align: center; font-size: 13px; line-height: 18px;
             color: #c98a4f; }
 
-/* --- machine info ------------------------------------------------------ */
-#mi-title { position: absolute; left: 12px; top: 40px; width: 232px;
-            font-size: 18px; font-weight: bold; letter-spacing: 3px;
-            color: #e8c266; }
-#mi-rows  { position: absolute; left: 12px; top: 100px; width: 232px; }
-.mi-l { font-size: 11px; letter-spacing: 2px; color: #55708a;
-        margin-bottom: 3px; }
-.mi-v { font-size: 16px; color: #dfe7ef; margin-bottom: 20px;
-        overflow: hidden; white-space: nowrap; }
-
 /* --- logout confirm ----------------------------------------------------- */
 #lo-q    { position: absolute; left: 12px; top: 300px; width: 232px;
            text-align: center; font-size: 26px; font-weight: bold;
@@ -368,7 +440,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
            text-align: center; font-size: 13px; line-height: 18px;
            color: #c98a4f; }
 
-/* --- shared compact list rows (tickets / handpay) ---------------------- */
+/* --- compact list rows (the HANDPAY list) ------------------------------ */
 .listbox { position: absolute; left: 12px; width: 232px; overflow: hidden; }
 .lr { position: relative; height: 46px; border-bottom: 1px solid #1c2634; }
 .lr-a { position: absolute; left: 0; top: 6px; font-size: 16px;
@@ -380,29 +452,20 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
 .lr-empty { text-align: center; font-size: 14px; color: #55708a;
             padding-top: 40px; }
 
-/* --- games rows -------------------------------------------------------- */
-.gr { position: relative; height: 40px; border-bottom: 1px solid #1c2634; }
-.gr-n { position: absolute; left: 0; top: 11px; width: 176px; font-size: 13px;
-        color: #dfe7ef; white-space: nowrap; overflow: hidden; }
-.gr-e { position: absolute; right: 0; top: 12px; font-size: 12px;
-        font-weight: bold; letter-spacing: 1px; }
-
-/* --- admin sub-view titles + settings rows ----------------------------- */
-#tk-title, #hp-title, #gm-title, #se-title {
+/* --- HANDPAY (admin) title ---------------------------------------------- */
+#hp-title {
   position: absolute; left: 12px; top: 40px; width: 232px;
   font-size: 18px; font-weight: bold; letter-spacing: 3px; color: #e8c266;
   white-space: nowrap; overflow: hidden; }
-#gm-asof { position: absolute; left: 12px; top: 72px; width: 232px;
-           font-size: 12px; color: #55708a; overflow: hidden;
-           white-space: nowrap; }
-#se-rows { position: absolute; left: 12px; top: 100px; width: 232px; }
 
 /* --- money confirm (reuses the logout-confirm layout) ------------------ */
 /* cf-q WRAPS on long questions ("CLEAR HANDPAY?" is two lines at 26px in
    the 232px lane) — explicit line-height + cf-sub pushed below the 2-line
    extent (292 + 2x32 = 356 < 364), still clear of the CONFIRM slot at 430.
    Live-caught 2026-07-16: the sub text rendered UNDER the wrapped second
-   line instead of below it. */
+   line instead of below it. One word cannot wrap, so askConfirm steps the
+   type down when an amount is wider than the lane. cf-sub has room for
+   three 20px lines (364..424). */
 #cf-q   { position: absolute; left: 12px; top: 292px; width: 232px;
           text-align: center; font-size: 26px; font-weight: bold;
           letter-spacing: 2px; color: #f0f4f8; line-height: 32px; }
@@ -413,9 +476,13 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
           text-align: center; font-size: 13px; line-height: 18px;
           color: #c98a4f; }
 
-/* --- custom-amount keypad (portrait, 256-wide lane): modal opened from the
-   FUND selection so ADD isn't stuck at the biggest preset chip. ATM-style
-   entry; OK feeds selCents. Bounded by the wallet (the AFT cap is just the BCD wire max). */
+/* --- the keypad (portrait, 256-wide lane): one overlay with four jobs.
+   MY WALLET opens it from the FUND selection so ADD isn't stuck at the
+   biggest preset chip (ATM-style entry; OK feeds selCents; bounded by the
+   wallet, the AFT cap is just the BCD wire max). Attract opens it for the
+   PIN login. The service screen opens it for the amount an admin adds for
+   the friend (with the three quick amounts on top, #kp-chips) and for the
+   friend's new PIN. */
 /* the SELECTED AMOUNT is the button: big, easy to hit, shows the live value
    and opens the keypad (seeded empty) to type a custom one. */
 #wl-custom { position: absolute; left: 12px; top: 328px; width: 232px;
@@ -435,8 +502,22 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
           text-align: center; font-size: 44px; line-height: 52px;
           font-weight: bold; color: #e8c266; overflow: hidden;
           white-space: nowrap; }
-#kp-msg { position: absolute; left: 12px; top: 180px; width: 232px; height: 16px;
+/* room for two lines (the hub's words on a refused new PIN), never more:
+   the keys start at y=212 */
+#kp-msg { position: absolute; left: 12px; top: 180px; width: 232px; height: 32px;
+          line-height: 16px; overflow: hidden;
           text-align: center; font-size: 12px; color: #c98a4f; }
+/* quick amounts, above the title: shown only while an admin is adding for
+   the friend (kpShow). Three 72x64 chips at x 12/92/172, y=16..80; a tap
+   is the same as typing that amount and OK. */
+#kp-chips { position: absolute; left: 12px; top: 16px; width: 232px;
+            height: 64px; display: none; }
+.kp-chip { position: absolute; top: 0; width: 72px; height: 64px;
+           line-height: 60px; text-align: center; font-size: 18px;
+           font-weight: bold; color: #e8c266; background: #141c26;
+           border: 2px solid #2c3a4a; cursor: pointer; }
+.kp-chip:active { background: #26364a; }
+#kp-chip0 { left: 0; }  #kp-chip1 { left: 80px; }  #kp-chip2 { left: 160px; }
 #kp-grid { position: absolute; left: 12px; top: 212px; width: 232px;
            height: 440px; }
 .kp-key { position: absolute; width: 72px; height: 84px; line-height: 80px;
@@ -479,7 +560,8 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
 .wide #at-note  { left: 0; top: 244px; width: 840px; }
 .wide #at-pin   { left: 340px; top: 200px; width: 160px; height: 38px;
                   line-height: 34px; font-size: 13px; }
-/* home: text column left, the button stack becomes a 2x4 grid on the right */
+/* home: text column left, the button stack becomes a grid on the right, two
+   across: x 420 / 624, rows y 16 / 84 / 152 (five buttons end y=212) */
 .wide .hd-hello { left: 24px; top: 24px; width: 380px; font-size: 28px; }
 .wide .hd-sub   { left: 24px; top: 62px; width: 380px; }
 .wide #ph-credits { left: 24px; top: 88px; width: 380px; font-size: 20px; }
@@ -490,13 +572,25 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
 .wide #hm-rule  { display: none; }
 .wide #hm-btns  { left: 420px !important; top: 16px !important; width: 412px; }
 .wide #hm-btns .nb { float: left; margin: 0 8px 8px 0; }
-/* html.many = the admin stack is showing (9 buttons incl. HIDE WINDOW):
-   tall lane — slimmer buttons so the column still clears the footer;
-   wide lane — three columns instead of two. */
-.many .btncol .nb { height: 76px; line-height: 72px; margin-bottom: 8px;
-                    font-size: 17px; }
-.wide.many #hm-btns .nb { width: 128px; font-size: 13px; letter-spacing: 0; }
 .wide .foot     { left: 24px; top: 262px; width: 380px; text-align: left; }
+/* service: name and balances in the text column (title y=18, name y=40,
+   the three label/figure pairs y=84/98, 126/140, 168/182, handpay caption
+   y=212), the buttons two across on the right like the home grid
+   (420,16) (624,16) (420,84) (624,84) -> end y=144, the message under
+   them (y=152, three 16px lines -> 200), DONE in the BACK slot (628,216) */
+.wide #sv-title { left: 24px; top: 18px; width: 380px; }
+.wide #sv-name  { left: 24px; top: 40px; width: 380px; font-size: 22px; }
+.wide .sv-l { left: 24px; width: 380px; }
+.wide .sv-v { left: 24px; width: 380px; font-size: 20px; }
+.wide #sv-wl-l { top: 84px; }    .wide #sv-wl-v { top: 98px; }
+.wide #sv-fp-l { top: 126px; }   .wide #sv-fp-v { top: 140px; }
+.wide #sv-mc-l { top: 168px; }   .wide #sv-mc-v { top: 182px; }
+.wide #sv-rule { display: none; }
+.wide #sv-hp-cap { left: 24px; top: 212px; width: 380px; }
+.wide #sv-btns { left: 420px; top: 16px; width: 412px; }
+.wide #sv-btns .nb { float: left; margin: 0 8px 8px 0; }
+.wide #sv-fsp { font-size: 14px; }
+.wide #sv-msg { clear: both; width: 404px; height: 48px; text-align: left; }
 /* wallet: balances left, fund pad middle, cash-out + back on the right */
 .wide #wl-title { left: 24px; top: 18px; width: 380px; }
 .wide #wl-k0    { left: 24px; top: 44px; width: 380px; }
@@ -539,13 +633,6 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
 .wide #co-toggle-slot { left: 420px; top: 40px !important; }
 .wide #co-toggle-hint { left: 420px; top: 106px; width: 196px; }
 .wide #co-note { left: 628px; top: 18px; width: 196px; }
-/* machine info: label/value pairs as rows */
-.wide #mi-title { left: 24px; top: 18px; width: 380px; }
-.wide #mi-rows  { left: 24px; top: 52px; width: 580px; }
-.wide .mi-l { float: left; clear: left; width: 130px; margin: 0 0 6px 0;
-              line-height: 18px; }
-.wide .mi-v { float: left; width: 440px; margin: 0 0 6px 0; font-size: 14px;
-              line-height: 18px; }
 /* logout + money confirm: question on top, the two buttons side by side */
 .wide #lo-q   { left: 0; top: 40px; width: 840px; }
 .wide #lo-sub { left: 120px; top: 84px; width: 600px; }
@@ -562,23 +649,23 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
 .wide #st-title { left: 0; top: 66px; width: 840px; }
 .wide #st-soon  { left: 0; top: 94px; width: 840px; }
 .wide #st-blurb { left: 120px; top: 132px; width: 600px; }
-/* admin lists: title + list left, action buttons right */
-.wide #tk-title, .wide #hp-title, .wide #gm-title, .wide #se-title {
-  left: 24px; top: 18px; width: 580px; }
-.wide #gm-asof { left: 24px; top: 44px; width: 580px; }
+/* handpay: title + list left, CLEAR right */
+.wide #hp-title { left: 24px; top: 18px; width: 580px; }
 .wide .listbox { left: 24px; width: 580px; }
-.wide #tk-list { top: 52px !important; height: 236px !important; }
 .wide #hp-list { top: 52px !important; height: 236px !important; }
-.wide #gm-list { top: 62px !important; height: 226px !important; }
 .wide .lr-b { width: 560px; }
-.wide .gr-n { width: 470px; }
-.wide #se-rows { left: 24px; top: 52px; width: 580px; }
-.wide #hp-clear-slot, .wide #gm-refresh-slot { left: 628px; top: 16px !important; }
-/* keypad: two rows of six keys, cancel underneath */
+.wide #hp-clear-slot { left: 628px; top: 16px !important; }
+/* keypad: two rows of six keys, cancel underneath; the quick amounts are a
+   column of three 140x56 chips left of the keys (x=24, y 92 / 156 / 220) */
 .wide #kp-ttl { left: 0; top: 8px; width: 840px; }
 .wide #kp-amt { left: 0; top: 26px; width: 840px; font-size: 34px;
                 line-height: 40px; }
-.wide #kp-msg { left: 0; top: 68px; width: 840px; }
+.wide #kp-msg { left: 0; top: 68px; width: 840px; height: 16px; }
+.wide #kp-chips { left: 24px; top: 92px; width: 140px; height: 184px; }
+.wide .kp-chip { width: 140px; height: 56px; line-height: 52px; }
+.wide #kp-chip0 { left: 0; top: 0; }
+.wide #kp-chip1 { left: 0; top: 64px; }
+.wide #kp-chip2 { left: 0; top: 128px; }
 .wide #kp-grid { left: 180px; top: 92px; width: 480px; height: 190px; }
 .wide .kp-key { width: 72px; height: 56px; line-height: 52px; font-size: 24px; }
 .wide #kp7 { left: 0 !important; top: 0 !important; }
@@ -610,13 +697,15 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   <div id="at-note"></div>
 </div>
 
-<!-- HOME: ONE stacked menu driven by state.admin.
-     Base (every account):  MY WALLET (gold) + LOG OUT (red).
-     Admin adds (updateTexts shows the .hm-admin buttons + #hm-badge only when
-     state.admin): MACHINE / TICKETS / HANDPAY / GAMES / SETTINGS.
+<!-- HOME: ONE stacked menu driven by state.admin (a normal card-in).
+     Base (every account):  MY WALLET (gold), CASH OUT, HIDE WINDOW,
+     LOG OUT (red).
+     An admin also gets HANDPAY for this machine (updateTexts shows the
+     .hm-admin button + #hm-badge only when state.admin).
      Extensible: to add a player feature, drop another .nb here and wire its
      onclick below (openStub('X') for a coming-soon slice); to make it
-     admin-only, give it class "hm-admin" and add its id to ADMIN_BTNS. -->
+     admin-only, give it class "hm-admin" and add its id to ADMIN_BTNS.
+     This view is never shown during a tap-over: see SERVICE below. -->
 <div class="view" id="v-home">
   <div class="hd-hello" id="ph-hello">Hello</div>
   <div class="hd-sub" id="ph-nick">&nbsp;</div>
@@ -630,11 +719,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   <div class="btncol" id="hm-btns" style="top:180px;">
     <div class="nb nb-gold" id="hb-wallet">MY WALLET</div>
     <div class="nb" id="hb-cashout">CASH OUT</div>
-    <div class="nb hm-admin" id="hb-machine" style="display:none;">MACHINE</div>
-    <div class="nb hm-admin" id="hb-tickets" style="display:none;">TICKETS</div>
     <div class="nb hm-admin" id="hb-handpay" style="display:none;">HANDPAY</div>
-    <div class="nb hm-admin" id="hb-games" style="display:none;">GAMES</div>
-    <div class="nb hm-admin" id="hb-settings" style="display:none;">SETTINGS</div>
     <!-- HIDE WINDOW (2026-09-14): game full screen, session KEPT — a
          second fob tap used to be the only way off the screen and it
          logged the player out. Re-tap or SERVICE brings the menu back. -->
@@ -642,6 +727,38 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     <div class="nb nb-red" id="hb-logout">LOG OUT</div>
   </div>
   <div class="foot" id="ph-foot">GAME ROOM</div>
+</div>
+
+<!-- SERVICE: the tap-over screen. An admin tapped their fob while a friend
+     is carded in; this shows INSTEAD of the home for as long as the state
+     says overlay. Everything on it is about the friend, and the hub decides
+     who that is (the machine's card session): the name and three balances
+     from state.service, CLEAR HANDPAY with the amount on the line above it
+     (button and line only while one is pending), ADD TO WALLET and ADD FREE
+     SLOT PLAY (the keypad with quick amounts, then the money confirm), SET
+     PIN (the keypad, typed twice), and DONE, which hands the screen back to
+     the friend. sv-msg is the result of the last action here, in the hub's
+     own words. No MY WALLET, CASH OUT, HIDE WINDOW or LOG OUT here. -->
+<div class="view" id="v-service">
+  <div id="sv-title">SERVICE</div>
+  <div id="sv-name">&nbsp;</div>
+  <div class="sv-l" id="sv-wl-l">WALLET</div>
+  <div class="sv-v" id="sv-wl-v">&#8212;</div>
+  <div class="sv-l" id="sv-fp-l">FREE SLOT PLAY</div>
+  <div class="sv-v" id="sv-fp-v">&#8212;</div>
+  <div class="sv-l" id="sv-mc-l">ON THIS MACHINE</div>
+  <div class="sv-v" id="sv-mc-v">&#8212;</div>
+  <div class="hairline" id="sv-rule"></div>
+  <div id="sv-hp-cap"></div>
+  <div class="btncol" id="sv-btns">
+    <div class="nb nb-gold" id="sv-clear" style="display:none;">CLEAR HANDPAY</div>
+    <div class="nb" id="sv-add">ADD TO WALLET</div>
+    <div class="nb" id="sv-fsp">ADD FREE SLOT PLAY</div>
+    <div class="nb" id="sv-pin">SET PIN</div>
+    <div id="sv-msg"></div>
+  </div>
+  <div class="backslot"><div class="nb nb-red" id="sv-done">DONE</div></div>
+  <div class="foot" id="sv-foot">GAME ROOM</div>
 </div>
 
 <!-- STUB: shared "coming soon" sub-view (title swapped per feature) -->
@@ -692,21 +809,6 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   <div class="backslot"><div class="nb" id="wl-back">BACK</div></div>
 </div>
 
-<!-- MACHINE INFO: real data from /api/glass/state, read-only -->
-<div class="view" id="v-machine">
-  <div id="mi-title">MACHINE</div>
-  <div id="mi-rows">
-    <div class="mi-l">NICKNAME</div>       <div class="mi-v" id="mi-nick">&#8212;</div>
-    <div class="mi-l">EGM ID</div>         <div class="mi-v" id="mi-egm">&#8212;</div>
-    <div class="mi-l">SIGNED IN</div>      <div class="mi-v" id="mi-who">&#8212;</div>
-    <div class="mi-l">SINCE</div>          <div class="mi-v" id="mi-since">&#8212;</div>
-    <div class="mi-l">HUB LINK</div>       <div class="mi-v" id="mi-link">&#8212;</div>
-    <div class="mi-l">GLASS WINDOW</div>   <div class="mi-v" id="mi-win">&#8212;</div>
-    <div class="mi-l">UI BUILD</div>       <div class="mi-v" id="mi-build">&#8212;</div>
-  </div>
-  <div class="backslot"><div class="nb" id="mi-back">BACK</div></div>
-</div>
-
 <!-- LOGOUT CONFIRM: YES posts the one real action -->
 <div class="view" id="v-logout">
   <div id="lo-q">LOG OUT?</div>
@@ -737,16 +839,9 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   <div class="backslot"><div class="nb" id="co-back">BACK</div></div>
 </div>
 
-<!-- TICKETS: admin, read-only. Recent vouchers + tito tickets for THIS machine,
-     newest first, from GET /api/glass/data?view=tickets. -->
-<div class="view" id="v-tickets">
-  <div id="tk-title">TICKETS</div>
-  <div class="listbox" id="tk-list" style="top:88px; height:560px;"></div>
-  <div class="backslot"><div class="nb" id="tk-back">BACK</div></div>
-</div>
-
-<!-- HANDPAY: admin. Pending handpays + a CLEAR button (money, confirm dialog)
-     shown only when the data view reports canClear. -->
+<!-- HANDPAY: admin. This machine's pending handpays (GET /api/glass/data
+     ?view=handpay) + a CLEAR button (money, confirm dialog) shown only when
+     the data view reports canClear. -->
 <div class="view" id="v-handpay">
   <div id="hp-title">HANDPAY</div>
   <div class="listbox" id="hp-list" style="top:88px; height:640px;"></div>
@@ -755,27 +850,10 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   <div class="backslot"><div class="nb" id="hp-back">BACK</div></div>
 </div>
 
-<!-- GAMES: admin. Two-level drill — a button per machine-enabled game, tap
-     for its paytables (hub-grouped; egm-disabled titles filtered out — the
-     host can't enable those). REFRESH = status-only refreshGameStatus. -->
-<div class="view" id="v-games">
-  <div id="gm-title">GAMES</div>
-  <div id="gm-asof"></div>
-  <div class="listbox" id="gm-list" style="top:100px; height:620px;"></div>
-  <div class="btnslot" id="gm-refresh-slot" style="top:770px;">
-    <div class="nb" id="gm-refresh">REFRESH</div></div>
-  <div class="backslot"><div class="nb" id="gm-back">BACK</div></div>
-</div>
-
-<!-- SETTINGS: admin, read-only machine summary. NO writes v1. -->
-<div class="view" id="v-settings">
-  <div id="se-title">SETTINGS</div>
-  <div id="se-rows"></div>
-  <div class="backslot"><div class="nb" id="se-back">BACK</div></div>
-</div>
-
-<!-- MONEY CONFIRM: shared by ADD-from-wallet + CLEAR-handpay. Same layout as
-     the logout confirm; the pending action lives in a JS closure var. -->
+<!-- MONEY CONFIRM: shared by ADD-from-wallet, CLEAR-handpay (the HANDPAY
+     view and the service screen) and the service screen's two adds. Same
+     layout as the logout confirm; the pending action lives in a JS closure
+     var. -->
 <div class="view" id="v-confirm">
   <div id="cf-q">CONFIRM?</div>
   <div id="cf-sub"></div>
@@ -787,9 +865,16 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
 </div>
 
 
-<!-- CUSTOM-AMOUNT KEYPAD: modal overlay opened from the FUND selection so ADD
-     can be any amount (not just the biggest preset chip). ATM-style entry. -->
+<!-- KEYPAD: one modal overlay (not a view). MY WALLET's custom amount
+     (ATM-style entry), the PIN login on attract, and on the service screen
+     the amount to add for the friend (with the quick amounts, kp-chips) and
+     the friend's new PIN. -->
 <div id="kp-scrim">
+  <div id="kp-chips">
+    <div class="kp-chip" id="kp-chip0">$20</div>
+    <div class="kp-chip" id="kp-chip1">$50</div>
+    <div class="kp-chip" id="kp-chip2">$100</div>
+  </div>
   <div id="kp-ttl">ADD &#183; AMOUNT</div>
   <div id="kp-amt">$0.00</div>
   <div id="kp-msg"></div>
@@ -854,7 +939,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   // may report the whole screen rather than its window. Tall = no changes
   // at all (the proven AVP path stays byte-identical). ES5 only.
   var LANE_W = 840, LANE_H = 292;
-  var layoutMode = '', layoutW = 256, layoutH = 1024, layoutFromHub = false;
+  var layoutMode = '', layoutFromHub = false;
   // fitFigure's off-screen ruler and what it last measured per element
   // (declared here, ahead of everything that paints)
   var ruler = null, fitSeen = {};
@@ -863,7 +948,6 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     if (!(w > 0 && h > 0)) { return; }
     if (layoutFromHub && !fromHub) { return; }   // census outranks a guess
     layoutFromHub = layoutFromHub || !!fromHub;
-    layoutW = w; layoutH = h;
     var mode = (w > h) ? 'wide' : 'tall';
     if (mode === layoutMode) { return; }
     layoutMode = mode;
@@ -892,25 +976,37 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   applyLayout(window.innerWidth, window.innerHeight, false);
 
   // ---- state: sess lives ONLY here (a closure var, never the URL) ------
-  var sess = null, tier = '', who = '', nick = '', sinceIso = '';
-  // PIN login (2026-09-14): the keypad doubles as a PIN pad on attract.
-  // kpMode 'amount' (wallet funding) | 'pin'; pinMin/pinAvail ride the
-  // state poll (pinLogin.minDigits / .available).
+  var sess = null, who = '', nick = '', sinceIso = '';
+  // The keypad overlay has four jobs (kpMode):
+  //   'amount'  MY WALLET's custom amount (wallet funding)
+  //   'pin'     the PIN login on attract (2026-09-14); pinMin/pinAvail ride
+  //             the state poll (pinLogin.minDigits / .available)
+  //   'give'    the amount an admin adds for the friend (service screen)
+  //   'newpin'  the friend's new PIN, typed twice (service screen)
   var kpMode = 'amount', kpPin = '', pinMin = 6, pinAvail = false, pinBusy = false;
+  var giveCtx = null;        // 'give' only: {restricted, name, maxCents},
+                             // made new on every open, dropped on close
+  var npFirst = '';          // 'newpin' only: the first entry, held until the
+                             // second one is typed ('' = still on the first)
+  var npBusy = false;        // 'newpin' only: the SET PIN post is in flight
   var admin = false;         // the MENU authority: state.admin from the hub
                              // (account.admin, legacy-bridged to operator
-                             // fobs) -> shows the backend button stack + badge.
-                             // tier stays for the machine-info readout only.
-  var overlay = false;       // ADMIN OVERLAY: an admin tapped OVER a carded
-                             // friend. The hub minted the admin an override
-                             // token and set state.overlay -> render the admin
-                             // stack but HIDE the money buttons (MY WALLET /
-                             // CASH OUT) so the supervisor can't touch the
-                             // friend's wallet, and label LOG OUT as "DONE"
-                             // (its logout POST ends the overlay, restoring the
-                             // friend — the hub never cards the friend out).
-  var supervising = '';      // overlay only: the carded FRIEND's name (context
-                             // for the admin; never their wallet).
+                             // fobs) -> shows HANDPAY + the ADMIN badge.
+  var overlay = false;       // TAP-OVER: an admin tapped their fob while a
+                             // friend is carded in. The hub minted the admin
+                             // a token and set state.overlay -> the SERVICE
+                             // screen shows instead of the home (home()).
+                             // The friend stays carded in the whole time;
+                             // DONE (a logout POST with this token) ends the
+                             // tap-over and the hub hands the screen back.
+  var supervising = '';      // tap-over only: the carded FRIEND's name
+  var svc = null;            // tap-over only: state.service, the friend's
+                             // figures; null when the hub left it out
+  var svcSeq = 0;            // counts the action answers that brought the
+                             // friend's fresh figures (see poll())
+  var svMsg = '';            // the service screen's message line: the result
+                             // of the last action there, kept until the
+                             // next one or a new session token
   var gameroom = '';         // collector-set gameroom name (Settings tab) shown
                              // in lights on attract + footer; '' -> neutral
                              // fallback. CabiNet is the product, THIS is theirs.
@@ -923,26 +1019,29 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   var failStreak = 0, hubOffline = false;
   var unknownStreak = 0;     // consecutive ok:false ("not known") replies;
                              // gates the attract-note escalation. NOT reset
-                             // by transport failures — a flapping link must
-                             // not let a truly unprovisioned screen sit on
+                             // by transport failures — on a flapping link
+                             // a truly unprovisioned screen must not sit on
                              // "reconnecting" forever; only an ok:true
                              // state clears it.
   var hubNote = false;       // an ok:false note is painted; ok:true clears
   var view = '';             // which .view is showing
   var logoutBusy = false;
 
-  // ---- destub state: the glass-data sub-views + money-confirm -----------
+  // ---- the glass-data sub-views + money-confirm -------------------------
   var dataTimer = null;              // cashout's ~2s live-data re-poll handle
   var confirmBusy = false;           // money-confirm POST in flight
   var coToggleBusy = false;          // WAT-toggle POST in flight
-  var gmBusy = false;                // games REFRESH POST in flight
-  var gmData = null;                 // last games payload (grouped by game)
-  var gmGame = -1;                   // drilled-into game index, -1 = list
-  var pendingConfirm = null;         // {body, back} armed for the confirm view
+  var pendingConfirm = null;         // {body, back, viaAdmin} armed for the
+                                     // confirm view
   var CUR = '$';                     // money symbol; the state poll's
                                      // "currency" (hub setting or the
                                      // machine's currencyId) overrides it
   var CHIPS = [100, 500, 2000];      // preset chips (cents): $1 / $5 / $20
+  var GIVE_CHIPS = [2000, 5000, 10000];  // the service screen's quick amounts
+                                     // (cents): $20 / $50 / $100
+  var GIVE_MAX = 10000000;           // the most one add may be (cents) when
+                                     // state.service names no limit; the hub
+                                     // keeps its own limit whatever we send
   var selIdx = 1;                    // selected chip index (default $5)
   var selCents = CHIPS[selIdx];      // its value in cents (what walletFund sends)
   var lastPlayerSince = '';          // sinceIso of the last PLAYER we saw the
@@ -980,12 +1079,12 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   }
 
   // ---- view switching: pure display flips, no layout churn --------------
-  var VIEWS = ['attract', 'home', 'stub', 'wallet', 'machine', 'logout',
-               'cashout', 'tickets', 'handpay', 'games', 'settings', 'confirm'];
+  var VIEWS = ['attract', 'home', 'service', 'stub', 'wallet', 'logout',
+               'cashout', 'handpay', 'confirm'];
   // the admin-only buttons on the home stack; add an id here to gate a new
   // button on state.admin (updateTexts show/hides the set as one). CASH OUT
   // (hb-cashout) is BASE, not here — every carded account gets it.
-  var ADMIN_BTNS = ['hb-machine', 'hb-tickets', 'hb-handpay', 'hb-games', 'hb-settings'];
+  var ADMIN_BTNS = ['hb-handpay'];
   function show(name) {
     stopDataPoll();   // any view flip cancels the cashout live-data re-poll
     for (var i = 0; i < VIEWS.length; i++) {
@@ -996,7 +1095,25 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     // button hides/shows the whole kiosk window (the old 45s mini-collapse was
     // retired 2026-07-14; the mediaDisplay window never resized with it).
   }
-  function home() { return 'home'; }   // one stacked home for every account
+  // where every BACK, CANCEL and card-in lands: the one stacked home, or
+  // the service screen for as long as a tap-over is up
+  function home() { return overlay ? 'service' : 'home'; }
+  // Nothing typed or asked under one session may stay on top of the next
+  // screen. The keypad is not a view, so show() does not close it: close it
+  // whatever it was doing (that forgets a half-typed PIN and the amount
+  // pad's context) and drop a pending confirm.
+  function dropPads() {
+    closeKeypad();
+    pendingConfirm = null;
+  }
+  // the screen goes to attract (card-out, the hub disowns us, or four
+  // failed polls). Only on the way IN: the PIN login pad is opened on
+  // attract and has to stay up there.
+  function toAttract() {
+    if (view === 'attract') { return; }
+    dropPads();
+    show('attract');
+  }
 
   // ---- XHR with a manual watchdog (readyState 4 + status 0 = dead hub) ---
   function xreq(method, url, body, cb) {
@@ -1032,18 +1149,21 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   // residency signal AND the sequencer's fetch-proof setActiveContent
   // trigger (the MDX003/MDX005 bench lessons, 2026-07-10).
   function poll() {
+    // which of the friend's figures this poll can know about: an add that
+    // is answered while the poll is in flight has newer ones (renderState)
+    var seq = svcSeq;
     xreq('GET', '/api/glass/state?egm=' + encodeURIComponent(egmId) +
       '&src=spa&dev=' + encodeURIComponent(devId), null,
       function (status, data) {
         if (status === 200 && data) {
           failStreak = 0;
           if (hubOffline) { hubOffline = false; note(''); }
-          renderState(data);
+          renderState(data, seq);
         } else {
           failStreak++;
           if (failStreak >= OFFLINE_AFTER && !hubOffline) {
             hubOffline = true;
-            if (view !== 'attract') { show('attract'); }
+            toAttract();
             // guest wording, not plumbing: "hub offline" named a component
             // no player has ever met (2026-08-17)
             note('Reconnecting \u2014 back in a moment');
@@ -1053,7 +1173,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
       });
   }
 
-  function renderState(s) {
+  function renderState(s, seq) {
     if (s.ok === false) {
       // hub answered but disowns us ("unknown egm"). This is ROUTINE, not a
       // fault: every hub restart disowns the whole floor until each machine
@@ -1063,7 +1183,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
       // only a not-known that OUTLIVES that window is a real setup problem
       // worth a human's attention (2026-08-17).
       sess = null;
-      if (view !== 'attract') { show('attract'); }
+      toAttract();
       unknownStreak++;
       note(unknownStreak > UNKNOWN_AFTER
         ? 'This screen isn\u2019t set up yet \u2014 ask your host.'
@@ -1115,65 +1235,84 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     if (s.carded) {
       if (kpMode === 'pin') { closeKeypad(); }   // the PIN worked (or a tap won)
       if (s.sess && s.sess !== deadSess) { deadSess = null; } // superseded
-      tier = s.tier || 'player';
       // admin is the MENU authority (account.admin, legacy-bridged to
-      // operator fobs host-side); tier is kept only for the machine readout
+      // operator fobs host-side)
       admin = (s.admin === true);
-      // overlay: an admin is supervising OVER a carded friend. It implies
-      // admin (the hub only sets it on an admin token) and drives the money-
-      // button hide + the DONE label below.
+      // overlay: a tap-over is up (the hub only sets it on an admin's
+      // token). The service screen shows instead of the home, painted from
+      // state.service: the FRIEND's name and figures. A hub fault can leave
+      // that block out; the screen then shows dashes and DONE still works.
       overlay = (s.overlay === true);
       supervising = overlay ? (s.supervising || '') : '';
+      if (!overlay) {
+        svc = null;
+      } else if (seq === svcSeq || s.sess !== sess) {
+        svc = (s.service && typeof s.service === 'object') ? s.service : null;
+      }
+      // else: this poll left before the last add was answered and carries
+      // the friend's OLDER figures. The answer's are newer: keep them for
+      // this one poll, so a balance never steps back after "Added ...".
       who = s.name || '';
       sinceIso = s.sinceIso || '';
       // "credits" is the hub's pre-formatted display string ("$X.XX");
       // absent = this fob has no linked account, so the line hides. The hub
-      // SUPPRESSES credits during an overlay (the friend's balance must never
-      // paint under the admin's token) — belt-and-braces blank it here too.
+      // sends no top-level credits during a tap-over (the name there is the
+      // admin's; the friend's figures are in state.service) — belt-and-
+      // braces blank it here too.
       credits = overlay ? '' : (
         (s.credits === undefined || s.credits === null)
           ? '' : String(s.credits));
       // Free Slot Play balance: sent only when the player has some, and
-      // hidden with the credits during an overlay
+      // never the home's during a tap-over
       setRestrMc(overlay ? 0 : s.restrictedMc);
       var fresh = (s.sess && s.sess !== sess);   // new hub-minted session
       if (s.sess) { sess = s.sess; }
       // Reset the FUND amount when a DIFFERENT player takes the seat, keyed on
-      // the session start (sinceIso) — NOT the token. An admin overlay re-mints
-      // the player's token when it POPS, but the underlying card session
+      // the session start (sinceIso) — NOT the token. A tap-over re-mints
+      // the player's token when it ends, but the underlying card session
       // (sinceIso) is unchanged, so the friend's amount must survive that.
-      // Sample ONLY in a real player state — never during an admin overlay.
+      // Sample ONLY in a real player state — never during a tap-over.
       if (!overlay && sinceIso && sinceIso !== lastPlayerSince) {
         lastPlayerSince = sinceIso;
         selIdx = 1; selCents = CHIPS[selIdx];   // no carryover between players
         coUseRestr = false;
       }
+      if (fresh) { svMsg = ''; }   // the last session's result is not this one's
       if (fresh || view === 'attract') {
-        show('home');          // card-in (or back from offline) -> home menu
-      } else if (!admin && (view === 'tickets' || view === 'handpay' ||
-                            view === 'games' || view === 'settings')) {
+        // card-in, a tap-over starting or ending (each one is a new token),
+        // or back from offline -> the home menu, or the service screen
+        // while a tap-over is up. Whatever the old session left open goes.
+        dropPads();
+        show(home());
+      } else if (!admin && view === 'handpay') {
         // Admin revoked mid-session (fob demoted / account.admin cleared,
-        // still carded) while the user sits INSIDE an admin sub-view: fall
+        // still carded) while the user sits INSIDE the admin sub-view: fall
         // back to home so a demoted user can't keep viewing admin-only data
-        // (these sub-views don't re-poll). The hub already 403s any write.
-        show('home');
+        // (the sub-view doesn't re-poll). The hub already 403s any write.
+        show(home());
+      }
+      // The service screen and state.overlay stay in step on EVERY poll,
+      // whatever order replies arrive in: the service screen (or its own
+      // confirm) only while a tap-over is up, and nothing else while it is.
+      var onSvc = (view === 'service') || (view === 'confirm' &&
+        pendingConfirm !== null && pendingConfirm.back === 'service');
+      if (overlay !== onSvc) {
+        dropPads();
+        show(home());
       }
       // A same-view admin flip on HOME just repaints the button set below
       // (updateTexts); with one stacked home there is no view to swap.
     } else {
-      sess = null; tier = ''; admin = false; overlay = false; supervising = '';
+      sess = null; admin = false; overlay = false; supervising = '';
+      svc = null;
       who = ''; sinceIso = ''; credits = '';
       setRestrMc(0);
-      if (view !== 'attract') { show('attract'); }   // hub-side card-out wins
+      toAttract();             // hub-side card-out wins
     }
     updateTexts();
   }
 
   function note(msg) { setText('at-note', msg); }
-  function fmtSince(iso) {
-    if (!iso || iso.length < 19) { return '\u2014'; }
-    return iso.substr(11, 8) + ' \u00b7 ' + iso.substr(0, 10);
-  }
 
   // ---- small formatters for the destub views ----------------------------
   // escape for the few innerHTML row builders (data is hub-minted, but names
@@ -1194,11 +1333,13 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   }
   // millicents -> dollars string (1 cent = 1000 millicents, the hub-side rule)
   function fmtMc(mc) { return fmtCents(Math.floor((mc || 0) / 1000)); }
-  // the preset chips are static HTML ("$1 $5 $20"); repaint them and the
-  // live amount button whenever the hub's money symbol changes
+  // the preset chips are static HTML ("$1 $5 $20", and the keypad's quick
+  // amounts "$20 $50 $100"); repaint them and the live amount button
+  // whenever the hub's money symbol changes
   function repaintCurrency() {
     for (var i = 0; i < 3; i++) {
       setText('wl-chip' + i, CUR + String(CHIPS[i] / 100));
+      setText('kp-chip' + i, CUR + String(GIVE_CHIPS[i] / 100));
     }
     setText('wl-custom', fmtCents(selCents));
     fitAmountButton();
@@ -1212,11 +1353,6 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     setText(id, s);
     setStyle($(id), 'color',
       (s && s.indexOf('-' + CUR) !== -1) ? '#ff7a6e' : '');
-  }
-  function sdot(a, b) {
-    a = (a === null || a === undefined) ? '' : String(a);
-    b = (b === null || b === undefined) ? '' : String(b);
-    return (a && b) ? (a + ' \u00b7 ' + b) : (a + b);
   }
   function dataErr(status) {
     if (status === 403) { return 'Not permitted'; }
@@ -1234,12 +1370,6 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     if (status === 401) { return 'Session ended \u2014 tap your card again'; }
     return 'Couldn\u2019t complete that \u2014 try again';
   }
-  function fmtLink(v) {
-    if (v === true) { return 'linked'; }
-    if (v === false) { return 'not linked'; }
-    return v;
-  }
-
   function brandName() {
     // the collector's gameroom name (Settings tab) painted in lights; until
     // they set one, a neutral house label (never the product name "CabiNet" —
@@ -1250,7 +1380,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   function updateTexts() {
     // Attract + menu headers show the NICKNAME only — never the EGM id
     // (serial-derived; keeping it off menu screens makes machine photos
-    // shareable — AJ, 2026-07-14). Diagnostics keep it: MACHINE INFO panel.
+    // shareable — AJ, 2026-07-14). The operator's web pages show it.
     var place = nick || '';
     var brand = brandName();
     setText('at-brand', brand);
@@ -1282,37 +1412,15 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     // footer = just the gameroom name (the raw UTC "in since HH:MM" was
     // confusing to players and served no purpose \u2014 dropped 2026-07-14)
     setText('ph-foot', brand);
-    // ADMIN badge + the backend button stack: shown as one set off "admin"
+    // ADMIN badge + the admin-only button (HANDPAY): one set off "admin"
     setStyle($('hm-badge'), 'display', admin ? 'block' : 'none');
     for (var ai = 0; ai < ADMIN_BTNS.length; ai++) {
       setStyle($(ADMIN_BTNS[ai]), 'display', admin ? 'block' : 'none');
     }
-    // nine buttons on screen (admin stack + HIDE WINDOW) -> html.many, the
-    // denser button geometry in both lanes (see the .many rules)
-    (function () {
-      var de = document.documentElement;
-      var cls = (de.className || '').replace(/\bmany\b/g, '').replace(/^\s+|\s+$/g, '');
-      de.className = admin ? (cls ? cls + ' many' : 'many') : cls;
-    })();
-    // ADMIN OVERLAY: hide the money buttons (MY WALLET / CASH OUT) so a
-    // supervisor stacked over a friend can't reach the friend's wallet, and
-    // relabel the badge + LOG OUT (its POST ends the overlay, not a card-out).
-    // The hub also 403s wallet verbs on an overlay token (defense in depth).
-    setStyle($('hb-wallet'), 'display', overlay ? 'none' : 'block');
-    setStyle($('hb-cashout'), 'display', overlay ? 'none' : 'block');
-    setText('hb-logout', overlay ? 'DONE' : 'LOG OUT');
-    setText('hm-badge', overlay
-      ? ('SUPERVISOR' + (supervising ? (' · ' + supervising +
-          ' stays carded') : ' — friend stays carded'))
-      : 'ADMIN');
-    setText('mi-nick', nick || '\u2014');
-    setText('mi-egm', egmId || '\u2014');
-    setText('mi-who', who ? (who + ' \u00b7 ' + tier) : '\u2014');
-    setText('mi-since', fmtSince(sinceIso));
-    setText('mi-link', hubOffline ? 'OFFLINE' : 'online');
-    setText('mi-win', 'dev ' + devId + ' \u00b7 ' + layoutW + '\u00d7' +
-      layoutH + ' \u00b7 ' + (layoutMode || 'tall'));
-    setText('mi-build', lastBuild === null ? '\u2014' : String(lastBuild));
+    // the service screen carries the same footer and is painted from the
+    // state on every poll (it is only on show while a tap-over is up)
+    setText('sv-foot', brand);
+    paintService();
   }
 
   // ---- the ONE real action: logout -> hub runs the true G2S card-out ----
@@ -1342,30 +1450,139 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
       });
   }
 
-  // ---- ADMIN OVERLAY "DONE": end the overlay, hand the glass back --------
-  // Posts the same logout verb, but the hub recognizes an overlay token and
-  // POPS THE OVERLAY (re-mints the friend's token) instead of carding anyone
-  // out. We do NOT flash attract — our admin token is now dead, and the next
+  // ---- TAP-OVER "DONE": end the tap-over, hand the glass back ------------
+  // Posts the same logout verb, but the hub recognizes a tap-over token and
+  // ENDS THE TAP-OVER (re-mints the friend's token) instead of carding anyone
+  // out. We do NOT flash attract: our admin token is now dead, and the next
   // ~1.5s state poll arrives carded:true with the FRIEND's fresh token, which
   // renderState treats as a card-in (fresh sess) and paints their home.
+  // While it is on its way DONE reads "handing back..." (paintService).
   function doOverlayDone() {
     if (logoutBusy || !sess) { return; }
+    var tok = sess;
     logoutBusy = true;
-    setText('hb-logout', 'handing back…');
+    paintService();
     xreq('POST', '/api/glass/action',
-      JSON.stringify({ sess: sess, action: 'logout' }),
+      JSON.stringify({ sess: tok, action: 'logout' }),
       function (status, data) {
         logoutBusy = false;
+        // the session moved on while this was in flight (the hub handed
+        // the screen back by itself): the answer is nobody's any more
+        if (sess !== tok) { paintService(); return; }
         if ((status === 200 && data && data.ok !== false) || status === 401) {
           // Tombstone our (now-dead) admin token so an in-flight poll still
-          // carrying it overlay:true can't repaint the supervisor stack; the
+          // carrying it overlay:true can't repaint the service screen; the
           // next poll's player token differs and restores the friend.
-          deadSess = sess; sess = null;
-        } else {
-          // couldn't reach the hub — leave the overlay up, restore the label
-          setText('hb-logout', 'DONE');
+          deadSess = tok; sess = null;
         }
+        // else: couldn't reach the hub; the tap-over stays up and DONE
+        // reads DONE again
+        paintService();
       });
+  }
+
+  // ---- the SERVICE screen (a tap-over) ------------------------------------
+  // Painted from state.service on every state poll, through setText /
+  // setStyle so an idle poll writes nothing. It never reads /api/glass/data:
+  // a data read counts as activity on the hub and would hold the tap-over
+  // open for ever. svc is null when the hub left the block out.
+  function svcFriend() {
+    // the friend's block when an action for them may start: a tap-over is
+    // up, we hold its token, DONE is not on its way, and the friend's fob
+    // is linked to a player. Otherwise null, and the tap does nothing.
+    return (overlay && sess && !logoutBusy && svc && svc.hasWallet === true)
+      ? svc : null;
+  }
+  function svcHandpay() {
+    // the handpay CLEAR HANDPAY resets next, or null when none is pending
+    return (overlay && svc && svc.handpay && svc.handpay.pending === true)
+      ? svc.handpay : null;
+  }
+  function hpAmount(hp) {
+    // '' when the machine gave no amount (the hub then sends the word)
+    var a = (hp.amount === null || hp.amount === undefined)
+      ? '' : String(hp.amount);
+    return (a === 'Handpay') ? '' : a;
+  }
+  // a figure the hub sends ready-made; the millicents beside it are only
+  // the fall-back
+  function svcMoney(str, mc) {
+    if (str) { return String(str); }
+    return (typeof mc === 'number') ? fmtMc(mc) : '\u2014';
+  }
+  // one balance on one line: 232px tall lane at 22px, 380px wide lane at 20px
+  function fitServiceFigure(id) {
+    var wide = (layoutMode === 'wide'), n;
+    if (!fitFigure(id, wide ? 376 : 228, wide ? 20 : 22, 11)) {
+      n = figLen(id);
+      setStyle($(id), 'fontSize', wide ? ''
+        : (n <= 13 ? '' : n <= 16 ? '18px' : '14px'));
+    }
+  }
+  // The three long button labels are measured like the figures: a
+  // renderer with wider letters steps the type down. They are one line
+  // (nowrap), so a label can never wrap out of the bottom of its button.
+  // Inside a button: 220px tall lane, 192px wide lane, less 4px a side.
+  function fitServiceLabel(id, lane, px, track) {
+    if (!fitFigure(id, lane, px, 10, track)) { setStyle($(id), 'fontSize', ''); }
+  }
+  function fitServiceLabels() {
+    var wide = (layoutMode === 'wide'), lane = wide ? 184 : 212;
+    fitServiceLabel('sv-clear', lane, wide ? 16 : 19, wide ? 1 : 2);
+    fitServiceLabel('sv-add', lane, wide ? 16 : 19, wide ? 1 : 2);
+    fitServiceLabel('sv-fsp', lane, wide ? 14 : 15, 1);
+  }
+  function paintService() {
+    var sv = overlay ? svc : null;
+    var hasW = !!(sv && sv.hasWallet === true);
+    var wide = (layoutMode === 'wide'), lane = wide ? 376 : 228, n;
+    // the friend's name: one line, fitted (a name made on the web page can
+    // be any length); by its length when the ruler cannot measure
+    setText('sv-name', String((sv && sv.name) || supervising || 'Player'));
+    if (!fitFigure('sv-name', lane, wide ? 22 : 26, 14, 0)) {
+      n = figLen('sv-name');
+      setStyle($('sv-name'), 'fontSize', wide
+        ? (n <= 14 ? '22px' : '18px')
+        : (n <= 10 ? '26px' : n <= 14 ? '20px' : '14px'));
+    }
+    // no player behind the fob: no wallet and no Free Slot Play to show
+    setMoney('sv-wl-v', hasW ? svcMoney(sv.wallet, sv.walletMc) : '\u2014');
+    setText('sv-fp-v', hasW ? svcMoney(sv.freePlay, sv.freePlayMc) : '\u2014');
+    setMoney('sv-mc-v', sv ? svcMoney(sv.machine, sv.machineMc) : '\u2014');
+    fitServiceFigure('sv-wl-v');
+    fitServiceFigure('sv-fp-v');
+    fitServiceFigure('sv-mc-v');
+    // CLEAR HANDPAY and the line above it: only while one is pending. The
+    // line names the one the button resets next; "+N more" when the
+    // machine holds others (each CLEAR resets one).
+    var hp = svcHandpay(), cap = '';
+    if (hp) {
+      cap = hpAmount(hp) ? ('HANDPAY ' + hpAmount(hp)) : 'HANDPAY PENDING';
+      if (hp.more > 0) { cap += ' (+' + hp.more + ' more)'; }
+    }
+    setText('sv-hp-cap', cap);
+    fitFigure('sv-hp-cap', lane, 12, 9, 1);
+    setStyle($('sv-clear'), 'display', hp ? 'block' : 'none');
+    setBtnOff('sv-add', !hasW);
+    setBtnOff('sv-fsp', !hasW);
+    setBtnOff('sv-pin', !hasW);
+    fitServiceLabels();
+    // the message line: the result of the last action here, else why the
+    // three buttons are grey
+    setText('sv-msg', svMsg ||
+      ((sv && !hasW) ? 'This fob is not linked to a player.' : ''));
+    setText('sv-done', (overlay && (logoutBusy || !sess))
+      ? 'handing back\u2026' : 'DONE');
+  }
+  // an action on the service screen went through: take the hub's sentence
+  // (or ours, where the hub sends none) and the friend's fresh figures
+  function serviceResult(data, say) {
+    if (data.service && typeof data.service === 'object') {
+      svc = data.service;
+      svcSeq++;              // polls already in flight are older than this
+    }
+    svMsg = data.msg ? String(data.msg) : say;
+    paintService();
   }
 
   // ---- glass DATA reads: GET /api/glass/data?sess=&view= (never-500) -----
@@ -1394,6 +1611,25 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   function postAction(obj, cb) {
     obj.sess = sess;
     xreq('POST', '/api/glass/action', JSON.stringify(obj), cb);
+  }
+  // ---- the service screen's writes: POST /api/glass/admin ----------------
+  // svcFund and svcSetPin, for the friend of a tap-over. The body carries
+  // the token and what to do, never who for: the hub takes the friend from
+  // the machine's card session. The hub keeps this body out of its wire
+  // log, which is why a new PIN is only ever sent here.
+  function postAdmin(obj, cb) {
+    obj.sess = sess;
+    xreq('POST', '/api/glass/admin', JSON.stringify(obj), cb);
+  }
+  // a request id: 16 characters from a-z0-9. One is made when a money
+  // confirm opens and every CONFIRM of that dialog sends the same one, so
+  // the hub pays it once however many times it arrives.
+  function newRid() {
+    var abc = 'abcdefghijklmnopqrstuvwxyz0123456789', r = '', i;
+    for (i = 0; i < 16; i++) {
+      r += abc.charAt(Math.floor(Math.random() * 36));
+    }
+    return r;
   }
 
   // ---- HIDE WINDOW: the hub hides this window (hideMediaDisplay); the
@@ -1445,7 +1681,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   // the class, so a stale className never re-enables an action)
   function setBtnOff(id, off) {
     var el = $(id), base = el.className.replace(/ *nb-off/g, '');
-    el.className = off ? (base + ' nb-off') : base;
+    setCls(el, off ? (base + ' nb-off') : base);
   }
   function resetCashout() {
     // setMoney (not setText) so a lingering red from a negative balance
@@ -1523,10 +1759,13 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   // balance lost its last digit (2026-11-17). Measured again only when
   // the text, the lane or the full size changes (no style churn on the
   // polls). Returns false when the ruler cannot measure; the caller then
-  // keeps its own size.
-  function fitFigure(id, lane, maxPx, minPx, track) {
+  // keeps its own size. "word" is for a line that wraps: the one word of
+  // it to measure (the widest) in place of the whole text.
+  function fitFigure(id, lane, maxPx, minPx, track, word) {
     var el = $(id), f = el.firstChild;
-    var s = f ? String(f.nodeValue) : '';
+    var s = word || (f ? String(f.nodeValue) : '');
+    if (s === '') { return false; }   // nothing to measure (and no ruler
+                                      // write on an idle poll)
     var key = s + '|' + lane + '|' + maxPx;
     if (fitSeen[id] === key) { return true; }
     if (!ruler) {
@@ -1626,10 +1865,18 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     paintWalletChips();
     setText('wl-fund-msg', '');
   }
-  // ---- custom-amount keypad (ATM-style: digits shift in as cents) ---------
+  // ---- the keypad (ATM-style: digits shift in as cents) -------------------
+  // One overlay, four jobs (kpMode, see the state block). kpShow puts it up
+  // for one of them; closeKeypad takes it down and forgets what was typed.
   var kpCents = 0;                        // amount being typed, in cents
+  function kpShow(mode) {
+    kpMode = mode;
+    // the quick amounts belong to the admin's add for a friend only
+    setStyle($('kp-chips'), 'display', mode === 'give' ? 'block' : 'none');
+    $('kp-scrim').style.display = 'block';
+  }
   function kpRepaint() {
-    if (kpMode === 'pin') {
+    if (kpMode === 'pin' || kpMode === 'newpin') {
       var dots = '', di;
       for (di = 0; di < kpPin.length; di++) { dots += '\u2022'; }
       setText('kp-amt', dots || '\u00a0');   // never the digits
@@ -1638,6 +1885,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     }
     setText('kp-amt', fmtCents(kpCents));
     fitKeypadFigure();
+    if (kpMode === 'give') { return; }    // its message line belongs to the keys
     var msg = '';
     if (coWalletMc !== null && kpCents * 1000 > coWalletMc) {
       msg = 'More than your wallet (' + fmtMc(coWalletMc) + ')';
@@ -1655,21 +1903,50 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
       kpPin += String(d); setText('kp-msg', ''); kpRepaint();
       return;
     }
+    if (kpMode === 'newpin') {
+      if (kpPin.length >= 8 || npBusy) { return; }
+      kpPin += String(d); setText('kp-msg', newPinPrompt()); kpRepaint();
+      return;
+    }
     var n = kpCents * 10 + d;
+    if (kpMode === 'give') {
+      // a digit that would pass the most one add may be is not taken
+      if (n > giveCtx.maxCents) { setText('kp-msg', giveMost()); return; }
+      kpCents = n; setText('kp-msg', 'For ' + giveCtx.name); kpRepaint();
+      return;
+    }
     if (n > 9999999999) { return; }       // 5-byte BCD wire max ($99,999,999.99, SAS_AFT_MAX_CENTS); real bound is the wallet balance (checked above)
     kpCents = n; kpRepaint();
   }
+  // C clears the entry being typed, whichever job the pad is doing
+  function kpClear() {
+    if (kpMode === 'newpin') {
+      if (npBusy) { return; }
+      kpPin = ''; setText('kp-msg', newPinPrompt()); kpRepaint();
+      return;
+    }
+    kpCents = 0; kpPin = '';
+    if (kpMode === 'give') { setText('kp-msg', 'For ' + giveCtx.name); }
+    kpRepaint();
+  }
   function openKeypad() {
     if (!coCanFund) { return; }
-    kpMode = 'amount'; kpPin = '';
+    kpPin = '';
     setText('kp-ttl', 'ADD \u00b7 AMOUNT'); setText('kp-msg', '');
     kpCents = 0;                          // START EMPTY — type the amount fresh,
-    kpRepaint();                          // no preset to clear first (ATM-style)
-    $('kp-scrim').style.display = 'block';
+    kpShow('amount');                     // no preset to clear first (ATM-style)
+    kpRepaint();
   }
   function closeKeypad() {
     $('kp-scrim').style.display = 'none';
     kpMode = 'amount'; kpPin = ''; pinBusy = false;
+    npFirst = ''; npBusy = false; giveCtx = null;
+  }
+  function kpCancel() {
+    // a new PIN on its way to the hub cannot be called back: its answer
+    // closes the pad (or says why not) a moment later
+    if (kpMode === 'newpin' && npBusy) { return; }
+    closeKeypad();
   }
   // ---- PIN login (2026-09-14): the same keypad, digits masked, OK posts
   // POST /api/glass/pinlogin {egm, dev, pin} — the one sessionless write.
@@ -1677,10 +1954,10 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   // and closes the pad (renderState). Refusals paint on kp-msg.
   function openPinKeypad() {
     if (sess) { return; }                 // already carded — nothing to log in
-    kpMode = 'pin'; kpPin = ''; pinBusy = false;
+    kpPin = ''; pinBusy = false;
     setText('kp-ttl', 'ENTER PIN'); setText('kp-msg', '');
+    kpShow('pin');
     kpRepaint();
-    $('kp-scrim').style.display = 'block';
   }
   function pinSubmit() {
     if (pinBusy) { return; }
@@ -1706,11 +1983,113 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   }
   function kpOk() {
     if (kpMode === 'pin') { pinSubmit(); return; }
+    if (kpMode === 'newpin') { newPinOk(); return; }
+    if (kpMode === 'give') { giveAsk(kpCents); return; }
     if (kpCents < 1) { setText('kp-msg', 'Enter an amount'); return; }
     selCents = kpCents; selIdx = -1;      // custom -> no preset chip highlighted
     paintWalletChips();
     setText('wl-fund-msg', '');
     closeKeypad();
+  }
+
+  // ---- ADD TO WALLET / ADD FREE SLOT PLAY for the friend (kpMode 'give') --
+  // House to the friend's wallet (svcFund); restricted = Free Slot Play.
+  // Type an amount and OK, or tap a quick amount: either one closes the pad
+  // and asks on the money confirm. Nothing is sent from the pad itself.
+  // In a sentence this page puts together, a name longer than 12 characters
+  // is its first 11 and three dots; the hub's own sentences come whole.
+  function shortName(n) {
+    n = String(n || '');
+    return n.length > 12 ? (n.substr(0, 11) + '\u2026') : n;
+  }
+  function giveMost() {
+    return 'The most at once is ' + fmtCents(giveCtx.maxCents);
+  }
+  function openGivePad(restricted) {
+    var f = svcFriend();
+    if (!f) { return; }
+    // a NEW context on every open, every field set: nothing carries over
+    // from the last one (closeKeypad drops it)
+    giveCtx = {
+      restricted: (restricted === true),
+      name: shortName(f.name || supervising || 'Player'),
+      maxCents: (typeof f.maxCents === 'number' && f.maxCents >= 1)
+        ? f.maxCents : GIVE_MAX
+    };
+    kpPin = ''; kpCents = 0;
+    setText('kp-ttl', giveCtx.restricted ? 'ADD FREE SLOT PLAY' : 'ADD TO WALLET');
+    setText('kp-msg', 'For ' + giveCtx.name);
+    kpShow('give');
+    kpRepaint();
+  }
+  function giveAsk(cents) {
+    var g = giveCtx;
+    if (!g || !sess) { return; }
+    if (cents < 1) { setText('kp-msg', 'Enter an amount'); return; }
+    if (cents > g.maxCents) { setText('kp-msg', giveMost()); return; }
+    // the request id is made HERE, with the dialog: every CONFIRM of this
+    // one dialog carries the same id, a new dialog gets a new one
+    var body = { action: 'svcFund', cents: cents, rid: newRid() };
+    if (g.restricted) { body.restricted = true; }
+    var sub = g.restricted
+      ? ('Free Slot Play for ' + g.name + '. It has to be played.')
+      : ('To ' + g.name + '\'s wallet, from the House.');
+    closeKeypad();                        // drops the context
+    askConfirm('ADD ' + fmtCents(cents) + '?', sub, body, 'service', true);
+  }
+
+  // ---- SET PIN for the friend (kpMode 'newpin') ---------------------------
+  // Typed twice with the digits hidden: the screen faces the room, and the
+  // second entry is the check against a slip nobody could see. The two are
+  // compared HERE and one PIN is sent, to POST /api/glass/admin only. The
+  // digits are never in the DOM (bullets), and both entries are forgotten
+  // when the pad closes, on the hub's answer either way, and with the
+  // session (dropPads -> closeKeypad).
+  function newPinPrompt() {
+    return npFirst ? 'Type it once more' : (pinMin + ' to 8 digits');
+  }
+  function newPinStart(msg) {            // (back to) the first entry
+    kpPin = ''; npFirst = '';
+    setText('kp-ttl', 'NEW PIN');
+    setText('kp-msg', msg || newPinPrompt());
+    kpRepaint();
+  }
+  function openNewPin() {
+    if (!svcFriend()) { return; }
+    npBusy = false;
+    kpShow('newpin');
+    newPinStart('');
+  }
+  function newPinOk() {
+    if (npBusy) { return; }
+    if (!npFirst) {
+      if (kpPin.length < pinMin) {
+        setText('kp-msg', 'Enter at least ' + pinMin + ' digits'); return;
+      }
+      npFirst = kpPin; kpPin = '';
+      setText('kp-ttl', 'NEW PIN AGAIN'); setText('kp-msg', newPinPrompt());
+      kpRepaint();
+      return;
+    }
+    if (kpPin !== npFirst) {
+      newPinStart('Those did not match. Start again.'); return;
+    }
+    if (!sess) { return; }
+    var tok = sess;
+    npBusy = true;
+    setText('kp-msg', 'Saving\u2026');
+    postAdmin({ action: 'svcSetPin', pin: kpPin }, function (status, data) {
+      npBusy = false;
+      // the session changed while this was in flight: that already closed
+      // the pad and forgot the entries, and the answer is nobody's now
+      if (sess !== tok || kpMode !== 'newpin') { return; }
+      if (status === 200 && data && data.ok !== false) {
+        closeKeypad();
+        serviceResult(data, '');
+      } else {
+        newPinStart(actionErr(status, data));
+      }
+    });
   }
   function resetWallet() {
     closeKeypad();
@@ -1732,7 +2111,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     pollWallet();           // fetches immediately, then re-arms every ~2s
   }
 
-  // ---- admin sub-view row builders + renderers --------------------------
+  // ---- the HANDPAY sub-view: row builders + renderer ---------------------
   function listRow(a, s, b) {
     return '<div class="lr"><div class="lr-a">' + esc(a) + '</div>' +
       '<div class="lr-s">' + esc(s) + '</div>' +
@@ -1740,17 +2119,6 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   }
   function emptyRow(msg) { return '<div class="lr-empty">' + esc(msg) + '</div>'; }
 
-  function renderTickets(status, d) {
-    var el = $('tk-list');
-    if (status !== 200 || !d) { el.innerHTML = emptyRow(dataErr(status)); return; }
-    var arr = d.tickets || [], html = '', i, t;
-    if (!arr.length) { el.innerHTML = emptyRow('No tickets on this machine'); return; }
-    for (i = 0; i < arr.length && i < 12; i++) {
-      t = arr[i];
-      html += listRow(t.amount, t.state, sdot(t.id, t.when));
-    }
-    el.innerHTML = html;
-  }
   function renderHandpay(status, d) {
     var el = $('hp-list');
     hpCanClear = false;
@@ -1768,91 +2136,8 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     hpCanClear = (d.canClear === true);
     $('hp-clear').style.display = hpCanClear ? 'block' : 'none';
   }
-  // GAMES is a two-level view inside v-games: level 1 = one BUTTON per
-  // machine-enabled game (the hub already grouped + filtered — an
-  // egm-disabled title never arrives, the host couldn't enable it anyway);
-  // tap a game -> level 2 = that game's paytables. BACK walks the levels.
-  function renderGames(status, d) {
-    gmData = null; gmGame = -1;
-    if (status !== 200 || !d) {
-      setText('gm-title', 'GAMES'); setText('gm-asof', '');
-      $('gm-list').innerHTML = emptyRow(dataErr(status)); return;
-    }
-    gmData = d;
-    paintGameList();
-  }
-  // #gm-list is 620px tall with 40px .gr rows, so ~15 rows fit and overflow
-  // is hidden (WebKit-534 can't pan it). Cap the render to what fits; when
-  // there are more, spend the last slot on a "+N more" notice so clipped
-  // rows aren't silently unreachable with no indication.
-  function gmCap(arr) {
-    var CAP = 15, shown = arr.length, more = 0;
-    if (arr.length > CAP) { shown = CAP - 1; more = arr.length - shown; }
-    return { shown: shown, more: more };
-  }
-  function gmMoreRow(more) {
-    return more ? ('<div class="gr"><div class="gr-n" style="color:#55708a;">+' +
-      more + ' more not shown</div></div>') : '';
-  }
-  function paintGameList() {
-    var el = $('gm-list'), arr = (gmData && gmData.games) || [], html = '', i;
-    gmGame = -1;
-    setText('gm-title', 'GAMES');
-    setText('gm-asof', (gmData && gmData.asOf) ? ('as of ' + gmData.asOf) : '');
-    if (!arr.length) { el.innerHTML = emptyRow('No machine-enabled games'); return; }
-    var c = gmCap(arr);
-    for (i = 0; i < c.shown; i++) {
-      html += '<div class="gr" id="gm-g' + i + '"><div class="gr-n">' +
-        esc(arr[i].name) + '</div>' +
-        '<div class="gr-e" style="color:#e8c266;">' +
-        (arr[i].count || 0) + ' &rsaquo;</div></div>';
-    }
-    el.innerHTML = html + gmMoreRow(c.more);
-    for (i = 0; i < c.shown; i++) { $('gm-g' + i).onclick = gmOpenGame(i); }
-  }
-  function gmOpenGame(i) { return function () { paintPaytables(i); }; }
-  function paintPaytables(i) {
-    var el = $('gm-list'), g = ((gmData && gmData.games) || [])[i];
-    if (!g) { paintGameList(); return; }
-    gmGame = i;
-    setText('gm-title', g.name || 'GAME');
-    setText('gm-asof', (g.count || 0) + ' paytable' + (g.count === 1 ? '' : 's'));
-    var arr = g.paytables || [], html = '', j, p, on;
-    if (!arr.length) { el.innerHTML = emptyRow('No paytables'); return; }
-    var c = gmCap(arr);
-    for (j = 0; j < c.shown; j++) {
-      p = arr[j];
-      on = (p.on === true);
-      html += '<div class="gr"><div class="gr-n">' + esc(p.label || p.id) + '</div>' +
-        '<div class="gr-e" style="color:' + (on ? '#6fcf97' : '#c98a4f') + ';">' +
-        (on ? 'ON' : 'OFF') + '</div></div>';
-    }
-    el.innerHTML = html + gmMoreRow(c.more);
-  }
-  function renderSettings(status, d) {
-    var el = $('se-rows');
-    if (status !== 200 || !d) { el.innerHTML = emptyRow(dataErr(status)); return; }
-    // EGM ID deliberately absent from this MENU screen (serial-derived —
-    // stays off menu screens so machine photos are shareable; AJ 2026-07-14).
-    // Diagnostics still show it: the MACHINE INFO panel.
-    var rows = [['NICKNAME', d.nick],
-                ['PROTOCOL', d.protocol], ['SAS LINK', fmtLink(d.sasLink)]];
-    var html = '', i;
-    for (i = 0; i < rows.length; i++) {
-      if (rows[i][1] === null || rows[i][1] === undefined || rows[i][1] === '') { continue; }
-      html += '<div class="mi-l">' + esc(rows[i][0]) + '</div>' +
-        '<div class="mi-v">' + esc(rows[i][1]) + '</div>';
-    }
-    el.innerHTML = html || emptyRow('No settings');
-  }
 
-  // ---- open an admin sub-view: show, paint "loading", GET, render -------
-  function openTickets() {
-    show('tickets'); $('tk-list').innerHTML = emptyRow('Loading…');
-    fetchData('tickets', function (s, d) {
-      if (view === 'tickets') { renderTickets(s, d); }
-    });
-  }
+  // ---- open the admin sub-view: show, paint "loading", GET, render -------
   function openHandpay() {
     show('handpay'); $('hp-list').innerHTML = emptyRow('Loading…');
     $('hp-clear').style.display = 'none';
@@ -1860,43 +2145,58 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
       if (view === 'handpay') { renderHandpay(s, d); }
     });
   }
-  function openGames() {
-    gmData = null; gmGame = -1;
-    show('games'); setText('gm-title', 'GAMES');
-    $('gm-list').innerHTML = emptyRow('Loading…'); setText('gm-asof', '');
-    fetchData('games', function (s, d) {
-      if (view === 'games') { renderGames(s, d); }
-    });
-  }
-  function openSettings() {
-    show('settings'); $('se-rows').innerHTML = emptyRow('Loading…');
-    fetchData('settings', function (s, d) {
-      if (view === 'settings') { renderSettings(s, d); }
-    });
-  }
 
-  // ---- money confirm: arm {body, back}, YES posts it, then re-open the
-  //      originating view so its numbers repaint (contract confirm pattern) --
-  function askConfirm(q, sub, body, back) {
-    pendingConfirm = { body: body, back: back };
+  // ---- money confirm: arm {body, back, viaAdmin}, YES posts it, then go
+  //      back to the originating view so its numbers repaint (contract
+  //      confirm pattern). viaAdmin true = the body goes to POST
+  //      /api/glass/admin (the service screen's adds); without it, to POST
+  //      /api/glass/action as always. ------------------------------------
+  function widestWord(q) {
+    var w = String(q).split(' '), best = '', i;
+    for (i = 0; i < w.length; i++) {
+      if (w[i].length > best.length) { best = w[i]; }
+    }
+    return best;
+  }
+  function askConfirm(q, sub, body, back, viaAdmin) {
+    pendingConfirm = { body: body, back: back, viaAdmin: (viaAdmin === true) };
     setText('cf-q', q); setText('cf-sub', sub); setText('cf-note', '');
+    // the question wraps between its words (two lines of room), but one
+    // word cannot wrap: when the widest, an amount, is wider than the lane
+    // the type steps down until it fits
+    if (!fitFigure('cf-q', layoutMode === 'wide' ? 820 : 228, 26, 14, 2,
+                   widestWord(q))) {
+      setStyle($('cf-q'), 'fontSize', '');
+    }
     show('confirm');
   }
   function returnFrom(back) {
     if (back === 'cashout') { openCashout(); }
     else if (back === 'wallet') { openWallet(); }
     else if (back === 'handpay') { openHandpay(); }
-    else { show(home()); }
+    else { show(home()); }   // 'service' too: home() is the service screen
+                             // for as long as the tap-over is up
   }
   function doConfirm() {
     if (confirmBusy || !pendingConfirm) { return; }
     confirmBusy = true;
     setText('cf-note', 'working…');
-    var pc = pendingConfirm;
-    postAction(pc.body, function (status, data) {
+    var pc = pendingConfirm, tok = sess;
+    (pc.viaAdmin ? postAdmin : postAction)(pc.body, function (status, data) {
       confirmBusy = false;
+      // A reply that comes back to a different session does nothing: the
+      // screen already shows what the new session should see. (A tap-over
+      // that ended while its ADD was in flight must not paint the service
+      // screen over the friend; a friend's own ADD in flight when a
+      // tap-over starts must not re-open MY WALLET under the admin.)
+      if (sess !== tok) { return; }
       if (status === 200 && data && data.ok !== false) {
         pendingConfirm = null;
+        if (pc.back === 'service') {
+          // the adds answer with a sentence and the friend's new figures;
+          // a handpay clear answers that the hub asked the machine
+          serviceResult(data, pc.viaAdmin ? '' : 'Handpay clear sent.');
+        }
         returnFrom(pc.back);
       } else {
         // money refusal: the hub's own wording VERBATIM when it gave any
@@ -1917,18 +2217,10 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   $('hb-cashout').onclick  = openCashout;                       // NEW: real, live
   $('hb-hide').onclick     = doHide;                            // game full screen, session kept
   $('hb-logout').onclick   = function () {
-    // In OVERLAY mode this button is "DONE": end the supervisor overlay
-    // directly (no YES/STAY confirm, no attract flash — the friend is not
-    // logging out); the next poll hands the glass back to them.
-    if (overlay) { doOverlayDone(); return; }
     setText('lo-note', ''); show('logout');
   };
-  // admin backend stack (buttons hidden by updateTexts unless state.admin)
-  $('hb-machine').onclick  = function () { show('machine'); };  // real read-only info
-  $('hb-tickets').onclick  = openTickets;
+  // admin only (the button is hidden by updateTexts unless state.admin)
   $('hb-handpay').onclick  = openHandpay;
-  $('hb-games').onclick     = openGames;
-  $('hb-settings').onclick = openSettings;
 
   // CASH OUT: the toggle sets the machine's cash-out destination (OFF prints a
   // ticket, ON mirrors credits to the wallet). Funding moved to MY WALLET.
@@ -1965,10 +2257,18 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   for (var kpi = 0; kpi <= 9; kpi++) {
     (function (dgt) { $('kp' + dgt).onclick = function () { kpDigit(dgt); }; })(kpi);
   }
-  $('kp-clr').onclick = function () { kpCents = 0; kpPin = ''; kpRepaint(); };
+  $('kp-clr').onclick = kpClear;
   $('at-pin').onclick = openPinKeypad;                          // attract -> PIN pad
   $('kp-ok').onclick = kpOk;
-  $('kp-cancel').onclick = closeKeypad;
+  $('kp-cancel').onclick = kpCancel;
+  // the quick amounts: the same as typing that amount and OK
+  for (var gci = 0; gci < 3; gci++) {
+    (function (idx) {
+      $('kp-chip' + idx).onclick = function () {
+        if (kpMode === 'give') { giveAsk(GIVE_CHIPS[idx]); }
+      };
+    })(gci);
+  }
   $('wl-add').onclick = function () {
     if (!coCanFund) { return; }
     if (coUseRestr) {
@@ -2023,17 +2323,30 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
       'Resets the pending handpay to credits on this machine.',
       { action: 'clearHandpay' }, 'handpay');
   };
-  // GAMES REFRESH: status-only, no confirm; re-open to repaint the list
-  $('gm-refresh').onclick = function () {
-    if (gmBusy) { return; }
-    gmBusy = true;
-    setText('gm-asof', 'refreshing…');
-    postAction({ action: 'refreshGames' }, function () {
-      gmBusy = false;
-      if (view === 'games') { openGames(); }
-    });
+  // SERVICE (a tap-over): everything here is for the friend who is carded
+  // in. Each handler tests the state, never the grey class, and does
+  // nothing without a token (after DONE, until the next poll).
+  $('sv-clear').onclick = function () {
+    var hp = svcHandpay();
+    if (!hp || !sess || logoutBusy) { return; }
+    if (hp.canClear !== true) {
+      svMsg = 'The machine is not answering. Try again in a moment.';
+      paintService();
+      return;
+    }
+    var amt = hpAmount(hp);
+    askConfirm('CLEAR HANDPAY?', amt
+      ? (amt + ' handpay. Resets it to credits on this machine.')
+      : 'Resets the pending handpay to credits on this machine.',
+      { action: 'clearHandpay' }, 'service');
   };
-  // money confirm dialog (shared by ADD-from-wallet + CLEAR-handpay)
+  $('sv-add').onclick  = function () { openGivePad(false); };
+  $('sv-fsp').onclick  = function () { openGivePad(true); };
+  $('sv-pin').onclick  = openNewPin;
+  $('sv-done').onclick = doOverlayDone;
+
+  // money confirm dialog (shared by ADD-from-wallet, CLEAR-handpay and the
+  // service screen's adds)
   $('cf-yes').onclick = doConfirm;
   $('cf-no').onclick  = function () {
     var b = pendingConfirm ? pendingConfirm.back : null;
@@ -2041,17 +2354,10 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     returnFrom(b);
   };
 
-  // BACK routes to home() (not a remembered origin) so a hub-side tier flip
-  // mid-sub-view still lands the user on the menu that matches their fob
-  $('tk-back').onclick = function () { show(home()); };
+  // BACK routes to home() (not a remembered origin) so a hub-side change
+  // mid-sub-view still lands the user on the screen that matches the session
   $('hp-back').onclick = function () { show(home()); };
-  // GAMES back walks the levels: paytables -> game list -> home
-  $('gm-back').onclick = function () {
-    if (gmGame >= 0 && gmData) { paintGameList(); } else { show(home()); }
-  };
-  $('se-back').onclick = function () { show(home()); };
   $('st-back').onclick = function () { show(home()); };
-  $('mi-back').onclick = function () { show(home()); };
   $('lo-yes').onclick  = doLogout;
   $('lo-no').onclick   = function () { show(home()); };
 
