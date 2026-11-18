@@ -783,7 +783,7 @@ def main():
                  "address", "ticketNumber", "mintedAt", "issuedAt",
                  "redeemedAt", "redeemedBy", "pending",
                  "reusable", "uses", "operatorAt",
-                 "validationType", "restrictedPromo"}
+                 "validationType", "restrictedPromo", "goodThrough"}
     check("row keys match the contract exactly",
           all(set(t) == want_keys for t in r["tickets"]),
           [sorted(t) for t in r["tickets"][:1]])
@@ -930,38 +930,77 @@ def main():
 
     immortal = _issue(days_ago=400, expire_days=None)   # pre-v12/never row
     fresh_exp = _issue(days_ago=10, expire_days=30)     # not yet expired
-    graced = _issue(days_ago=35, expire_days=30)        # expired, in grace
-    dead = _issue(days_ago=90, expire_days=30)          # expired + grace over
+    last_day = _issue(days_ago=30, expire_days=30)      # its date is today
+    # and another such, printed one second after midnight that day: by the
+    # hour its 30 days are up; by the date on it, it is good all of today
+    early = _issue(days_ago=30, expire_days=30)
+    first_second = _time.strftime(
+        "%Y-%m-%dT00:00:01", _time.localtime(_time.time() - 30 * 86400))
     with hs.lock:
-        n = hs._reap_expired_locked(hs._conn)
+        hs._conn.execute("UPDATE tito_tickets SET issued_at=? "
+                         "WHERE canonical=?", (first_second, early))
         hs._conn.commit()
-    check("reaper takes ONLY expired-past-grace rows", n == 1, n)
+    day_after = _issue(days_ago=31, expire_days=30)     # its date was yesterday
+    kept = _issue(days_ago=35, expire_days=30)          # expired 5 days ago
+    dead = _issue(days_ago=90, expire_days=30)          # expired 60 days ago
+    sweep = hs.tito_expiry_sweep()
+    check("the nightly sweep removes ONLY rows that expired more than "
+          "EXPIRED_KEEP_DAYS ago, and says what it found",
+          sweep == {"expiredAtMidnight": 1, "expired": 2, "removed": 1},
+          sweep)
     with hs.lock:
         left = {r["canonical"] for r in hs._conn.execute(
             "SELECT canonical FROM tito_tickets WHERE state='issued'"
         ).fetchall()}
     check("never-expire row is immortal at any age", immortal in left)
     check("unexpired row survives", fresh_exp in left)
-    check("expired-but-in-grace row survives (hub honors it a while "
-          "longer than the machines)", graced in left)
-    check("expired-past-grace row is GONE (unknown = what the paper "
+    check("an expired row is kept a while, for the Tickets page to show",
+          kept in left and day_after in left)
+    check("a row that expired long ago is GONE (unknown = what the paper "
           "promised)", dead not in left)
 
     lst = hs.tito_list(state="expired")
-    check("?state=expired filter finds the in-grace row (display, "
-          "no grace)",
-          lst["total"] == 1 and lst["tickets"][0]["canonical"] == graced,
-          lst["total"])
-    all_rows = {t2["canonical"]: t2["state"]
-                for t2 in hs.tito_list(limit=100)["tickets"]}
-    check("list derives 'expired' display state for the in-grace row",
-          all_rows.get(graced) == "expired")
-    check("list keeps 'issued' for unexpired + immortal rows",
+    check("?state=expired filter finds the expired rows",
+          lst["total"] == 2 and {t2["canonical"] for t2 in lst["tickets"]}
+          == {kept, day_after}, lst["total"])
+    rows_by = {t2["canonical"]: t2 for t2 in hs.tito_list(limit=100)["tickets"]}
+    all_rows = {k: v["state"] for k, v in rows_by.items()}
+    check("list derives 'expired' for a row past its date",
+          all_rows.get(kept) == "expired"
+          and all_rows.get(day_after) == "expired")
+    check("list keeps 'issued' for unexpired + immortal rows, and for a "
+          "ticket on its last day",
           all_rows.get(fresh_exp) == "issued"
-          and all_rows.get(immortal) == "issued")
-    dec = hs.tito_authorize("IGT_AVP", "tg", graced)
-    check("in-grace expired ticket still REDEEMS (grace = money honored)",
+          and all_rows.get(immortal) == "issued"
+          and all_rows.get(last_day) == "issued")
+    import datetime as _dt
+    check("the list says the date each ticket is good through (None for "
+          "one that never expires)",
+          rows_by[last_day]["goodThrough"] == _dt.date.today().isoformat()
+          and rows_by[immortal]["goodThrough"] is None,
+          (rows_by[last_day]["goodThrough"], rows_by[immortal]["goodThrough"]))
+    dec = hs.tito_authorize("IGT_AVP", "tg", kept)
+    check("an expired ticket is REFUSED when presented, and the refusal "
+          "says expired (no grace: it used to redeem for 30 more days)",
+          dec.get("authorized") is False and dec.get("why") == "expired"
+          and "good through" in dec.get("reason", ""), dec)
+    dec = hs.tito_authorize("IGT_AVP", "td", day_after)
+    check("refused from the first midnight after its date",
+          dec.get("authorized") is False and dec.get("why") == "expired",
+          dec)
+    dec = hs.tito_authorize("IGT_AVP", "tl", last_day)
+    check("a ticket is good THROUGH the date on it: redeemed on its last "
+          "day", dec.get("authorized") is True, dec)
+    dec = hs.tito_authorize("IGT_AVP", "te", early)
+    check("whatever the hour it was printed at",
           dec.get("authorized") is True, dec)
+    dec = hs.tito_authorize("IGT_AVP", "ti", immortal)
+    check("a ticket with no expiry stamp is redeemed at any age",
+          dec.get("authorized") is True, dec)
+    r2 = hs.tito_reissue(kept)
+    dec = hs.tito_authorize("IGT_AVP", "tr", kept)
+    check("an expired ticket the operator reissues is good again",
+          bool(r2) and dec.get("authorized") is True, (r2, dec))
     hs.close()
 
     operator_controls()

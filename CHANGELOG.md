@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.3.23
+Ticket expiry, kept by the hub.
+- **A ticket is good through the date on it and no longer.** The date is
+  the day it was printed plus the hub's expiry days at that moment. It
+  is refused from the next midnight. There is no grace period. Before,
+  the hub never refused a ticket for its age: a ticket from its own
+  ledger stayed good for 30 days past its date and then until the
+  ledger happened to be tidied, and a ticket a G2S machine printed had
+  no expiry at all.
+- **Tickets a G2S machine prints are held to the hub's days too.** With
+  the hub now setting each machine's expiry at every join (v0.3.22),
+  that is the date on the paper.
+- **A nightly job at 12:01 am** logs how many tickets went past their
+  date at midnight and removes tickets that expired more than 30 days
+  ago. It decides nothing: a ticket is judged by its own date at the
+  moment it is presented, so a hub that was off overnight loses
+  nothing. A hub that was off at 12:01 runs the job when it comes up.
+- A G2S machine is told "expired" for such a ticket; a SAS machine gets
+  the plain rejection it gets for any refused ticket.
+- The Tickets page shows the date a ticket is good through.
+- Tickets printed before this version, and tickets printed while the
+  hub is set to "never", carry no date and never expire. Reissuing a
+  ticket, or making it reusable, lifts its expiry as before.
+
 ## v0.3.22
 Fifth batch from the G2S audit: the rest of the ticket items. Seven
 items.

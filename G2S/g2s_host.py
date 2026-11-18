@@ -125,7 +125,7 @@ if "tournament_names" not in _hub_store_mod.HOST_SETTING_KEYS:
 # the MINOR bump per the repo's version rule). Surfaced in engine_meta() ->
 # /api/status ["_engine"]["version"]; bump this and add a CHANGELOG.md
 # section on every commit with a user-visible change.
-CABINET_VERSION = "0.3.22"
+CABINET_VERSION = "0.3.23"
 
 WSDL_NS = "http://www.gamingstandards.com/wsdl/g2s/v1.0"
 SCHEMA_NS = "http://www.gamingstandards.com/g2s/schemas/v1.0.3"
@@ -1401,6 +1401,30 @@ def ticket_expiry(rec):
     if g2s_true(rec.get("expireCredits")) and rec.get("expireDateTime"):
         return rec.get("expireDateTime")
     return None
+
+
+def ticket_good_through(issued_at, days):
+    """The last date, by the hub's clock, that a ticket printed at
+    `issued_at` on a `days` expiry is good on (a datetime.date); None for a
+    ticket with no such stamp (it never expires) or an unreadable one. The
+    same rule as the hub ledger's (hub_store, "Ticket expiry"): good
+    through the date on the paper, refused from the next midnight."""
+    try:
+        n = int(days or 0)
+    except (TypeError, ValueError):
+        return None
+    when = parse_g2s_datetime(issued_at) if n > 0 else None
+    if when is None:
+        return None
+    return when.astimezone().date() + timedelta(days=n)
+
+
+def ticket_expired_since(info):
+    """For a ticket id record: the date it was last good on, if that is
+    behind us; else None."""
+    last = ticket_good_through(info.get("issuedAt"), info.get("expireDays"))
+    return last if last is not None and datetime.now().date() > last \
+        else None
 
 
 #: voucherState values of a log entry whose transaction the machine has
@@ -2892,6 +2916,25 @@ class VoucherStore:
         with self.lock:
             return self.state["egms"].get(egm_id, {}).get("lastListId", 0)
 
+    def expiry_sweep(self):
+        """For the nightly job: how many printed tickets are past their
+        date, and how many of those were last good yesterday. Counts only;
+        nothing is changed (authorize_redemption decides from the ticket's
+        own date when it is presented)."""
+        yesterday = datetime.now().date() - timedelta(days=1)
+        out = {"expiredAtMidnight": 0, "expired": 0}
+        with self.lock:
+            for info in self.state["issuedIds"].values():
+                if info.get("state") != "issued":
+                    continue
+                last = ticket_expired_since(info)
+                if last is None:
+                    continue
+                out["expired"] += 1
+                if last == yesterday:
+                    out["expiredAtMidnight"] += 1
+        return out
+
     def reconcile_open_since(self, egm_id):
         """When this host switched the machine's ticket printing off to
         refresh its ticket numbers and has not since seen it on again
@@ -3025,6 +3068,13 @@ class VoucherStore:
                     info["expireDateTime"] = expiry
                 else:
                     info.pop("expireDateTime", None)
+                # The hub's own expiry, in days from the print date. Until
+                # v0.3.23 a ticket a G2S machine printed had none: the
+                # paper said 30 days and the hub redeemed it for ever.
+                if int(rec.get("hubExpireDays") or 0) > 0:
+                    info["expireDays"] = int(rec["hubExpireDays"])
+                else:
+                    info.pop("expireDays", None)
             self._save_locked()
         return False
 
@@ -3091,6 +3141,11 @@ class VoucherStore:
                 # (2000-01-01..., Table 21.22)
                 return self._reject(
                     3, f"voucher expired {info.get('expireDateTime')}")
+            last_good = ticket_expired_since(info)
+            if last_good is not None:
+                return self._reject(
+                    3, "voucher expired (it was good through "
+                       f"{last_good.isoformat()})")
             info["state"] = "redeemPending"
             info["pending"] = {"egmId": egm_id, "transactionId": txn_id,
                                "voucherAmt": str(amt),
@@ -3193,6 +3248,7 @@ class VoucherStore:
             info["operatorAt"] = now_iso()
             info.pop("pending", None)
             info.pop("expireDateTime", None)
+            info.pop("expireDays", None)
             info.pop("voidedAt", None)
             self._save_locked()
         return {"ok": True, "prior": prior, "state": "issued"}
@@ -3213,6 +3269,7 @@ class VoucherStore:
             info["operatorAt"] = now_iso()
             if on:
                 info.pop("expireDateTime", None)
+                info.pop("expireDays", None)
                 if info.get("state") in ("redeemed", "committed"):
                     info["state"] = "issued"
             self._save_locked()
@@ -3232,7 +3289,7 @@ class VoucherStore:
     #                          (minLogEntries) but a hostile/looping list
     #                          must never balloon the store in one call
 
-    def merge_egm_log(self, egm_id, entries):
+    def merge_egm_log(self, egm_id, entries, expire_days=0):
         """Reconcile the EGM's voucherLogList (§21.26, Table 21.28) into the
         durable store — the 'host was down while tickets moved' repair.
         Entries are voucherLog attribute dicts (localname keys).
@@ -3358,6 +3415,12 @@ class VoucherStore:
                             info["expireDateTime"] = expiry
                         else:
                             info.pop("expireDateTime", None)
+                        # a ticket learned of from the log is held to the
+                        # hub's days as well (`expire_days`: the setting
+                        # now, the nearest thing to hand)
+                        if int(expire_days or 0) > 0 \
+                                and "expireDays" not in info:
+                            info["expireDays"] = int(expire_days)
                 else:
                     # stash the value even on a redeem-only sighting (a
                     # legacy tier-1 issue record has nothing else to pay
@@ -3413,6 +3476,11 @@ class VoucherStore:
             if expdt is not None and expdt.year > 2000 \
                     and expdt < datetime.now(timezone.utc):
                 state = "expired"
+        # ...or whose own date, by the hub's days, is behind us
+        through = ticket_good_through(info.get("issuedAt"),
+                                      info.get("expireDays"))
+        if state == "issued" and ticket_expired_since(info) is not None:
+            state = "expired"
         amt = info.get("voucherAmt")
         try:
             amt = int(amt)
@@ -3428,6 +3496,8 @@ class VoucherStore:
             "issuedAt": info.get("issuedAt"),
             "redeemedAt": info.get("redeemedAt"),
             "expireAt": exp,
+            # the last date the ticket is good on, None = it never expires
+            "goodThrough": through.isoformat() if through else None,
             "voidedAt": info.get("voidedAt"),
             "transactionId": info.get("issueTxn")
             or pend.get("transactionId") or info.get("redeemedTxn"),
@@ -3523,7 +3593,8 @@ class TitoAuthority:
                    else "inProcess" if "already in process" in reason
                    else "notFound" if "never issued here" in reason
                    else "denied")
-        exc = {"redeemed": 2, "inProcess": 1, "notFound": 4}.get(why, 99)
+        exc = {"redeemed": 2, "inProcess": 1, "notFound": 4,
+               "expired": 3}.get(why, 99)
         return {"exc": exc, "amt": "0", "creditType": "G2S_cashable",
                 "retry": False, "reason": reason}
 
@@ -15952,6 +16023,45 @@ class G2SHost:
                     assoc.egm_id)
         self.enqueue_set_voucher_state(assoc, enable=True)
 
+    #: When the nightly ticket housekeeping runs, hub local time (hour,
+    #: minute). Just after midnight: a ticket is good through a DATE.
+    TICKET_EXPIRY_JOB_AT = (0, 1)
+
+    def run_ticket_expiry_job(self):
+        """The nightly ticket housekeeping: say how many tickets went past
+        their date at midnight, and remove from the hub's ledger those that
+        expired long ago (hub_store.EXPIRED_KEEP_DAYS). It decides nothing
+        about any ticket: a ticket is judged by its own date when it is
+        presented, whether or not this has run."""
+        hub = self.hub_store.tito_expiry_sweep()
+        g2s = self.voucher_store.expiry_sweep()
+        out = {
+            "ranAt": now_iso(),
+            "expiredAtMidnight": hub["expiredAtMidnight"]
+            + g2s["expiredAtMidnight"],
+            "expired": hub["expired"] + g2s["expired"],
+            "removed": hub["removed"],
+        }
+        self.ticket_expiry_last = out
+        log.info("🎫 ticket expiry — %d ticket(s) went past their date at "
+                 "midnight; %d expired ticket(s) on the books; %d removed "
+                 "(expired long ago)", out["expiredAtMidnight"],
+                 out["expired"], out["removed"])
+        return out
+
+    def maybe_run_ticket_expiry_job(self, now=None):
+        """Called from the watchdog loop. Runs the job once per local day,
+        at or after TICKET_EXPIRY_JOB_AT; a hub that was off at that time
+        runs it when it next looks."""
+        now = datetime.now() if now is None else now
+        if (now.hour, now.minute) < self.TICKET_EXPIRY_JOB_AT:
+            return None
+        today = now.date().isoformat()
+        if getattr(self, "_ticket_expiry_ran", None) == today:
+            return None
+        self._ticket_expiry_ran = today
+        return self.run_ticket_expiry_job()
+
     def sweep_voucher_reconciles(self, now=None):
         """Called from the watchdog loop. A machine whose ticket printing
         this hub switched off for a reconcile, and has not shown as on
@@ -22374,6 +22484,12 @@ class G2SHost:
                 "expireCredits": g2s_bool(attr(el, "expireCredits")),
                 "expireDateTime": attr(el, "expireDateTime"),
                 "egmException": attr(el, "egmException") or "0",
+                # the days the hub is set to as this ticket prints: what
+                # the machine has been told to print on it (the hub sets
+                # the machine's own expiry at every join), and what the
+                # hub holds the ticket to
+                "hubExpireDays":
+                    int(self.ticket_header().get("expireDays") or 0),
                 "seenAt": now_iso(),
             }
             dup = self.voucher_store.record_voucher(assoc.egm_id, rec)
@@ -23469,7 +23585,9 @@ class G2SHost:
             # recorded dedupes on (egmId, kind, transactionId). Bounded +
             # idempotent (see merge_egm_log), so an operator can mash the
             # button.
-            summary = self.voucher_store.merge_egm_log(assoc.egm_id, entries)
+            summary = self.voucher_store.merge_egm_log(
+                assoc.egm_id, entries,
+                expire_days=int(self.ticket_header().get("expireDays") or 0))
             log.info("🎟️ [%s] voucherLogList dev=%s — %d entr%s: %d known, "
                      "%d merged (%d id records updated, %d open skipped, "
                      "%d masked/unknown-id history-only)",
@@ -28150,6 +28268,11 @@ def watchdog(engine):
             engine.sweep_voucher_reconciles()
         except Exception as e:  # noqa: BLE001 — never take the watchdog down
             log.error("voucher-reconcile sweep failed: %s", e)
+        # the nightly ticket housekeeping, once a day just after midnight
+        try:
+            engine.maybe_run_ticket_expiry_job()
+        except Exception as e:  # noqa: BLE001 — never take the watchdog down
+            log.error("ticket expiry job failed: %s", e)
         for assoc in list(engine.associations.values()):
             if assoc.comms_state == "onLine":
                 # The host keepAlive pinger POSTs every HOST_KEEPALIVE_SEC and

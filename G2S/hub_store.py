@@ -69,6 +69,7 @@ import re
 import sqlite3
 import threading
 import time
+from datetime import date as _date, timedelta as _timedelta
 
 log = logging.getLogger("g2s.hub_store")
 
@@ -211,16 +212,25 @@ MAX_OPEN_MINTS = 256
 # registry. At the cap the oldest REDEEMED rows (paper already consumed)
 # are pruned to make room; if nothing is prunable, new inserts refuse.
 MAX_TICKETS = 10_000
-# Expired-ticket reaper (v12): an ISSUED row whose per-row expire_days
-# snapshot (stamped from the ticket_expire_days setting AT ISSUE TIME —
-# what the paper actually printed) has passed gets reaped GRACE days later.
-# NULL/0 expire_days = the paper printed no expiration = immortal (the
-# collector-right default). The grace window keeps the ledger honoring a
-# just-expired paper a while longer than the machines do (clock skew,
-# drawer-found tickets) before the row — the drawer-ticket class that
-# would otherwise fill MAX_TICKETS with unprunable rows over the years —
-# is finally let go.
-EXPIRE_REAP_GRACE_DAYS = 30
+# Ticket expiry. An ISSUED row carries the number of days the hub was set
+# to when the ticket was printed (expire_days, stamped AT ISSUE TIME: what
+# the paper says, whatever the setting becomes later). NULL/0 = the paper
+# printed no expiration = it never expires (the collector-right default,
+# and every row from before the stamp existed).
+#
+# A ticket is good THROUGH the date on it: the day it was printed plus
+# that many days, to the end of that day by the hub's clock. It is refused
+# from the next midnight on. There is no grace (the owner, 2026-11-17: "No
+# grace"). Until v0.3.23 the ledger never refused a ticket for its age: it
+# went on redeeming one for 30 days past its date and then deleted the
+# row, and that only when a new ticket number was minted or the ledger was
+# full, so on a quiet floor an expired ticket stayed good for ever.
+#
+# An expired row is KEPT for EXPIRED_KEEP_DAYS, so that the Tickets page
+# can show it as expired, and is then removed by the nightly sweep
+# (tito_expiry_sweep), before the drawer-found tickets of the years fill
+# MAX_TICKETS with rows nothing else may prune.
+EXPIRED_KEEP_DAYS = 30
 # A 'minted' row is only reused for the 0x57 re-fire of the SAME cash-out —
 # seconds apart. Past this window a matching mint is STALE (its issued-push
 # may simply not have landed yet) and reusing it could put one validation
@@ -715,7 +725,7 @@ class HubStore:
             # actually printed); NULL/0 = printed no expiration = the row
             # is immortal. Every pre-v12 row is NULL — history is never
             # retro-killed by a later setting. The reaper deletes issued
-            # rows expire_days + EXPIRE_REAP_GRACE_DAYS after issue.
+            # rows EXPIRED_KEEP_DAYS after they expire.
             try:
                 c.execute("ALTER TABLE tito_tickets "
                           "ADD COLUMN expire_days INTEGER")
@@ -2070,7 +2080,8 @@ class HubStore:
     def _tito_reject(reason, why="denied"):
         """A refusal. `why` says which kind for whoever must put it into
         a protocol's own code: "notFound" (a number this ledger does not
-        hold as a printed ticket), "inProcess", "redeemed", or "denied"
+        hold as a printed ticket), "inProcess", "redeemed", "expired", or
+        "denied"
         (everything else: voided, a state or an amount the ledger cannot
         pay from, the ledger itself failing)."""
         return {"authorized": False, "amountMc": 0,
@@ -2102,26 +2113,79 @@ class HubStore:
             v = 0
         return v if 0 < v <= 255 else None
 
-    #: SQL for "this issued row's printed expiration (+ optional grace
-    #: days) has passed" — issued_at is the local-naive ISO the store
-    #: writes, which sqlite's datetime() parses directly.
+    #: SQL for "the date this issued row is good through (+ optional more
+    #: days) is behind us" — by DATE, as the paper states it: issued_at is
+    #: the local-naive ISO the store writes, which sqlite's date() parses
+    #: directly. The one parameter is 0 for "expired", EXPIRED_KEEP_DAYS
+    #: for "expired long enough to be removed".
     _EXPIRED_SQL = ("state='issued' AND expire_days IS NOT NULL AND "
-                    "expire_days > 0 AND datetime(issued_at, '+' || "
+                    "expire_days > 0 AND date(issued_at, '+' || "
                     "(expire_days + ?) || ' days') < "
-                    "datetime('now','localtime')")
+                    "date('now','localtime')")
+
+    @staticmethod
+    def _good_through(issued_at, expire_days):
+        """The last date an issued ticket is good on (a datetime.date), or
+        None for one that never expires or whose stamps cannot be read."""
+        try:
+            days = int(expire_days or 0)
+            if days <= 0 or not issued_at:
+                return None
+            y, m, d = (int(x) for x in str(issued_at)[:10].split("-"))
+            return _date(y, m, d) + _timedelta(days=days)
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    @classmethod
+    def _expired_since(cls, row):
+        """The date a row was last good, if that is behind us; else None."""
+        try:
+            last = cls._good_through(row["issued_at"], row["expire_days"])
+        except (KeyError, IndexError):
+            return None
+        return last if last is not None and _date.today() > last else None
 
     def _reap_expired_locked(self, c):
-        """MUST hold lock. Reap issued rows whose printed expiration passed
-        EXPIRE_REAP_GRACE_DAYS ago. Returns rows reaped. After the reap the
-        paper is unknown to the hub — exactly what its face promised."""
+        """MUST hold lock. Remove issued rows that expired more than
+        EXPIRED_KEEP_DAYS ago. Returns rows removed. After that the paper
+        is unknown to the hub."""
         gone = c.execute(
             "DELETE FROM tito_tickets WHERE " + self._EXPIRED_SQL,
-            (EXPIRE_REAP_GRACE_DAYS,)).rowcount
+            (EXPIRED_KEEP_DAYS,)).rowcount
         if gone:
-            log.info("tito ledger reaped %d expired ticket(s) "
-                     "(printed expiry + %dd grace)", gone,
-                     EXPIRE_REAP_GRACE_DAYS)
+            log.info("tito ledger removed %d ticket(s) that expired more "
+                     "than %d days ago", gone, EXPIRED_KEEP_DAYS)
         return gone
+
+    def tito_expiry_sweep(self):
+        """The nightly housekeeping for expired tickets (the hub runs it
+        just after midnight). Nothing here decides whether a ticket is
+        honoured: tito_authorize does that from the ticket's own date at
+        the moment it is presented. This counts and tidies. Returns
+        {"expiredAtMidnight": tickets whose last good day was yesterday,
+         "expired": expired tickets still on the books,
+         "removed": rows removed, expired more than EXPIRED_KEEP_DAYS ago}.
+        Never raises."""
+        out = {"expiredAtMidnight": 0, "expired": 0, "removed": 0}
+        if self.ephemeral:
+            return out
+        try:
+            with self.lock:
+                c = self._conn
+                out["removed"] = self._reap_expired_locked(c)
+                out["expired"] = c.execute(
+                    "SELECT COUNT(*) AS n FROM tito_tickets WHERE "
+                    + self._EXPIRED_SQL, (0,)).fetchone()["n"]
+                out["expiredAtMidnight"] = c.execute(
+                    "SELECT COUNT(*) AS n FROM tito_tickets WHERE "
+                    "state='issued' AND expire_days IS NOT NULL AND "
+                    "expire_days > 0 AND date(issued_at, '+' || "
+                    "expire_days || ' days') = "
+                    "date('now','localtime','-1 day')").fetchone()["n"]
+                c.commit()
+        except sqlite3.Error as e:
+            self._warn_limited("tito_expiry_sweep", e)
+        return out
 
     def _make_room_locked(self, c):
         """MUST hold lock. True if an INSERT may proceed under MAX_TICKETS.
@@ -2458,6 +2522,11 @@ class HubStore:
                     "printed against it", why="notFound")
             if state != "issued":
                 return self._tito_reject(f"unredeemable state {state!r}")
+            last_good = self._expired_since(row)
+            if last_good is not None:
+                return self._tito_reject(
+                    "ticket expired (it was good through %s)"
+                    % last_good.isoformat(), why="expired")
             amount = int(row["amount_mc"] or 0)
             if amount <= 0:
                 return self._tito_reject("issued amount unknown/invalid")
@@ -2976,25 +3045,25 @@ class HubStore:
         # in the db until the reaper's grace runs out — this list feeds a
         # UI, never a money decision).
         def _row_state(r):
-            try:
-                ed = r["expire_days"]
-            except (KeyError, IndexError):
-                ed = None
-            if r["state"] == "issued" and ed and r["issued_at"]:
-                try:
-                    exp = time.mktime(time.strptime(
-                        r["issued_at"], "%Y-%m-%dT%H:%M:%S"))                         + int(ed) * 86400
-                    if time.time() > exp:
-                        return "expired"
-                except (ValueError, TypeError, OverflowError):
-                    pass
+            # by the same date rule tito_authorize refuses on
+            if r["state"] == "issued" and self._expired_since(r) is not None:
+                return "expired"
             return r["state"]
+
+        def _through(r):
+            try:
+                last = self._good_through(r["issued_at"], r["expire_days"])
+            except (KeyError, IndexError):
+                last = None
+            return last.isoformat() if last is not None else None
         return {"total": total, "tickets": [{
             "canonical": r["canonical"], "vn16": r["vn16"],
             "state": _row_state(r), "amountMc": r["amount_mc"],
             "origin": r["origin"], "address": r["address"],
             "ticketNumber": r["ticket_number"], "mintedAt": r["minted_at"],
             "issuedAt": r["issued_at"], "redeemedAt": r["redeemed_at"],
+            # the last date the ticket is good on, None = it never expires
+            "goodThrough": _through(r),
             "redeemedBy": r["redeemed_by"],
             "pending": self._tito_pending(r) or None,
             # v15 operator controls — the UI feature-detects on "reusable"
