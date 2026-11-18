@@ -125,7 +125,7 @@ if "tournament_names" not in _hub_store_mod.HOST_SETTING_KEYS:
 # the MINOR bump per the repo's version rule). Surfaced in engine_meta() ->
 # /api/status ["_engine"]["version"]; bump this and add a CHANGELOG.md
 # section on every commit with a user-visible change.
-CABINET_VERSION = "0.3.23"
+CABINET_VERSION = "0.3.24"
 
 WSDL_NS = "http://www.gamingstandards.com/wsdl/g2s/v1.0"
 SCHEMA_NS = "http://www.gamingstandards.com/g2s/schemas/v1.0.3"
@@ -391,6 +391,16 @@ GLASS_SPA_LIVE_SEC = 8
 # Service-button debounce: one physical press can chirp several CBE301
 # events (4 in 3s observed live 2026-07-10), and a toggle must not flap.
 GLASS_BUTTON_DEBOUNCE_SEC = 2.0
+# A service-button event older than this when it arrives is not acted on.
+# The events are persisted and re-sent until acknowledged (§4.1.4), so one
+# raised while the hub was unreachable is delivered at the next sign-on,
+# hours later if need be, and opened or closed the player menu then. The
+# longest delivery lag seen on a live link is 7 s (the AVP's paced queue).
+# The machine's own clock dates the event: its measured lead is taken off,
+# and when that is not yet known the allowance is the 30 s within which the
+# hub leaves a machine's clock alone.
+GLASS_BUTTON_MAX_AGE_SEC = 15.0
+GLASS_BUTTON_MAX_AGE_UNSYNCED_SEC = 45.0
 # Glass follows the card (AJ 2026-07-10: "the game can play full screen
 # when the menu isn't needed"): the Service Window is a SCALE type — while
 # shown it carves its 256px out of the game — so the hub hides it whenever
@@ -783,6 +793,17 @@ def g2s_bool(value, default="false"):
     if v in ("false", "0"):
         return "false"
     return default
+
+
+def text_message(text):
+    """A text for an attribute of the textMessage type (disableText and the
+    like): no control characters, and no more than its 256 characters
+    (Appendix A, Table A.1). A longer one, or one with a control character
+    in it, makes the command one that a machine checking the schema
+    rejects, so the lock it carried is not applied."""
+    clean = "".join(ch if ch.isprintable() else " "
+                    for ch in str(text or ""))
+    return clean[:256]
 
 
 def same_stamp(a, b):
@@ -1181,9 +1202,14 @@ EVENT_HOOK_CODES = {
     "G2S_CBE309": ("tilt", {}),
     "G2S_CBE313": ("tilt_clear", {}),
     # power — §3.27; CBE324/325 both appeared in the overnight live stream
-    "G2S_CBE317": ("power_loss", {"door": "logic"}),
-    "G2S_CBE318": ("power_loss", {"door": "auxiliary"}),
-    "G2S_CBE319": ("power_loss", {"door": "cabinet"}),
+    # G2S_CBE317/318/319: the machine found, on getting its power back,
+    # that a door "has been opened when EGM power has been removed"
+    # (§3.27.2-3.27.4). A door opening, reported late; the loss of power
+    # itself is G2S_CBE324. They were filed under power_loss.
+    "G2S_CBE317": ("door_open", {"door": "logic", "whilePowerOff": True}),
+    "G2S_CBE318": ("door_open", {"door": "auxiliary",
+                                 "whilePowerOff": True}),
+    "G2S_CBE319": ("door_open", {"door": "cabinet", "whilePowerOff": True}),
     "G2S_CBE324": ("power_loss", {}),
     "G2S_CBE325": ("power_up", {}),
     # money in — §13.19.22 Note Stacked; the dispatcher adds denomination
@@ -1810,6 +1836,18 @@ class EgmAssociation:
         # guard) resets there.
         self.supported_events = []
         self.subscribed = False
+        # sessionId -> "explicit" | "wildcard": which subscription each
+        # setEventSub asked for; when the hub last cleared its
+        # subscriptions here; the sign-on at which it last fell back to
+        # the wildcard
+        self.eventsub_kinds = {}
+        self.eventsub_cleared_at = 0.0
+        self.eventsub_fallback_epoch = -1
+        # what the machine's event handler does when its log of unsent
+        # events is full (eventHandlerProfile), and whether it has said
+        # the log IS full (G2S_EHE102, until G2S_EHE103)
+        self.event_handler = {}
+        self.event_queue_full_at = None
         self.events = []
         self.event_count = 0
         # G2S-14 log backfill: eh_log_last_sequence is the high-water
@@ -1997,10 +2035,24 @@ class EgmAssociation:
         # ONLY — nothing automatic ever sends setCabinetState. The record's
         # sessionId gives EXACT response/error attribution (unlike the
         # best-effort clock_sync window). Accumulated knowledge — NOT cleared
-        # in new_epoch (a host-disable PERSISTS across an EGM restart per the
-        # profile's restartStatus, §3.11, so the last attempt stays relevant
-        # across re-handshakes); snapshot() derives a lazy 30s timeout.
+        # in new_epoch; snapshot() derives a lazy 30s timeout.
         self.cabinet_state_change = {}
+        # The cabinet state the operator last asked this machine to be in
+        # (the tile's Disable/Enable, the floor lock, the command API):
+        # {enable, disableText, enableGamePlay, enableMoneyIn,
+        # enableMoneyOut, at}, or None for a machine never told. Kept on
+        # disk with the machine's other facts, and sent again when the
+        # machine comes back saying otherwise. A host disable does NOT
+        # survive a machine restart by itself: "upon restart, the
+        # hostEnabled attribute of a device MUST be set based on the
+        # restartStatus for the device" (§1.20.3), and restartStatus
+        # defaults to true, so a locked machine that follows the document
+        # comes back enabled; one set to restartStatus=false comes back
+        # disabled whatever it was told. The comments here said for years
+        # that a disable "persists across an EGM restart", and nothing
+        # re-sent it.
+        self.cabinet_wanted = None
+        self.cabinet_reassert_epoch = -1
         # voucher tier-1 (G2S-26): the validation list we most recently sent
         # this EGM (id/size/timestamp) + a bounded ring of issued/committed
         # voucher records. Backed by the engine's durable VoucherStore.
@@ -2549,6 +2601,14 @@ class EgmAssociation:
             "configDeviceCount": len(config_devices),
             "configDevices": config_devices,
             "subscribed": self.subscribed,
+            # what the machine does when its log of unsent events is full,
+            # and since when it has said the log is full (None = it is not)
+            "eventHandler": dict(self.event_handler),
+            "eventQueueFullAt": self.event_queue_full_at,
+            # the cabinet state this machine was last asked to be in (None
+            # = never told); sent again if it rejoins in another one
+            "cabinetWanted": dict(self.cabinet_wanted)
+            if self.cabinet_wanted else None,
             "supportedEventCount": len(self.supported_events),
             "eventCount": self.event_count,
             "recentEvents": recent_events,
@@ -3709,6 +3769,20 @@ class ConfigInventoryStore:
             rec["configDevices"] = config_devices
             rec["configOptions"] = config_options
             rec["at"] = now_iso()
+            self._write_locked(data)
+
+    def save_cabinet_wanted(self, egm_id, wanted):
+        """Read-modify-write the cabinet state the operator last asked this
+        machine to be in (EgmAssociation.cabinet_wanted); None removes it."""
+        with self.lock:
+            data = self._read_locked()
+            rec = data["egms"].setdefault(egm_id, {})
+            if wanted:
+                rec["cabinetWanted"] = wanted
+            elif "cabinetWanted" in rec:
+                del rec["cabinetWanted"]
+            else:
+                return
             self._write_locked(data)
 
     def save_game_play(self, egm_id, game_play, as_of=None):
@@ -5132,6 +5206,8 @@ class G2SHost:
                 # EGM while the host was down would otherwise be presented
                 # indefinitely as current.
                 saved = self.config_store.get(egm_id)
+                if saved and isinstance(saved.get("cabinetWanted"), dict):
+                    a.cabinet_wanted = dict(saved["cabinetWanted"])
                 if saved and (saved.get("configDevices")
                               or saved.get("configOptions")):
                     a.config_devices = dict(saved.get("configDevices") or {})
@@ -5170,6 +5246,18 @@ class G2SHost:
             return a
 
     # ------------------------------------------------------- event hooks (G2S-12)
+
+    @staticmethod
+    def _event_age_sec(assoc, event_date_time, now=None):
+        """How long ago an event happened, in seconds by the hub's clock:
+        the machine's eventDateTime with its measured clock lead taken off.
+        None when the stamp cannot be read."""
+        when = parse_g2s_datetime(event_date_time)
+        if when is None:
+            return None
+        now = datetime.now(timezone.utc) if now is None else now
+        lead = getattr(assoc, "egm_clock_skew_sec", None) or 0.0
+        return (now - when).total_seconds() + float(lead)
 
     def fire_event_hooks(self, assoc, ev, bill=None):
         """Map one LIVE, deduped eventReport onto its semantic hook (if the
@@ -8285,6 +8373,14 @@ class G2SHost:
             assoc = self.associations.get(egm_id)
         if assoc is None or assoc.comms_state != "onLine":
             return
+        age = self._event_age_sec(assoc, info.get("dateTime"))
+        lead = getattr(assoc, "egm_clock_skew_sec", None)
+        if age is not None and age > (GLASS_BUTTON_MAX_AGE_SEC
+                                      if lead is not None
+                                      else GLASS_BUTTON_MAX_AGE_UNSYNCED_SEC):
+            log.info("🛎️ [%s] service button %s from %ds ago, delivered "
+                     "now — not acted on", egm_id, code, int(age))
+            return
         # Same window resolution every glass path uses, so the button
         # toggles the window the push actually landed on (resolved BEFORE
         # the lock — it takes assoc.lock itself).
@@ -10939,7 +11035,8 @@ class G2SHost:
                 seat["locked"] = False
             else:
                 self.enqueue_set_cabinet_state(assoc, enable=enable,
-                                               disable_text=text)
+                                               disable_text=text,
+                                               remember=False)
                 seat["locked"] = not enable
                 # the epoch this send was queued under: the FIFO worker
                 # silently drops jobs whose epoch a rejoin superseded, so
@@ -11418,7 +11515,8 @@ class G2SHost:
         2026-07-21: "lock/unlock all machines… the tournament already
         does it"). EXACTLY the tournament's per-seat lock rules, minus
         the tournament: pure-G2S cabinets over setCabinetState (full-flag
-        builder, disable persists across an EGM restart), LINKED cabinets
+        builder; the state is remembered and sent again if a machine comes
+        back from a restart in another one), LINKED cabinets
         over their SAS leg ONLY (one lock one owner — never a G2S
         setCabinetState that would strand a second host-disable latch,
         [[the ⭐ note in _tournament_lock_seat]]), unlinked live SAS
@@ -13643,6 +13741,29 @@ class G2SHost:
             return inner, f"getDescriptor(cid={cid})"
         self._enqueue(assoc, build, epoch=epoch)
 
+    @staticmethod
+    def _class_dev(a, device_class, default="1"):
+        """The deviceId to address for a class of which a machine has one
+        active device (cabinet, handpay): the one its descriptor list marks
+        active, else the first it lists, else `default`, which is all there
+        is before the list has been read. The document promises that there
+        is one active device, not what its number is (§3.1: "the EGM MUST
+        only expose one active cabinet device"; §11.1 for handpay; device
+        identifiers are assigned by the EGM, §1.8). Every cabinet and
+        handpay command was addressed to 1. Reads only: safe under a.lock
+        and without it."""
+        first = None
+        for d in getattr(a, "descriptors", None) or []:
+            if d.get("deviceClass") != device_class:
+                continue
+            did = str(d.get("deviceId") or "")
+            if not did or did == "0":
+                continue
+            if d.get("active") is None or g2s_true(d.get("active")):
+                return did
+            first = first or did
+        return first or default
+
     def enqueue_get_comm_host_list(self, assoc, epoch=None):
         """commConfig.getCommHostList — ask the EGM for its host table. This is
         the probe for the descriptorCount=0 mystery: getDescriptor returns only
@@ -13665,7 +13786,7 @@ class G2SHost:
         def build(a):
             sid = a.next_session_id()
             inner, cid = self.build_inner_request(
-                a, "eventHandler", "1", "<g2s:getEventHandlerProfile/>",
+                a, "eventHandler", self.host_id, "<g2s:getEventHandlerProfile/>",
                 str(sid), "30000")
             return inner, f"getEventHandlerProfile(cid={cid})"
         self._enqueue(assoc, build, epoch=epoch)
@@ -13677,7 +13798,7 @@ class G2SHost:
         def build(a):
             sid = a.next_session_id()
             inner, cid = self.build_inner_request(
-                a, "eventHandler", "1",
+                a, "eventHandler", self.host_id,
                 '<g2s:getSupportedEvents g2s:deviceClass="G2S_all" '
                 'g2s:deviceId="-1"/>',
                 str(sid), "30000")
@@ -13709,6 +13830,19 @@ class G2SHost:
     _EVENT_SUB_FLAGS = ('g2s:sendDeviceStatus="true" g2s:sendTransaction="true" '
                         'g2s:sendClassMeters="false" g2s:sendDeviceMeters="true" '
                         'g2s:sendUpdatableMeters="true" g2s:eventPersist="true"')
+    # The two per-game events the hub still takes are narration: a game
+    # started, a game ended. They are asked for WITHOUT eventPersist ("only
+    # sent out once", Table 4.12). A persisted event is kept in the
+    # machine's event log until the hub acknowledges it, and that log is
+    # small (minLogEntries defaults to 35, Table 4.5). With the hub off, a
+    # machine being played put two events per game into it: after some
+    # seventeen games the log was full, and from then on the machine
+    # overwrote, discarded, or switched its event handler off, as its own
+    # queueBehavior says (an IGT AVP here: G2S_disable), taking the events
+    # that matter (a door, a handpay, a bill) with it.
+    EVENT_SUB_ONCE = frozenset(("G2S_GPE103", "G2S_GPE112"))
+    _EVENT_SUB_FLAGS_ONCE = _EVENT_SUB_FLAGS.replace(
+        'g2s:eventPersist="true"', 'g2s:eventPersist="false"')
 
     def enqueue_clear_event_sub(self, assoc, epoch=None):
         """eventHandler.clearEventSub — drop host 1's WILDCARD subscription
@@ -13725,31 +13859,75 @@ class G2SHost:
                    'g2s:deviceId="-1" g2s:eventCode="G2S_all"/>'
                    '</g2s:clearEventSub>')
             inner, cid = self.build_inner_request(
-                a, "eventHandler", "1", sub, str(sid), "30000")
+                a, "eventHandler", self.host_id, sub, str(sid), "30000")
+            # from here until a setEventSubAck the hub holds no
+            # subscription on this machine, and says so
+            a.subscribed = False
+            a.eventsub_cleared_at = time.time()
             return inner, f"clearEventSub(wildcard,cid={cid})"
         self._enqueue(assoc, build, epoch=epoch)
 
-    def enqueue_set_event_sub(self, assoc, epoch=None):
+    #: How long after a clear the hub waits for the acknowledgement of the
+    #: subscription that follows it before asking for the wildcard. Long on
+    #: purpose: the acknowledgement normally comes within a second or two,
+    #: and the wildcard brings back the per-spin events the explicit list
+    #: leaves out (EVENT_SUB_SKIP) until the next sign-on.
+    EVENT_SUB_ACK_SEC = 60
+
+    def sweep_event_subs(self, now=None):
+        """Called from the watchdog loop. A machine whose subscriptions the
+        hub cleared and which has not acknowledged a new one since is
+        asked for the wildcard subscription, once per sign-on: with none
+        at all it sends the hub nothing, and nothing would say so."""
+        now = time.time() if now is None else now
+        with self.assoc_lock:
+            assocs = list(self.associations.values())
+        for assoc in assocs:
+            with assoc.lock:
+                if assoc.comms_state != "onLine" or assoc.subscribed \
+                        or not assoc.eventsub_cleared_at \
+                        or now - assoc.eventsub_cleared_at \
+                        < self.EVENT_SUB_ACK_SEC \
+                        or assoc.eventsub_fallback_epoch == assoc.epoch:
+                    continue
+                assoc.eventsub_fallback_epoch = assoc.epoch
+            log.warning("[%s] 📇 no event subscription has been "
+                        "acknowledged since the hub cleared the old ones "
+                        "%ds ago — asking for the wildcard", assoc.egm_id,
+                        int(now - assoc.eventsub_cleared_at))
+            self.enqueue_set_event_sub(assoc, wildcard=True)
+
+    def enqueue_set_event_sub(self, assoc, epoch=None, wildcard=False):
         """eventHandler.setEventSub — step 3, the payoff. With the catalog in
         hand (supportedEvents), subscribe host 1 to every (deviceClass,
         eventCode) pair the EGM offers, deviceId=-1 (all devices of the class),
         EXCEPT EVENT_SUB_SKIP — device-status + transaction records riding
         along (spec §4.10, Table 4.12). eventPersist=true makes each event a
-        request/response pair the AVP persists until we eventAck it, so nothing
-        is lost. Without a catalog yet (first join, before supportedEvents
-        answers) this is the old wildcard firehose; the catalog handler then
-        re-arms it explicitly. Owner-only; host 1 owns eventHandler 1 (§4.1)."""
+        request/response pair the machine keeps and re-sends until we
+        eventAck it. That is not "nothing is lost": the machine keeps only
+        so many (its event log), and when the log is full it does what its
+        queueBehavior says (§1.16, §4.1.6). See EVENT_SUB_ONCE for the two
+        events asked for without it. Without a catalog yet (first join,
+        before supportedEvents answers) this is the old wildcard firehose;
+        the catalog handler then re-arms it explicitly; `wildcard=True`
+        asks for the wildcard whatever is known (the fall-back when the
+        explicit list is refused). Owner-only; the host owns the
+        eventHandler device whose id is its host id (§4.1)."""
         def build(a):
             sid = a.next_session_id()
-            pairs = sorted({(e.get("deviceClass"), e.get("eventCode"))
-                            for e in (a.supported_events or [])
-                            if e.get("deviceClass") and e.get("eventCode")
-                            and e.get("eventCode") not in self.EVENT_SUB_SKIP})
+            pairs = [] if wildcard else sorted(
+                {(e.get("deviceClass"), e.get("eventCode"))
+                 for e in (a.supported_events or [])
+                 if e.get("deviceClass") and e.get("eventCode")
+                 and e.get("eventCode") not in self.EVENT_SUB_SKIP})
             if pairs:
                 body = ''.join(
                     f'<g2s:eventHostSubscription g2s:deviceClass="{cls}" '
                     f'g2s:deviceId="-1" g2s:eventCode="{code}" '
-                    f'{self._EVENT_SUB_FLAGS}/>' for cls, code in pairs)
+                    + (self._EVENT_SUB_FLAGS_ONCE
+                       if code in self.EVENT_SUB_ONCE
+                       else self._EVENT_SUB_FLAGS) + '/>'
+                    for cls, code in pairs)
                 label = f"setEventSub(explicit {len(pairs)} pairs, skip {len(self.EVENT_SUB_SKIP)},cid="
             else:
                 body = (f'<g2s:eventHostSubscription g2s:deviceClass="G2S_all" '
@@ -13758,7 +13936,14 @@ class G2SHost:
                 label = "setEventSub(wildcard,cid="
             sub = f'<g2s:setEventSub>{body}</g2s:setEventSub>'
             inner, cid = self.build_inner_request(
-                a, "eventHandler", "1", sub, str(sid), "30000")
+                a, "eventHandler", self.host_id, sub, str(sid), "30000")
+            # which kind this request was, for the day it is refused
+            # (builders run holding a.lock)
+            kinds = getattr(a, "eventsub_kinds", None)
+            if kinds is not None:
+                kinds[str(sid)] = "explicit" if pairs else "wildcard"
+                while len(kinds) > 16:
+                    kinds.pop(next(iter(kinds)))
             return inner, f"{label}{cid})"
         self._enqueue(assoc, build, epoch=epoch)
 
@@ -13786,7 +13971,7 @@ class G2SHost:
         def build(a):
             sid = a.next_session_id()
             inner, cid = self.build_inner_request(
-                a, "eventHandler", "1",
+                a, "eventHandler", self.host_id,
                 f'<g2s:getEventHandlerLog g2s:lastSequence="{last_sequence}" '
                 f'g2s:totalEntries="{total_entries}"/>',
                 str(sid), "30000")
@@ -13801,7 +13986,7 @@ class G2SHost:
         def build(a):
             sid = a.next_session_id()
             inner, cid = self.build_inner_request(
-                a, "cabinet", "1", "<g2s:getCabinetStatus/>", str(sid), "30000")
+                a, "cabinet", self._class_dev(a, "G2S_cabinet"), "<g2s:getCabinetStatus/>", str(sid), "30000")
             return inner, f"getCabinetStatus(cid={cid})"
         self._enqueue(assoc, build, epoch=epoch)
 
@@ -13809,11 +13994,39 @@ class G2SHost:
     # Ported 2026-07-07 from the Pi-only hotfix (bench: weak NVRAM battery
     # trips a hard tilt on cold power-up; a software restart keeps VBAT fed).
 
-    def enqueue_reset_processor(self, assoc):
+    def _reset_blockers(self, assoc):
+        """What the hub itself knows to be in progress on a machine that a
+        restart would cut across: a handpay waiting to be keyed off, a
+        transfer, an option or denomination change. A list of plain
+        reasons, empty when there is none. (A game in play is the
+        machine's own to refuse: the hub does not track one reliably.)"""
+        why = []
+        with assoc.lock:
+            if assoc.handpays_pending:
+                why.append("a handpay is waiting to be keyed off")
+            if assoc.optionconfig_stage in OPTION_CHANGE_BUSY:
+                why.append("an option change is running")
+            if (assoc.denom_ceremony or {}).get("stage") in (
+                    "entering", "writing", "exiting"):
+                why.append("a denomination change is running")
+        if self.wat_store.newest_active(assoc.egm_id) is not None:
+            why.append("a transfer is in progress")
+        return why
+
+    def enqueue_reset_processor(self, assoc, force=False):
         """cabinet.resetProcessor (spec §3.16, p.107-108) — remote WARM
-        REBOOT, plan A. Owner-only; sendable regardless of tilt/disable
-        state per spec ("the host may send the resetProcessor command"
-        regardless of disable outcome); NVRAM MUST survive per spec.
+        REBOOT, plan A. Owner-only. §3.16 in full: "the host should first
+        attempt to disable the EGM using the setCabinetState command.
+        Regardless of the results of disabling the EGM, the host may send
+        the resetProcessor command". The disable is NOT sent, on purpose
+        (decided 2026-11-17): a machine that then refuses the reset (this
+        floor's AVP does, G2S_APX008) would be left disabled, a machine
+        with a SAS link must not be host-disabled over G2S at all, and
+        putting it back afterwards needs three recoveries (refusal, no
+        answer, restart) for a command no machine here honours. In its
+        place the hub refuses to send the reset while it knows something
+        is in progress (_reset_blockers; `force` overrides); NVRAM MUST
+        survive per spec.
         Expected when honored: resetStarted response + CBE401, then
         commsClosing + reboot + fresh commsOnLine + CBE402.
 
@@ -13825,10 +14038,17 @@ class G2SHost:
         G2S_CBX002 = implemented but "cannot reset right now". ttl is a
         GENEROUS 60000 (§3.16: "a reasonable timeToLive ... giving the EGM
         enough time to perform a friendly shutdown")."""
+        if not force:
+            why = self._reset_blockers(assoc)
+            if why:
+                return {"ok": False, "blockedBy": why,
+                        "error": "not sent: " + "; ".join(why)
+                        + " on this machine"}
+
         def build(a):
             sid = a.next_session_id()
             inner, cid = self.build_inner_request(
-                a, "cabinet", "1", "<g2s:resetProcessor/>", str(sid), "60000")
+                a, "cabinet", self._class_dev(a, "G2S_cabinet"), "<g2s:resetProcessor/>", str(sid), "60000")
             # build() runs under assoc.lock (the worker holds it while
             # allocating commandIds) — stamp the probe directly, like
             # cabinet_state_change; NEVER re-acquire the non-reentrant lock.
@@ -13839,7 +14059,8 @@ class G2SHost:
             return inner, f"resetProcessor(cid={cid},sid={sid})"
         self._enqueue(assoc, build)
 
-    def enqueue_reboot_script(self, assoc, script_id=None, auto_retry=False):
+    def enqueue_reboot_script(self, assoc, script_id=None, auto_retry=False,
+                              force=False):
         """download.setScript w/ systemCmd G2S_resetEgm (spec §10.30
         setScript p.422-423, §10.37 systemCmd p.424, Table 10.70 operSystem
         p.441) — plan-B remote warm reboot, for the machines (this AVP014
@@ -13865,7 +14086,23 @@ class G2SHost:
 
         Both sends are tagged with ONE epoch captured up front (GR-18): a
         re-commsOnLine landing between the two enqueues must drop or keep
-        the PAIR, never send setScript without its setDownloadState."""
+        the PAIR, never send setScript without its setDownloadState.
+
+        G2S_immediate with G2S_none asks for the reset AT ONCE (Table
+        10.30; G2S_none: "Disable condition does not apply"). That this
+        AVP waits for idle is its own gate, not the document's: a machine
+        that follows the document would restart in the middle of whatever
+        it was doing. The document's wait-for-idle form (G2S_disable with
+        G2S_idle) has never been sent to the one machine known to take
+        this script, so the conditions stay as proven and the hub refuses
+        instead while it knows something is in progress (_reset_blockers;
+        `force` overrides)."""
+        if not force:
+            why = self._reset_blockers(assoc)
+            if why:
+                return {"ok": False, "blockedBy": why,
+                        "error": "not sent: " + "; ".join(why)
+                        + " on this machine"}
         sid_script = str(script_id or int(time.time()))
         def build_state(a):
             sid = a.next_session_id()
@@ -13908,7 +14145,7 @@ class G2SHost:
         def build(a):
             sid = a.next_session_id()
             inner, cid = self.build_inner_request(
-                a, "cabinet", "1", "<g2s:getCabinetProfile/>", str(sid), "30000")
+                a, "cabinet", self._class_dev(a, "G2S_cabinet"), "<g2s:getCabinetProfile/>", str(sid), "30000")
             return inner, f"getCabinetProfile(cid={cid})"
         self._enqueue(assoc, build)
 
@@ -13917,7 +14154,7 @@ class G2SHost:
         def build(a):
             sid = a.next_session_id()
             inner, cid = self.build_inner_request(
-                a, "cabinet", "1", "<g2s:getDateTime/>", str(sid), "30000")
+                a, "cabinet", self._class_dev(a, "G2S_cabinet"), "<g2s:getDateTime/>", str(sid), "30000")
             return inner, f"getDateTime(cid={cid})"
         self._enqueue(assoc, build)
 
@@ -13935,7 +14172,7 @@ class G2SHost:
             sid = a.next_session_id()
             ts = now_iso()
             inner, cid = self.build_inner_request(
-                a, "cabinet", "1",
+                a, "cabinet", self._class_dev(a, "G2S_cabinet"),
                 f'<g2s:setDateTime g2s:cabinetDateTime="{ts}"/>',
                 str(sid), "30000")
             a.clock_sync = {"cabinetDateTime": ts, "sentAt": ts,
@@ -13947,16 +14184,23 @@ class G2SHost:
 
     def enqueue_set_cabinet_state(self, assoc, enable=True, disable_text="",
                                   enable_game_play=True, enable_money_in=True,
-                                  enable_money_out=True):
+                                  enable_money_out=True, remember=True):
         """cabinet.setCabinetState (spec §3.7, Table 3.2) — enable/disable the
-        WHOLE machine. Owner-only, API-triggered ONLY (never automatic). Every
+        WHOLE machine. Owner-only. Sent when someone asks (the tile, the
+        floor lock, a tournament, the command API), and once more at a join
+        when the machine comes back in another state than it was last asked
+        to be in (_reassert_cabinet_state). Every
         attribute defaults TRUE, so a partial send implicitly resets omitted
         flags — we therefore always send the FULL intended state: enable plus
         explicit enableGamePlay/enableMoneyIn/enableMoneyOut="true" (this
         surface never granularly disables), disableText only on a disable.
         THE RESTORE PATH IS SACRED: enable=true with all flags true is the
-        clean full restore (§3.7 p.101 — a disable persists until exactly
-        that, and across an EGM restart via the profile's restartStatus).
+        clean full restore (§3.7 p.101 — a disable lasts until exactly
+        that; across a machine restart it lasts only if the machine's
+        restartStatus says so, see EgmAssociation.cabinet_wanted).
+        `remember` records the state as the one this machine is wanted in;
+        a tournament's lock and unlock are its own business and are not
+        recorded, and neither is the re-assert itself.
         The application response is cabinetStatus (§3.9) echoing hostEnabled;
         the dispatch handler confirms via the sessionId recorded here (result:
         sent -> acked -> confirmed / disagree / error:*). A getCabinetStatus
@@ -13965,13 +14209,27 @@ class G2SHost:
         g2sAcks then stays silent — record parks at sent/acked, snapshot()
         derives a lazy 30s timeout, no retry storms. Events on the EGM:
         G2S_CBE003/CBE004 (+ CBE204/CBE205 when play is affected)."""
+        if remember:
+            wanted = {"enable": bool(enable),
+                      "disableText": text_message(disable_text)
+                      if not enable else "",
+                      "enableGamePlay": bool(enable_game_play),
+                      "enableMoneyIn": bool(enable_money_in),
+                      "enableMoneyOut": bool(enable_money_out),
+                      "at": now_iso()}
+            with assoc.lock:
+                assoc.cabinet_wanted = wanted
+            store = getattr(self, "config_store", None)
+            if store is not None:
+                store.save_cabinet_wanted(assoc.egm_id, wanted)
+
         def build(a):
             sid = a.next_session_id()
             on = str(bool(enable)).lower()
             text = ""
             if not enable and disable_text:
                 text = (' g2s:disableText="'
-                        f'{html.escape(disable_text, quote=True)}"')
+                        f'{html.escape(text_message(disable_text), quote=True)}"')
             # ⭐ GRANULAR LOCK (2026-07-25). These were hardcoded "true", so
             # every "disable" we ever sent simultaneously asserted
             # enableGamePlay="true" — i.e. WE HAVE NEVER LOCKED GAME PLAY on
@@ -13989,9 +14247,11 @@ class G2SHost:
                    f'g2s:enableGamePlay="{gp}" g2s:enableMoneyIn="{mi}" '
                    f'g2s:enableMoneyOut="{mo}"{text}/>')
             inner, cid = self.build_inner_request(
-                a, "cabinet", "1", cmd, str(sid), "30000")
+                a, "cabinet", self._class_dev(a, "G2S_cabinet"), cmd, str(sid), "30000")
             a.cabinet_state_change = {
-                "enable": on, "disableText": disable_text if text else "",
+                "enable": on, "enableGamePlay": gp, "enableMoneyIn": mi,
+                "enableMoneyOut": mo,
+                "disableText": disable_text if text else "",
                 "sessionId": str(sid), "sentAt": now_iso(),
                 "sentTs": time.time(), "result": "sent"}
             log.info("🖥️ [%s] setCabinetState enable=%s%s — expecting "
@@ -14620,6 +14880,32 @@ class G2SHost:
         elif code in ("G2S_CCE101", "G2S_CCE102"):
             self._comm_config_mode_seen(assoc, code == "G2S_CCE101", code)
 
+    def _event_queue_event(self, assoc, ev):
+        """G2S_EHE102: the machine's event log for this hub is full, so
+        from now on it overwrites, discards or switches its event handler
+        off (its queueBehavior); G2S_EHE103: it has room again. Said when
+        it happens, and when it clears the log is read back, since what
+        was overwritten or discarded in between is known only from what
+        the log still holds."""
+        code = ev.get("eventCode")
+        if code == "G2S_EHE102":
+            with assoc.lock:
+                assoc.event_queue_full_at = now_iso()
+                behaviour = assoc.event_handler.get("queueBehavior")
+            log.warning("[%s] 📇 the machine's event log for this hub is "
+                        "FULL (G2S_EHE102) — it now does what its "
+                        "queueBehavior says (%s); events may be missing "
+                        "until it clears", assoc.egm_id,
+                        behaviour or "not known")
+        elif code == "G2S_EHE103":
+            with assoc.lock:
+                was = assoc.event_queue_full_at
+                assoc.event_queue_full_at = None
+            log.info("[%s] 📇 the machine's event log has room again "
+                     "(G2S_EHE103%s) — reading it back", assoc.egm_id,
+                     f", full since {was}" if was else "")
+            self.enqueue_get_event_handler_log(assoc)
+
     def sweep_config_modes(self, now=None):
         """Watchdog pass over the denomination ceremonies. A write that has
         had no verdict for CEREMONY_WRITE_DEADLINE_SEC is closed (the exit
@@ -14897,7 +15183,7 @@ class G2SHost:
             text = ""
             if not enable and disable_text:
                 text = (' g2s:disableText="'
-                        f'{html.escape(disable_text, quote=True)}"')
+                        f'{html.escape(text_message(disable_text), quote=True)}"')
             inner, cid = self.build_inner_request(
                 a, "gamePlay", dev,
                 f'<g2s:setGamePlayState g2s:enable="{on}"{text}/>',
@@ -15001,9 +15287,11 @@ class G2SHost:
         disable). Owner-only; always point-to-point here so the EGM MUST
         answer noteAcceptorStatus (§13.8 — a multicast delivery would draw
         no response) and fires NAE003/NAE004. This is a DELIBERATE bench/
-        test-panel action: it changes machine behavior, the disable
-        PERSISTS across an EGM restart per the profile's restartStatus
-        (Table 13.4), and with requiredForPlay=true a disable takes the
+        test-panel action: it changes machine behavior; after a machine
+        restart the device is on or off as the machine's own restartStatus
+        says, not as it was last told (§1.20.3; Table 13.4: default true,
+        so a disable is undone by a restart), and with
+        requiredForPlay=true a disable takes the
         WHOLE EGM down via evaluate(cabinet.egmState) (§13.19.1).
         Pre-ownership the AVP just g2sAcks then stays silent — no pending
         state machine, no timeout, no retry. hostEnabled absent = true
@@ -15016,7 +15304,7 @@ class G2SHost:
             text = ""
             if not enable and disable_text:
                 text = (' g2s:disableText="'
-                        f'{html.escape(disable_text, quote=True)}"')
+                        f'{html.escape(text_message(disable_text), quote=True)}"')
             inner, cid = self.build_inner_request(
                 a, "noteAcceptor", dev,
                 f'<g2s:setNoteAcceptorState g2s:enable="{on}"{text}/>',
@@ -15247,9 +15535,58 @@ class G2SHost:
         self.enqueue_get_game_denoms(assoc, dev)
         return True
 
+    def _reassert_cabinet_state(self, assoc, data):
+        """A cabinetStatus that is not the answer to a command of ours, the
+        first of this join: if the machine is not in the state it was last
+        asked to be in (cabinet_wanted), ask again. Once per join. A
+        machine that was never told anything is left as it is, a machine
+        with a SAS link is locked over SAS and is not touched here, and
+        while a tournament has the floor its own locks stand. Returns True
+        if a setCabinetState was sent."""
+        with assoc.lock:
+            first = assoc.cabinet_reassert_epoch != assoc.epoch
+            assoc.cabinet_reassert_epoch = assoc.epoch
+            wanted = dict(assoc.cabinet_wanted) if assoc.cabinet_wanted \
+                else None
+            csc = assoc.cabinet_state_change
+            busy = csc.get("result") in ("sent", "acked") and \
+                time.time() - (csc.get("sentTs") or 0) < 30
+            restart = (assoc.cabinet.get("profile") or {}).get(
+                "restartStatus")
+        if not first or not wanted or busy:
+            return False
+        if self.sas_links.get(assoc.egm_id):
+            return False
+        with self.tournament_lock:
+            if self.tournament.get("phase") != "idle":
+                return False
+        want = "true" if wanted.get("enable") else "false"
+        if data.get("hostEnabled") == want:
+            return False
+        log.warning("🖥️ [%s] the machine came back %s; it was last asked to "
+                    "be %s (%s) — asking again (a restart sets hostEnabled "
+                    "from the machine's restartStatus%s, §1.20.3)",
+                    assoc.egm_id,
+                    "enabled" if data.get("hostEnabled") == "true"
+                    else "disabled",
+                    "enabled" if wanted.get("enable") else "disabled",
+                    wanted.get("at"),
+                    f", which is {restart} here" if restart else "")
+        self.enqueue_set_cabinet_state(
+            assoc, enable=bool(wanted.get("enable")),
+            disable_text=wanted.get("disableText") or "",
+            enable_game_play=bool(wanted.get("enableGamePlay", True)),
+            enable_money_in=bool(wanted.get("enableMoneyIn", True)),
+            enable_money_out=bool(wanted.get("enableMoneyOut", True)),
+            remember=False)
+        return True
+
     def _fold_cabinet_status(self, assoc, el, source):
-        """Fold ONE cabinetStatus element (§3.9 Table 3.3 — every attribute
-        optional) into assoc.cabinet. Shared by the cabinetStatus response
+        """Fold ONE cabinetStatus element (§3.9 Table 3.3: hostEnabled,
+        egmEnabled, the three partial locks and the door, lamp and lock
+        flags are optional with a default; egmState and the fields that
+        name the game in play are required) into assoc.cabinet. Shared by
+        the cabinetStatus response
         handler and the eventReport affected-status ride-along (the
         _fold_note_acceptor_status twin), so egmState/doors track the CBE
         narration live with zero class reads — the stale-tile fix
@@ -15270,6 +15607,14 @@ class G2SHost:
         data.setdefault("egmEnabled", "true")
         for f in self.CABINET_STATUS_FLAGS:
             data.setdefault(f, "false")
+        # The three partial locks default to TRUE and hardMetersDisconnected
+        # to false (Table 3.3). Left out of a status they kept the value
+        # last stored: after a partial lock and a full restore, a machine
+        # that leaves attributes out at their default went on reading
+        # enableGamePlay="false".
+        for f in ("enableGamePlay", "enableMoneyIn", "enableMoneyOut"):
+            data.setdefault(f, "true")
+        data.setdefault("hardMetersDisconnected", "false")
         # the attributes Table 3.3 types as boolean, in one spelling (1 and
         # 0 are as legal as true and false; everything that reads these,
         # the setCabinetState verdict included, compares the two words)
@@ -15477,7 +15822,7 @@ class G2SHost:
             text = ""
             if not enable and disable_text:
                 text = (' g2s:disableText="'
-                        f'{html.escape(disable_text, quote=True)}"')
+                        f'{html.escape(text_message(disable_text), quote=True)}"')
             inner, cid = self.build_inner_request(
                 a, "wat", dev,
                 f'<g2s:setWatState g2s:enable="{on}"{text}/>',
@@ -16109,7 +16454,7 @@ class G2SHost:
             text = ""
             if not enable and disable_text:
                 text = (' g2s:disableText="'
-                        f'{html.escape(disable_text, quote=True)}"')
+                        f'{html.escape(text_message(disable_text), quote=True)}"')
             inner, cid = self.build_inner_request(
                 a, "voucher", dev,
                 f'<g2s:setVoucherState g2s:enable="{on}"{text}/>',
@@ -16291,7 +16636,7 @@ class G2SHost:
             text = ""
             if not enable and disable_text:
                 text = (' g2s:disableText="'
-                        f'{html.escape(disable_text, quote=True)}"')
+                        f'{html.escape(text_message(disable_text), quote=True)}"')
             inner, cid = self.build_inner_request(
                 a, "bonus", dev,
                 f'<g2s:setBonusState g2s:enable="{on}"{text}/>',
@@ -17620,7 +17965,7 @@ class G2SHost:
                    f'g2s:deviceId="{device_id}" g2s:meterDefinitions="false"/>'
                    '</g2s:getMeterInfo>')
             inner, cid = self.build_inner_request(
-                a, "meters", "1", cmd, str(sid), "30000")
+                a, "meters", self.host_id, cmd, str(sid), "30000")
             # which devices this read asked about and when, so that its
             # answer can be told from any other meterInfo (builders run
             # holding a.lock)
@@ -18218,7 +18563,7 @@ class G2SHost:
             text = ""
             if enable and disable_text:
                 text = (' g2s:disableText="'
-                        f'{html.escape(disable_text, quote=True)}"')
+                        f'{html.escape(text_message(disable_text), quote=True)}"')
             inner, cid = self.build_inner_request(
                 a, "optionConfig", self.host_id,
                 f'<g2s:enterOptionConfigMode '
@@ -18310,7 +18655,7 @@ class G2SHost:
         def build(a):
             sid = a.next_session_id()
             inner, cid = self.build_inner_request(
-                a, "handpay", "1",
+                a, "handpay", self._class_dev(a, "G2S_handpay"),
                 f'<g2s:getHandpayLog g2s:lastSequence="0" '
                 f'g2s:totalEntries="{int(entries)}"/>',
                 str(sid), "30000")
@@ -18700,7 +19045,7 @@ class G2SHost:
         Allowed. NOTE for tonight's test: a lockup raised BEFORE the flip
         carries its own remoteCredit=false (Table 11.6) — raise a FRESH
         handpay after 'verified' lands."""
-        dc, di = "G2S_handpay", "1"
+        dc, di = "G2S_handpay", self._class_dev(assoc, "G2S_handpay")
         gid = oid = "G2S_handpayOptions"
         with assoc.lock:
             opt = assoc.config_options.get(f"{dc}/{di}/{gid}/{oid}")
@@ -19036,12 +19381,13 @@ class G2SHost:
                 return
             assoc.handpay_arm_epoch = assoc.epoch
             assoc.handpay_arm_pending = True
-            assoc.option_detail_settled.discard("G2S_handpay/1")
+            dev = self._class_dev(assoc, "G2S_handpay")
+            assoc.option_detail_settled.discard(f"G2S_handpay/{dev}")
         log.info("💰 [%s] join: re-asserting remote handpay key-off — "
-                 "reading G2S_handpay/1 options first (a RAM clear silently "
-                 "resets G2S_enabledRemoteCredit)", assoc.egm_id)
+                 "reading G2S_handpay/%s options first (a RAM clear silently "
+                 "resets G2S_enabledRemoteCredit)", assoc.egm_id, dev)
         self.enqueue_get_option_list(assoc=assoc, device_class="G2S_handpay",
-                                     device_id="1", option_detail=True)
+                                     device_id=dev, option_detail=True)
 
     def _remote_handpay_arm_after_option_list(self, assoc):
         """A (any) optionList landed — run the armed remote key-off
@@ -19054,11 +19400,12 @@ class G2SHost:
         definitions say what may be changed; a machine that never
         advertises the option costs one dict probe per landing and nothing
         on the wire."""
-        key = "G2S_handpay/1/G2S_handpayOptions/G2S_handpayOptions"
+        dev = self._class_dev(assoc, "G2S_handpay")
+        key = f"G2S_handpay/{dev}/G2S_handpayOptions/G2S_handpayOptions"
         with assoc.lock:
             if not assoc.handpay_arm_pending:
                 return
-            if "G2S_handpay/1" not in assoc.option_detail_settled:
+            if f"G2S_handpay/{dev}" not in assoc.option_detail_settled:
                 return
             has_opt = key in assoc.config_options
             if has_opt:
@@ -19376,7 +19723,10 @@ class G2SHost:
             return
         log.info("⬇️ [%s] idle countdown elapsed — re-firing the reboot "
                  "script (once)", assoc.egm_id)
-        self.enqueue_reboot_script(assoc, auto_retry=True)
+        held = self.enqueue_reboot_script(assoc, auto_retry=True)
+        if isinstance(held, dict) and held.get("ok") is False:
+            log.warning("⬇️ [%s] reboot re-fire %s", assoc.egm_id,
+                        held.get("error"))
 
     def dispatch(self, assoc, req):
         """Handle one class-level command. Outbound sends run on a worker
@@ -19923,6 +20273,27 @@ class G2SHost:
             # (fire-and-observe, like resetProcessor); just shout with the
             # actionable hint. The generic warning above already carried
             # the raw errorText.
+            elif req["class"] == "eventHandler" and ans_cmd == "setEventSub":
+                # The subscription was refused (G2S_EHX001 invalid,
+                # G2S_EHX003 cannot add, §4.10). If it was the explicit
+                # list, which follows a clear of everything, the hub now
+                # holds NO subscription on this machine: it used to log
+                # the refusal and go on showing "subscribed". The wildcard
+                # is asked for in its place.
+                with assoc.lock:
+                    kind = assoc.eventsub_kinds.pop(str(req["sessionId"]),
+                                                    None)
+                    assoc.subscribed = False
+                if kind == "explicit":
+                    log.warning("[%s] 📇 the explicit event subscription "
+                                "was REFUSED (%s) — asking for the wildcard "
+                                "so that events still arrive", assoc.egm_id,
+                                rerr)
+                    self.enqueue_set_event_sub(assoc, wildcard=True)
+                else:
+                    log.error("[%s] 📇 the event subscription was REFUSED "
+                              "(%s) — this machine is sending the hub NO "
+                              "events", assoc.egm_id, rerr)
             elif req["class"] == "download":
                 hint = {
                     "G2S_APX999": "EGM not idle — the script path IS "
@@ -20754,14 +21125,32 @@ class G2SHost:
             # but silently vanished from the ring/count. A genuine retry (or
             # a backfill overlap) resends the SAME stored record and thus the
             # same eventDateTime; a recycled id after a clear does not.
+            # ...with one exception. An entry merged from the machine's log
+            # with eventAck false is an event the machine has NOT had
+            # acknowledged: it "must be persisted and retried by the EGM
+            # until acknowledged" (§1.16), so the event itself is still to
+            # come, and this is it. Taken for a repeat it was acknowledged
+            # and dropped: a bill stacked while the hub was away never
+            # reached the count, the tape missed the event, and a
+            # G2S_GPE201 did not move a denomination change on. The log
+            # entry is replaced by the event and the event is handled as
+            # any first delivery is.
             with assoc.lock:
-                dup = bool(ev["eventId"]) and any(
-                    e.get("eventId") == ev["eventId"]
-                    and e.get("eventDateTime") == ev["eventDateTime"]
-                    for e in assoc.events)
+                at = next((i for i, e in enumerate(assoc.events)
+                           if ev["eventId"]
+                           and e.get("eventId") == ev["eventId"]
+                           and e.get("eventDateTime") == ev["eventDateTime"]),
+                          None)
+                unacked = at is not None \
+                    and assoc.events[at].get("source") == "backfill" \
+                    and not g2s_true(assoc.events[at].get("eventAck"))
+                dup = at is not None and not unacked
+                if unacked:
+                    assoc.events[at] = ev        # counted when it was merged
                 if not dup:
-                    assoc.event_count += 1
-                    assoc.events.append(ev)
+                    if not unacked:
+                        assoc.event_count += 1
+                        assoc.events.append(ev)
                     if len(assoc.events) > 200:
                         assoc.events = assoc.events[-200:]
                     if bill is not None:
@@ -20787,6 +21176,8 @@ class G2SHost:
                 self._game_play_event_refresh(assoc, ev)
                 # a config mode entered or left (the watch on config modes)
                 self._config_mode_event(assoc, ev)
+                # the machine's log of unsent events filled, or cleared
+                self._event_queue_event(assoc, ev)
                 log.info("🔔 [%s] EVENT #%d %s [%s] from %s/%s (eventId=%s "
                          "txn=%s)%s%s",
                          assoc.egm_id, total, code, ev["label"],
@@ -20934,6 +21325,24 @@ class G2SHost:
                          attr(f, "deviceClass"), attr(f, "deviceId"),
                          attr(f, "eventCode"))
             log.info("=" * 64)
+            behaviour = attr(el, "queueBehavior")
+            needed = g2s_bool(attr(el, "requiredForPlay"))
+            with assoc.lock:
+                assoc.event_handler = {
+                    "queueBehavior": behaviour,
+                    "requiredForPlay": needed,
+                    "minLogEntries": attr(el, "minLogEntries") or "35",
+                    "at": now_iso()}
+            if behaviour == "G2S_disable":
+                # §1.16: on a full log the machine "may ... discard new
+                # events and become disabled"
+                log.warning("[%s] 📇 this machine switches its event handler "
+                            "OFF when %s events are waiting for the hub%s. "
+                            "A long hub outage while it is played does "
+                            "that.", assoc.egm_id,
+                            attr(el, "minLogEntries") or "35",
+                            ", and stops play with it (requiredForPlay)"
+                            if needed == "true" else "")
 
         elif cmd == "supportedEvents" and stype == "G2S_response":
             el = req["commandEl"]
@@ -20964,6 +21373,7 @@ class G2SHost:
 
         elif cmd == "setEventSubAck" and stype == "G2S_response":
             assoc.subscribed = True
+            assoc.eventsub_cleared_at = 0.0
             log.info("=" * 64)
             log.info("🎉 [%s] setEventSubAck — SUBSCRIPTION INSTALLED. The AVP "
                      "will now push eventReports.", assoc.egm_id)
@@ -21366,8 +21776,13 @@ class G2SHost:
                 if csc.get("result") in ("sent", "acked") and \
                         req["sessionId"] == csc.get("sessionId"):
                     want = csc.get("enable")
+                    # the three partial locks are part of what was asked:
+                    # one the machine did not apply is not "confirmed"
+                    partial = all(data.get(k) == csc.get(k, data.get(k))
+                                  for k in ("enableGamePlay", "enableMoneyIn",
+                                            "enableMoneyOut"))
                     verdict = ("confirmed" if data["hostEnabled"] == want
-                               else "disagree")
+                               and partial else "disagree")
                     csc["result"] = verdict
                     csc["confirmedAt"] = now_iso()
                     csc["hostEnabled"] = data["hostEnabled"]
@@ -21383,8 +21798,17 @@ class G2SHost:
             elif verdict == "disagree":
                 log.warning("🖥️ [%s] CABINET STATE DISAGREEMENT — asked "
                             "enable=%s but the EGM reports hostEnabled=%s "
-                            "(egmState=%s)", assoc.egm_id, want,
-                            data["hostEnabled"], data.get("egmState"))
+                            "(egmState=%s; play/money in/money out %s/%s/%s)",
+                            assoc.egm_id, want,
+                            data["hostEnabled"], data.get("egmState"),
+                            data.get("enableGamePlay"),
+                            data.get("enableMoneyIn"),
+                            data.get("enableMoneyOut"))
+            if verdict is None:
+                # not the answer to a command of ours: at a join, this is
+                # where a machine that restarted shows the state it came
+                # back in
+                self._reassert_cabinet_state(assoc, data)
             log.info("=" * 64)
             log.info("🖥️  [%s] CABINET STATUS egmState=%s", assoc.egm_id,
                      data.get("egmState"))
@@ -25289,8 +25713,9 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
             "setDateTime": engine.enqueue_set_date_time,
             # cabinet control (G2S-20 rest): {"enable": false, "disableText":
             # "..."} disables the WHOLE machine (in-flight game completes,
-            # then money+play stop; PERSISTS across an EGM restart per the
-            # profile's restartStatus); enable omitted/true is the sacred
+            # then money+play stop; a machine restart sets it back to what
+            # the machine's restartStatus says, and the hub then sends the
+            # remembered state again); enable omitted/true is the sacred
             # full restore (all Table 3.2 flags explicit true). Deliberate
             # bench action; a getCabinetStatus refresh rides behind the set.
             "setCabinetState": engine.enqueue_set_cabinet_state,
@@ -25363,8 +25788,9 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
             # noteAcceptor acceptance toggle (G2S-23): {"enable": false,
             # "disableText": "..."} disables bill acceptance, enable omitted/
             # true re-enables. Deliberate bench action — changes machine
-            # behavior (and persists across an EGM restart per the profile's
-            # restartStatus); the EGM answers noteAcceptorStatus + NAE003/004.
+            # behavior (until the machine restarts: it then follows its own
+            # restartStatus, default enabled); the EGM answers
+            # noteAcceptorStatus + NAE003/004.
             "setNoteAcceptorState": engine.enqueue_set_note_acceptor_state,
             # meters read (G2S-15)
             "getMeterInfo": engine.enqueue_get_meter_info,
@@ -25997,6 +26423,9 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                 kwargs["key_off_type"] = str(req["keyOffType"])
         if action == "voidValidationId":
             kwargs["validation_id"] = str(req.get("validationId") or "")
+        if action in ("rebootEgmScript", "resetProcessor") and \
+                req.get("force") is True:
+            kwargs["force"] = True
         if action == "rebootEgmScript" and req.get("scriptId") is not None:
             # RB: explicit scriptId override for a DLX006 re-fire; omitted
             # = a fresh per-attempt default (epoch seconds).
@@ -28263,6 +28692,11 @@ def watchdog(engine):
             engine.sweep_config_modes()
         except Exception as e:  # noqa: BLE001 — never take the watchdog down
             log.error("config-mode sweep failed: %s", e)
+        # a machine left with no event subscription after a clear
+        try:
+            engine.sweep_event_subs()
+        except Exception as e:  # noqa: BLE001 — never take the watchdog down
+            log.error("event-subscription sweep failed: %s", e)
         # ticket printing this hub switched off and has not seen on again
         try:
             engine.sweep_voucher_reconciles()
