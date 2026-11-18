@@ -4967,6 +4967,359 @@ def sas_handpays_have_an_amount_and_are_booked():
           and "amount" not in entry["lastHandpay"], entry["lastHandpay"])
 
 
+def a_cash_out_the_machine_cannot_make_yet_is_tried_again():
+    print("— CASH OUT TO WALLET on a machine that is busy at that moment "
+          "(the owner: \"why doesnt the hub hold it for up to 15 seconds "
+          "and retry when available\", then \"a retry queue.. it shouldnt "
+          "be paused\"): the satellite keeps the pull and tries again "
+          "every second; the hub keeps track of it meanwhile")
+    LEG = "smib-x/1"
+
+    def report(host, **more):
+        payload = {"smibId": "smib-x", "address": "1", "online": True,
+                   "meters": {"0x1A": 0}, "pendingHandpay": None,
+                   "lastHandpay": None}
+        payload.update(more)
+        host.sas_report(payload, "192.168.50.102")
+
+    def taken(host):
+        """The commands queued for the satellite, as it would collect
+        them."""
+        q = host.sas_commands.get("smib-x")
+        out = list(q or ())
+        if q:
+            q.clear()
+        return out
+
+    def floor():
+        host = make_host()
+        egm = online(joined(host, "BTB_retry"))
+        host.sas_links[egm.egm_id] = LEG
+        a, _ = host.account_store.create("Player A")
+        b, _ = host.account_store.create("Player B")
+        report(host)
+        taken(host)
+        return host, egm, a["id"], b["id"]
+
+    def view(host, egm, acct):
+        return host._glass_data_cashout(egm.egm_id, egm.assoc,
+                                        gh.PIN_UID_PREFIX + acct)
+
+    def done(cid, cents=2500, txn="T-1", **more):
+        return dict({"id": cid, "type": "aft_cashout", "ok": True,
+                     "outcome": "completed", "txnId": txn,
+                     "amountCents": cents, "restrictedCents": 0,
+                     "detail": "full transfer successful"}, **more)
+
+    def busy(cid, **more):
+        return dict({"id": cid, "type": "aft_cashout", "ok": False,
+                     "outcome": "lock_failed", "amountCents": 0,
+                     "detail": "game lock never confirmed; transfer NOT "
+                               "sent (try 7, 16 s after it was asked)",
+                     "tries": 7, "waitedSec": 16.5}, **more)
+
+    # -- the tap ---------------------------------------------------------
+    host, egm, A, B = floor()
+    code, reply = host.glass_cash_out_now(egm.egm_id, A)
+    sent = taken(host)
+    check("the pull asks the satellite to keep trying for fifteen seconds",
+          code == 200 and [c["type"] for c in sent] == ["aft_cashout_pull"]
+          and sent[0].get("retrySec") == 15 == host.CASH_OUT_RETRY_SEC
+          and sent[0]["accountId"] == A, sent)
+    cid = sent[0]["id"]
+    check("until there is an answer the screen is told it is on its way",
+          view(host, egm, A).get("cashOutPending") is True
+          and "cashOutError" not in view(host, egm, A), view(host, egm, A))
+    check("only the player who asked is told so",
+          "cashOutPending" not in view(host, egm, B), view(host, egm, B))
+    code, reply = host.glass_cash_out_now(egm.egm_id, A)
+    check("a second tap while it waits sends nothing more",
+          code == 200 and reply.get("pending") is True
+          and reply.get("waiting") is True and taken(host) == [], reply)
+
+    # -- it works on a later try -------------------------------------------
+    start = cash(host, A)
+    for _ in range(3):                      # the satellite repeats results
+        report(host, commandResults=[done(cid, tries=4, waitedSec=6.2)])
+    check("when a later try works the wallet is credited, once",
+          cash(host, A) == start + 2_500_000, cash(host, A) - start)
+    shown = view(host, egm, A)
+    check("and the screen stops saying it is on its way, with nothing "
+          "else to say", "cashOutPending" not in shown
+          and "cashOutError" not in shown, shown)
+    code, reply = host.glass_cash_out_now(egm.egm_id, A)
+    sent = taken(host)
+    check("the next tap is a new pull", code == 200 and len(sent) == 1
+          and sent[0]["id"] != cid and "waiting" not in reply, reply)
+    cid = sent[0]["id"]
+
+    # -- the fifteen seconds run out ---------------------------------------
+    told = said(lambda: [report(host, commandResults=[busy(cid)])
+                         for _ in range(3)])
+    shown = view(host, egm, A)
+    check("a machine that stayed busy the whole time: the player is told "
+          "nothing was sent, and it is no longer on its way",
+          "stayed busy" in shown.get("cashOutError", "")
+          and "cashOutPending" not in shown
+          and told.count("did not happen") == 1, (shown, told))
+    check("nobody else at the machine is shown that",
+          "cashOutError" not in view(host, egm, B), view(host, egm, B))
+    code, reply = host.glass_cash_out_now(egm.egm_id, A)
+    sent = taken(host)
+    shown = view(host, egm, A)
+    check("asking again takes the old news off the screen",
+          len(sent) == 1 and shown.get("cashOutPending") is True
+          and "cashOutError" not in shown, shown)
+    cid = sent[0]["id"]
+    report(host, commandResults=[done(cid, txn="T-1b")])
+    shown = view(host, egm, A)
+    check("and it does not come back when that one works",
+          "cashOutError" not in shown and "cashOutPending" not in shown,
+          shown)
+    host.glass_cash_out_now(egm.egm_id, A)
+    cid = taken(host)[0]["id"]
+
+    # -- the machine was emptied some other way while it waited ------------
+    report(host, commandResults=[dict(
+        busy(cid), outcome="no_credits", tries=3,
+        detail="machine reports no cashable credits")])
+    shown = view(host, egm, A)
+    check("a pull that finds the machine empty after waiting says nothing "
+          "(the credits went by its CASH OUT button, or were played)",
+          "cashOutError" not in shown and "cashOutPending" not in shown,
+          shown)
+
+    # -- no answer at all ---------------------------------------------------
+    host.glass_cash_out_now(egm.egm_id, A)
+    taken(host)
+    host._cash_out_pulls()[LEG]["ts"] -= host.CASH_OUT_PULL_OPEN_SEC + 1
+    shown = view(host, egm, A)
+    check("a pull the satellite never answers stops counting as on its "
+          "way after half a minute, and the player is told",
+          "cashOutPending" not in shown
+          and "did not answer" in shown.get("cashOutError", ""), shown)
+    code, reply = host.glass_cash_out_now(egm.egm_id, A)
+    check("and can be asked for again", code == 200
+          and len(taken(host)) == 1 and "waiting" not in reply, reply)
+
+    # -- the player leaves while it waits -----------------------------------
+    host, egm, A, B = floor()
+    host.glass_cash_out_now(egm.egm_id, A)
+    cid = taken(host)[0]["id"]
+    host._glass_card_out(egm.egm_id)
+    sent = taken(host)
+    check("a card-out tells the satellite to stop trying that pull",
+          [(c["type"], c.get("enable"), c.get("dropPull")) for c in sent]
+          == [("aft_set_host_cashout", False, True)], sent)
+    code, reply = host.glass_cash_out_now(egm.egm_id, B)
+    sent = taken(host)
+    check("the next player's tap is a pull of their own, not a wait for "
+          "the one before", code == 200 and len(sent) == 1
+          and sent[0]["id"] != cid and "waiting" not in reply
+          and sent[0]["accountId"] == B, (reply, sent))
+    bid = sent[0]["id"]
+    start_a, start_b = cash(host, A), cash(host, B)
+    told = said(lambda: report(host, commandResults=[dict(
+        busy(cid), outcome="cancelled", tries=2,
+        detail="not sent: the player left before the machine could send "
+               "its credits")]))
+    shown = view(host, egm, B)
+    check("the dropped pull's answer puts nothing on the next player's "
+          "screen, and their own is still on its way",
+          "cashOutError" not in shown
+          and shown.get("cashOutPending") is True, shown)
+    report(host, commandResults=[done(bid, txn="T-2")])
+    check("which is credited to them", cash(host, B) == start_b + 2_500_000
+          and cash(host, A) == start_a,
+          (cash(host, A) - start_a, cash(host, B) - start_b))
+
+    host, egm, A, B = floor()
+    host.glass_cash_out_now(egm.egm_id, A)
+    cid = taken(host)[0]["id"]
+    host._glass_card_out(egm.egm_id)        # ...as its last try went through
+    taken(host)
+    start = cash(host, A)
+    told = said(lambda: report(host, commandResults=[done(cid, txn="T-3")]))
+    check("a try that was already under way when they left is still "
+          "credited to the player who asked (it had no home: the pin "
+          "went with the card)", cash(host, A) == start + 2_500_000
+          and "UNHOMED" not in told.upper(), (cash(host, A) - start, told))
+
+    host, egm, A, B = floor()
+    host.glass_cash_out_now(egm.egm_id, A)
+    cid = taken(host)[0]["id"]
+    host._glass_card_out(egm.egm_id)
+    host.glass_cash_out_now(egm.egm_id, B)  # B is there within the second
+    bid = [c for c in taken(host) if c["type"] == "aft_cashout_pull"][0]["id"]
+    start_a, start_b = cash(host, A), cash(host, B)
+    report(host, commandResults=[done(cid, txn="T-3b")])
+    check("...even when the next player has already asked for a cash-out "
+          "of their own", cash(host, A) == start_a + 2_500_000
+          and cash(host, B) == start_b
+          and view(host, egm, B).get("cashOutPending") is True,
+          (cash(host, A) - start_a, cash(host, B) - start_b))
+    report(host, commandResults=[done(bid, txn="T-3c", cents=100)])
+    check("and theirs is credited to them when it comes",
+          cash(host, B) == start_b + 100_000, cash(host, B) - start_b)
+
+    host, egm, A, B = floor()
+    host.glass_cash_out_now(egm.egm_id, A)
+    cid = taken(host)[0]["id"]
+    host._glass_card_out(egm.egm_id)
+    taken(host)
+    report(host, commandResults=[busy(cid)])
+    check("a pull that ends badly after its player has gone puts nothing "
+          "on the screen for whoever is there next",
+          "cashOutError" not in view(host, egm, B)
+          and "cashOutError" not in view(host, egm, A), view(host, egm, B))
+
+    host, egm, A, B = floor()
+    host.glass_cash_out_now(egm.egm_id, A)
+    cid = taken(host)[0]["id"]
+    host._glass_card_out(egm.egm_id)
+    taken(host)
+    host._cash_out_pulls_gone()[cid]["ts"] -= host.CASH_OUT_PULL_OPEN_SEC + 1
+    start = cash(host, A)
+    told = said(lambda: report(host, commandResults=[done(cid,
+                                                          txn="T-3e")]))
+    check("that holds for half a minute after the tap and no longer: a "
+          "result under that id later than that has no home, as before",
+          cash(host, A) == start and "T-3e" in told, told)
+
+    host, egm, A, B = floor()
+    host.glass_cash_out_now(egm.egm_id, A)
+    cid = taken(host)[0]["id"]
+    report(host, commandResults=[dict(
+        busy(cid), outcome="cancelled", tries=2,
+        detail="not sent: a newer cash-out request took its place")])
+    shown = view(host, egm, A)
+    check("a pull the satellite dropped while its player is still there "
+          "(another pull took its place) is not left looking as if it "
+          "were on its way: they are told nothing was sent",
+          "cashOutPending" not in shown
+          and "did not send" in shown.get("cashOutError", ""), shown)
+
+    host, egm, A, B = floor()
+    host.glass_cash_out_now(egm.egm_id, A)
+    taken(host)
+    with host._glass_pin_lock:
+        host._glass_cash_out_pin.pop(egm.egm_id, None)   # the switch, off
+    host._glass_card_out(egm.egm_id)
+    sent = taken(host)
+    check("the card-out stops a waiting pull even when the machine's "
+          "button was not set for the wallet",
+          [(c["type"], c.get("dropPull")) for c in sent]
+          == [("aft_set_host_cashout", True)], sent)
+
+    host, egm, A, B = floor()
+    host.glass_cash_out_now(egm.egm_id, A)
+    taken(host)
+    host.account_store.delete(A)
+    host._sweep_cash_out_pins()
+    sent = taken(host)
+    check("so does the player's account being removed",
+          [(c["type"], c.get("dropPull")) for c in sent]
+          == [("aft_set_host_cashout", True)], sent)
+
+    host, egm, A, B = floor()
+    host.glass_cash_out_now(egm.egm_id, A)
+    cid = taken(host)[0]["id"]
+    code, reply = host.glass_cash_out_now(egm.egm_id, B)
+    start_a, start_b = cash(host, A), cash(host, B)
+    report(host, commandResults=[done(cid, txn="T-3d")])
+    check("a second player's tap on the same machine while the first is "
+          "still there joins the pull that is waiting, and it is theirs "
+          "(as the machine's pin is)", reply.get("waiting") is True
+          and taken(host) == [] and cash(host, B) == start_b + 2_500_000
+          and cash(host, A) == start_a,
+          (cash(host, A) - start_a, cash(host, B) - start_b))
+
+    # -- who it belongs to ----------------------------------------------------
+    host, egm, A, B = floor()
+    host.glass_cash_out_now(egm.egm_id, A)
+    cid = taken(host)[0]["id"]
+    with host._glass_pin_lock:
+        host._glass_cash_out_pin.pop(egm.egm_id, None)   # the switch, off
+    start = cash(host, A)
+    report(host, commandResults=[done(cid, txn="T-4")])
+    check("switching the CASH OUT button's routing off while it waits "
+          "does not lose it", cash(host, A) == start + 2_500_000,
+          cash(host, A) - start)
+
+    host, egm, A, B = floor()
+    host.glass_cash_out_now(egm.egm_id, A)
+    cid = taken(host)[0]["id"]
+    with host._glass_pin_lock:
+        host._glass_cash_out_pin[egm.egm_id] = B         # B armed the button
+    start_a, start_b = cash(host, A), cash(host, B)
+    report(host, commandResults=[done(cid, txn="T-5")])
+    check("the pull goes to the player who asked for it, whoever the "
+          "machine's button is set for by then",
+          cash(host, A) == start_a + 2_500_000
+          and cash(host, B) == start_b,
+          (cash(host, A) - start_a, cash(host, B) - start_b))
+
+    host, egm, A, B = floor()
+    host.glass_cash_out_now(egm.egm_id, A)
+    cid = taken(host)[0]["id"]
+    start_a, start_h = cash(host, A), cash(host, "house")
+    host._tournament_sweep_pins[LEG] = {"acct": "house", "ts": time.time()}
+    report(host, commandResults=[done(cid, txn="T-6")])
+    check("a tournament sweep under way still outranks it",
+          cash(host, "house") == start_h + 2_500_000
+          and cash(host, A) == start_a,
+          (cash(host, A) - start_a, cash(host, "house") - start_h))
+
+    host, egm, A, B = floor()
+    host.glass_cash_out_now(egm.egm_id, A)
+    cid = taken(host)[0]["id"]
+    with host._glass_pin_lock:
+        host._glass_cash_out_pin.pop(egm.egm_id, None)
+    start = cash(host, A)
+    told = said(lambda: report(host, commandResults=[
+        done("copull999-1", txn="T-7")]))
+    check("a result under an id the hub did not ask under is nobody's: "
+          "not credited (the report channel can be forged)",
+          cash(host, A) == start and "T-7" in told, told)
+    check("and the real pull is still counted as on its way",
+          view(host, egm, A).get("cashOutPending") is True)
+
+    # -- a transfer that was sent and has no end yet ---------------------------
+    host, egm, A, B = floor()
+    host.glass_cash_out_now(egm.egm_id, A)
+    cid = taken(host)[0]["id"]
+    report(host, commandResults=[dict(
+        busy(cid), outcome="unconfirmed", txnId="T-8", tries=2,
+        detail="transfer issued but final status never confirmed")])
+    with host._glass_pin_lock:
+        host._glass_cash_out_pin.pop(egm.egm_id, None)
+    start = cash(host, A)
+    report(host, commandResults=[done("late-T-8", txn="T-8",
+                                      lateFor=cid)])
+    check("a transfer that ends late (the satellite names the command it "
+          "was for) is credited to the player who asked",
+          cash(host, A) == start + 2_500_000, cash(host, A) - start)
+
+    # -- housekeeping -----------------------------------------------------------
+    host, egm, A, B = floor()
+    for n in range(host.SAS_CMD_QUEUE_MAX):
+        host.sas_enqueue_command("smib-x", {"id": f"x{n}", "type": "x"})
+    code, reply = host.glass_cash_out_now(egm.egm_id, A)
+    check("a pull that could not be queued is not counted as on its way",
+          code == 400 and "cashOutPending" not in view(host, egm, A),
+          reply)
+    taken(host)
+    code, reply = host.glass_cash_out_now(egm.egm_id, A)
+    check("and the next tap is sent", code == 200
+          and len(taken(host)) == 1 and "waiting" not in reply, reply)
+    host._disarm_sas_leg(LEG)
+    sent = taken(host)
+    check("the disarm the hub sends when it starts, or finds a cash-out "
+          "with no home, drops a waiting pull as well",
+          [(c["type"], c.get("dropPull")) for c in sent]
+          == [("aft_set_host_cashout", True)], sent)
+
+
 def main():
     logging.basicConfig(level=logging.CRITICAL + 1)
     logging.getLogger("g2s_host").setLevel(logging.CRITICAL + 1)
@@ -5025,6 +5378,7 @@ def main():
     batch_7_handpays()
     linked_machines_use_sas()
     sas_handpays_have_an_amount_and_are_booked()
+    a_cash_out_the_machine_cannot_make_yet_is_tried_again()
     print("=" * 50)
     print(f"RESULT: {_p} passed, {_f} failed")
     return 1 if _f else 0

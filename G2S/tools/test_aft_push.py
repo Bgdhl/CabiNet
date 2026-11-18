@@ -289,6 +289,13 @@ def main():
     class CashStub:
         SAS_AFT_MAX_CENTS = 1_000_000
         _settle_aft_cashouts = G.G2SHost._settle_aft_cashouts
+        # the waiting-pull record the settle consults (v0.3.29); nothing
+        # is waiting in these cases, so the stub's pin decides as before
+        CASH_OUT_PULL_OPEN_SEC = G.G2SHost.CASH_OUT_PULL_OPEN_SEC
+        _cash_out_pulls = G.G2SHost._cash_out_pulls
+        _cash_out_pulls_gone = G.G2SHost._cash_out_pulls_gone
+        _cash_out_pull_asker = G.G2SHost._cash_out_pull_asker
+        _cash_out_pull_answered = G.G2SHost._cash_out_pull_answered
 
         def __init__(self, pin):
             self.account_store = store
@@ -296,8 +303,8 @@ def main():
             self._aft_cashout_unconfirmed = set()
             self.pin, self.flags, self.disarmed = pin, [], []
 
-        def _sas_cashout_pin(self, key):
-            return self.pin
+        def _sas_cashout_pin(self, key, asker=None):
+            return asker or self.pin
 
         def _flag_unhomed_cashout(self, *a, **k):
             self.flags.append((a, k))
@@ -461,6 +468,14 @@ def main():
         _drop_refused_cashout_arms = G.G2SHost._drop_refused_cashout_arms
         _cash_out_armed = G.G2SHost._cash_out_armed
         _glass_data_cashout = G.G2SHost._glass_data_cashout
+        # the pull is kept track of while the satellite tries (v0.3.29)
+        CASH_OUT_RETRY_SEC = G.G2SHost.CASH_OUT_RETRY_SEC
+        CASH_OUT_PULL_OPEN_SEC = G.G2SHost.CASH_OUT_PULL_OPEN_SEC
+        CASH_OUT_ERROR_SEC = G.G2SHost.CASH_OUT_ERROR_SEC
+        linked_leg = G.G2SHost.linked_leg
+        _cash_out_pulls = G.G2SHost._cash_out_pulls
+        _cash_out_pull_waiting = G.G2SHost._cash_out_pull_waiting
+        _cash_out_note = G.G2SHost._cash_out_note
 
         def _session_account(self, uid):
             return None, None
