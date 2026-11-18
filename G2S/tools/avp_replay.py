@@ -4421,9 +4421,10 @@ def main():
     if m:
         a = m.get("commandAttrs", {})
         check("watBalance reports the live house balances (cashableAmt "
-              "matches /api/accounts)",
+              "matches /api/accounts; v0.3.26: never below 0, the type "
+              "is meterValue)",
               m["command"] == "watBalance" and a.get("accountId") == "house"
-              and a.get("cashableAmt") == str(house_cashable())
+              and a.get("cashableAmt") == str(max(0, house_cashable()))
               and a.get("frozen") == "false", f"got {a}")
     post_to_host(avp_wrap(avp_class_command(
         "wat", '<g2s:getWatBalance g2s:accountId="NOBODY99"/>',
@@ -7391,9 +7392,10 @@ def main():
           "(debit-on-confirm)", house_cashable() == hb0 - 250000,
           f"got {house_cashable()} want {hb0 - 250000}")
     led = get_json(ACCT_URL).get("ledger", [])
-    check("ledger: the debit carries ref g2sbonus:<transactionId> (the "
-          "retry-idempotency key)",
-          any(e.get("ref") == f"g2sbonus:{bn_txn1}"
+    check("ledger: the debit carries ref g2sbonus:<egmId>:<transactionId>:"
+          "<bonusId> (the retry-idempotency key; v0.3.26: a transactionId "
+          "is unique only inside one EGM)",
+          any(e.get("ref") == f"g2sbonus:{EGM_ID}:{bn_txn1}:{bid1}"
               and e.get("deltaMillicents") == -250000
               and e.get("accountId") == "house" for e in led),
           f"got refs {[e.get('ref') for e in led[-6:]]}")
@@ -7488,7 +7490,8 @@ def main():
           and aw2[0].get("paidAmt") == 0, f"got {aw2}")
     led = get_json(ACCT_URL).get("ledger", [])
     check("ledger: NO g2sbonus ref for the failed transaction",
-          not any(e.get("ref") == f"g2sbonus:{bn_txn2}" for e in led),
+          not any(str(e.get("ref") or "").startswith(
+              f"g2sbonus:{EGM_ID}:{bn_txn2}:") for e in led),
           f"got refs {[e.get('ref') for e in led[-6:]]}")
 
     print("— Step 6.99535: commitBonus WITHOUT a transactionId — no "
@@ -7514,7 +7517,8 @@ def main():
           house_cashable() == hb1, f"got {house_cashable()} want {hb1}")
     led = get_json(ACCT_URL).get("ledger", [])
     check("ledger: NO g2sbonus:0 ref ever minted",
-          not any(e.get("ref") == "g2sbonus:0" for e in led),
+          not any(str(e.get("ref") or "").startswith(
+              f"g2sbonus:{EGM_ID}:0:") for e in led),
           f"got refs {[e.get('ref') for e in led[-6:]]}")
 
     print("— Step 6.9954: bonusAward strict validation — junk draws HTTP "
