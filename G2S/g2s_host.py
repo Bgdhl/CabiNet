@@ -11094,6 +11094,8 @@ class G2SHost:
     # the two pages never word a refusal themselves.
     GLASS_SAY_GONE = "That player is not there any more."
     GLASS_SAY_NO_PLAYER = "This fob is not linked to a player."
+    GLASS_SAY_OWN_WALLET = ("This is your own wallet. It can't be added to "
+                            "from this screen.")
     GLASS_SAY_AGAIN = "That did not work. Try again."
     GLASS_SAY_UNSURE = ("That may not have gone through. Check the balance "
                         "before trying again.")
@@ -11360,6 +11362,14 @@ class G2SHost:
             aid, acct = self._session_account(who["card"].get("uid"))
             if acct is None:
                 return no(self.GLASS_SAY_NO_PLAYER)
+            # A tap-over never pays the admin who raised it. The friend can
+            # be that admin: an admin account logged in by PIN is a plain
+            # player (pin_admin_allowed off) and its own fob then taps
+            # over it; so does the fob of a player who was made an admin
+            # after carding in.
+            if action == "svcFund" and aid == self._session_account(
+                    who["rec"].get("uid"))[0]:
+                return no(self.GLASS_SAY_OWN_WALLET)
         elif action not in ("plCreate", "plAddFobCancel"):
             aid = req.get("accountId")
             acct = is_player(aid)

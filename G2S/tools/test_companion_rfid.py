@@ -908,6 +908,7 @@ def rid():
 GONE = "That player is not there any more."
 UNSURE = ("That may not have gone through. Check the balance before "
           "trying again.")
+OWN_WALLET = "This is your own wallet. It can't be added to from this screen."
 SVC = ("svcFund", "svcSetPin")
 PL = ("plFund", "plTake", "plSetPin", "plClearPin", "plRename", "plCreate",
       "plAddFob", "plAddFobCancel", "plRemoveFob")
@@ -1450,11 +1451,56 @@ def admin_menu_service():
           and "walletMc" not in r
           and (st2, r2.get("error")) == (403, "not authorized")
           and books(eng3) == before, (got, r, r2))
-    check("the service actions are let in",
-          adm(eng3, own_tok, "svcFund")[1].get("error")
-          == "Enter an amount.")
+    got = [adm(eng3, own_tok, "svcFund", cents=5000, rid=rid()),
+           adm(eng3, own_tok, "svcFund", cents=5000, restricted=True,
+               rid=rid())]
+    check("ADD TO WALLET and ADD FREE SLOT PLAY there are refused in "
+          "words: a tap-over does not pay the admin who raised it, and "
+          "nothing is booked",
+          all((s, x.get("ok"), x.get("error")) == (200, False, OWN_WALLET)
+              for s, x in got) and books(eng3) == before, got)
+    check("SET PIN is still let in there",
+          adm(eng3, own_tok, "svcSetPin")[1].get("error")
+          == "A PIN is digits only.")
     eng3.account_store.set_admin(sam, False)
     eng3.glass_state("M1")              # the poll hands the screen back
+
+    print("— service screen: an admin logged in by PIN who taps their own "
+          "fob")
+    # With admin by PIN off (the default) an admin's PIN login is a plain
+    # player's session, so their own fob raises a tap-over over it.
+    eng5 = menu_engine("M1", "M2")
+    aj5 = player(eng5, "AJ", "A1A00001", admin=True, cents=100)
+    chris5 = player(eng5, "Christopher", "C4150001", cents=1000)
+    eng5.account_store.set_pin(aj5, "424242")
+    r = eng5.pin_login("M1", "424242")
+    kind0 = eng5._glass_caller(tok_of(eng5, "M1"))["kind"]
+    tap_at(eng5, "M1", "A1A00001")
+    own5 = tok_of(eng5, "M1")
+    check("the PIN login is a player's session, and the fob raises a "
+          "tap-over over it",
+          r.get("ok") is True and kind0 == "player"
+          and (eng5.admin_overlays.get("M1") or {}).get("uid") == "A1A00001"
+          and eng5._glass_caller(own5)["kind"] == "service"
+          and eng5.glass_state("M1")["service"].get("name") == "AJ",
+          (r, kind0, eng5._glass_caller(own5)["kind"]))
+    before = books(eng5)
+    got = [adm(eng5, own5, "svcFund", cents=10000000, rid=rid()),
+           adm(eng5, own5, "svcFund", cents=5000, restricted=True,
+               rid=rid())]
+    check("ADD TO WALLET and ADD FREE SLOT PLAY from that screen are "
+          "refused in the same words, and nothing is booked",
+          all((s, x.get("ok"), x.get("error")) == (200, False, OWN_WALLET)
+              for s, x in got) and books(eng5) == before, got)
+    tap_at(eng5, "M2", "C4150001")
+    tap_at(eng5, "M2", "A1A00001")              # AJ taps over Christopher
+    st, r = adm(eng5, tok_of(eng5, "M2"), "svcFund", cents=5000, rid=rid())
+    check("the same admin tapping over a friend still adds to the "
+          "friend's wallet",
+          st == 200 and r.get("ok") is True
+          and r.get("msg") == "Added $50.00 to Christopher's wallet."
+          and cash(eng5, chris5) == 6000000 and cash(eng5, aj5) == 100000,
+          (st, r))
 
     print("— service screen: a token that is no longer the machine's own")
     eng3._admin_overlay_push("M1", {"companionId": "companion-M1"},
@@ -1925,6 +1971,36 @@ def admin_menu_money():
           "own sentence (not the store's), and no ledger row",
           (st, r.get("error"), r.get("ok")) == (200, GONE, False)
           and len(rows(eng)) == n0, (st, r))
+
+    print("— who did it comes from the session, never from the request")
+    rec = Records()
+    host_log = logging.getLogger("g2s_host")
+    level = host_log.level
+    host_log.addHandler(rec)
+    host_log.setLevel(logging.DEBUG)
+    logging.disable(logging.NOTSET)
+    n0 = len(rows(eng))
+    try:
+        st, r = adm(eng, svc, "svcFund", cents=100, rid=rid(),
+                    by="Mallory at the door (web)")
+        st2, r2 = adm(eng, adm_tok, "plFund", accountId=sam, cents=100,
+                      rid=rid(), by="Mallory at the door (web)")
+    finally:
+        logging.disable(logging.CRITICAL)
+        host_log.removeHandler(rec)
+        host_log.setLevel(level)
+    new = rows(eng)[n0:]
+    check("svcFund and plFund with a by in the request body: both ledger "
+          "notes of each still end with the real admin and machine",
+          r.get("ok") is True and r2.get("ok") is True
+          and [e["note"] for e in new]
+          == ["house fund" + by_svc, f"fund {chris}" + by_svc,
+              "house fund" + by_adm, f"fund {sam}" + by_adm], (r, r2, new))
+    funds = [ln for ln in rec.lines if "player fund" in ln]
+    check("...and so does the log line of each",
+          len(funds) == 2 and funds[0].endswith(by_svc)
+          and funds[1].endswith(by_adm)
+          and "Mallory" not in "\n".join(rec.lines), funds)
 
     print("— the Players web page is unchanged")
     n0 = len(rows(eng))

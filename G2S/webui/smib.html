@@ -1264,6 +1264,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   var ppRow = null;                  // PLAYER: the row whose page is open
   var ppMsg = '';                    // PLAYER: the hub's last sentence
   var fwOn = false;                  // ADD FOB: waiting for a tap
+  var fwSince = 0;                   // ADD FOB: when that wait began (ms)
   var fwBusy = null;                 // ADD FOB: the arming request in flight
                                      // (its own marker object), else null
   var fwWait = null;                 // ADD FOB: the hub's last fobWait
@@ -2312,6 +2313,14 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
       kpPin1 = first;
       return;
     }
+    // The second entry is compared only when it is long enough to be a
+    // PIN. An OK tapped twice lands here with nothing typed: the step
+    // stays as it is.
+    if (kpPin.length < pinMin) {
+      setText('kp-msg', kpPin.length
+        ? ('Enter at least ' + pinMin + ' digits') : pinHint());
+      return;
+    }
     if (kpPin !== kpPin1) {
       newPinStep(1, 'Those did not match. Start again.'); return;
     }
@@ -2523,6 +2532,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
       fwBusy = null;
       if (!ok) { fobStop(actionErr(status, d)); return; }
       fwOn = true; fwFails = 0; fwWait = d.fobWait;
+      fwSince = new Date().getTime();
       paintPlayer();
       fobPoll();
     });
@@ -2899,7 +2909,12 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
       { action: 'plClearPin', accountId: ppRow.id }, 'player', true);
   };
   $('pp-addfob').onclick = function () {
-    if (fwOn) { fobCancel(); } else { fobArm(); }   // it reads CANCEL then
+    if (!fwOn) { fobArm(); return; }
+    // It reads CANCEL now. For the first half second it takes no tap: the
+    // second tap of a double tap on ADD FOB lands here.
+    var ms = new Date().getTime() - fwSince;
+    if (ms >= 0 && ms < 500) { return; }
+    fobCancel();
   };
   $('pp-remfob').onclick = function () {
     var fobs = rowFobs(ppRow);
@@ -2937,6 +2952,9 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   // money confirm dialog (shared by every confirm but LOG OUT)
   $('cf-yes').onclick = doConfirm;
   $('cf-no').onclick  = function () {
+    // a CONFIRM on its way to the hub is answered before the dialog
+    // closes, so what it did is always seen
+    if (pendingConfirm && pendingConfirm.busy) { return; }
     var b = pendingConfirm ? pendingConfirm.back : null;
     pendingConfirm = null;
     returnFrom(b, null, '');

@@ -1031,8 +1031,8 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   var dataTimer = null;              // cashout's ~2s live-data re-poll handle
   var confirmBusy = false;           // money-confirm POST in flight
   var coToggleBusy = false;          // WAT-toggle POST in flight
-  var pendingConfirm = null;         // {body, back, viaAdmin} armed for the
-                                     // confirm view
+  var pendingConfirm = null;         // {body, back, viaAdmin, at} armed for
+                                     // the confirm view (at = when, in ms)
   var CUR = '$';                     // money symbol; the state poll's
                                      // "currency" (hub setting or the
                                      // machine's currencyId) overrides it
@@ -2071,6 +2071,14 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
       kpRepaint();
       return;
     }
+    // The second entry is compared only when it is long enough to be a
+    // PIN. An OK tapped twice lands here with nothing typed: the pad
+    // stays on this step.
+    if (kpPin.length < pinMin) {
+      setText('kp-msg', kpPin.length
+        ? ('Enter at least ' + pinMin + ' digits') : newPinPrompt());
+      return;
+    }
     if (kpPin !== npFirst) {
       newPinStart('Those did not match. Start again.'); return;
     }
@@ -2159,7 +2167,8 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     return best;
   }
   function askConfirm(q, sub, body, back, viaAdmin) {
-    pendingConfirm = { body: body, back: back, viaAdmin: (viaAdmin === true) };
+    pendingConfirm = { body: body, back: back, viaAdmin: (viaAdmin === true),
+                       at: new Date().getTime() };
     setText('cf-q', q); setText('cf-sub', sub); setText('cf-note', '');
     // the question wraps between its words (two lines of room), but one
     // word cannot wrap: when the widest, an amount, is wider than the lane
@@ -2177,8 +2186,16 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     else { show(home()); }   // 'service' too: home() is the service screen
                              // for as long as the tap-over is up
   }
+  // CONFIRM and CANCEL sit where the keypad's OK key was a moment ago, so
+  // the second tap of a double tap on OK lands on one of them. For the
+  // dialog's first half second neither takes a tap: the question is read
+  // before it is answered.
+  function confirmFresh() {
+    var ms = pendingConfirm ? (new Date().getTime() - pendingConfirm.at) : -1;
+    return ms >= 0 && ms < 500;
+  }
   function doConfirm() {
-    if (confirmBusy || !pendingConfirm) { return; }
+    if (confirmBusy || !pendingConfirm || confirmFresh()) { return; }
     confirmBusy = true;
     setText('cf-note', 'working…');
     var pc = pendingConfirm, tok = sess;
@@ -2349,6 +2366,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   // service screen's adds)
   $('cf-yes').onclick = doConfirm;
   $('cf-no').onclick  = function () {
+    if (confirmFresh()) { return; }
     var b = pendingConfirm ? pendingConfirm.back : null;
     pendingConfirm = null;
     returnFrom(b);
