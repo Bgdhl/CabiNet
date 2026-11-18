@@ -384,10 +384,22 @@ class HandpayLatch:
     # A key-off at the machine is settled by the next credit-meter
     # reading (on_credits), so `last` follows it by one meter sweep.
 
-    def __init__(self, denom_cents=None):
+    # A key-off at the machine is judged on a credit-meter reading taken
+    # at least this long after the machine said the handpay was reset, so
+    # that a reading from the moment of the reset, before the credit
+    # meter has the win, is not taken for "it did not go there". Getting
+    # that wrong would book a win to a wallet that is also on the meter.
+    KEY_OFF_SETTLE_SEC = 3.0
+
+    def __init__(self, denom_cents=None, settle_sec=None,
+                 clock=time.monotonic):
         # denom_cents: a callable giving the machine's accounting
         # denomination in cents (or None), for a record given in cents
         self._denom_cents = denom_cents or (lambda: None)
+        self._settle_sec = (self.KEY_OFF_SETTLE_SEC if settle_sec is None
+                            else settle_sec)
+        self._clock = clock
+        self._settle_at = 0.0
         self.pending = None   # {"since": iso-local, "code": "0x51", ...}
         self.last = None      # the handpay that ended last, see above
         self._seq = 0
@@ -412,6 +424,7 @@ class HandpayLatch:
                 # keyed off at the machine: by hand, unless the credit
                 # meter shows it went there
                 self._settling, self.pending = self.pending, None
+                self._settle_at = self._clock() + self._settle_sec
             logger.info("🧾 handpay latch cleared (0x52 handpay was reset)")
         elif code == HANDPAY_CANCELLED_EXCEPTION and self.pending is not None:
             self._finish("cancelled", "the player cancelled the request")
@@ -436,7 +449,7 @@ class HandpayLatch:
             return
         self._credits = credits
         rec = self._settling
-        if rec is None:
+        if rec is None or self._clock() < self._settle_at:
             return
         self._settling = None
         before, amount = rec.get("creditsAtLockup"), rec.get("amount")

@@ -81,20 +81,20 @@ def lockup(latch, credits=500, seen="the $10,750.00 win"):
 
 class TestHowItEnded:
     def test_pending_carries_the_record(self):
-        latch = lockup(HandpayLatch())
+        latch = lockup(HandpayLatch(settle_sec=0))
         assert latch.pending["amount"] == 1_075_000
         assert latch.pending["kind"] == "win"
         assert latch.pending["creditsAtLockup"] == 500
         assert latch.last is None
 
     def test_the_record_seen_first_stands(self):
-        latch = lockup(HandpayLatch())
+        latch = lockup(HandpayLatch(settle_sec=0))
         latch.on_exception(PENDING)          # the machine asks again
         latch.on_info(parse_handpay_record(record(SEEN["a $22,500.00 win"])))
         assert latch.pending["amount"] == 1_075_000
 
     def test_the_hubs_reset_puts_it_on_the_credit_meter(self):
-        latch = lockup(HandpayLatch())
+        latch = lockup(HandpayLatch(settle_sec=0))
         latch.begin_reset()
         latch.on_exception(RESET)            # arrives inside the reset
         latch.end_reset()
@@ -105,14 +105,14 @@ class TestHowItEnded:
         assert latch.last["seq"] == 1        # reported once, not twice
 
     def test_the_hubs_reset_when_the_52_is_not_seen(self):
-        latch = lockup(HandpayLatch())
+        latch = lockup(HandpayLatch(settle_sec=0))
         latch.begin_reset()
         latch.end_reset()
         latch.on_reset_ok()
         assert latch.last["how"] == "credit"
 
     def test_keyed_off_at_the_machine_is_paid_by_hand(self):
-        latch = lockup(HandpayLatch(), credits=500)
+        latch = lockup(HandpayLatch(settle_sec=0), credits=500)
         latch.on_exception(RESET)
         assert latch.pending is None
         assert latch.last is None            # waits for a credit reading
@@ -121,31 +121,31 @@ class TestHowItEnded:
             ("hand", 1_075_000)
 
     def test_keyed_off_to_the_credit_meter_at_the_machine(self):
-        latch = lockup(HandpayLatch(), credits=500)
+        latch = lockup(HandpayLatch(settle_sec=0), credits=500)
         latch.on_exception(RESET)
         latch.on_credits(500 + 1_075_000 - 300)   # less one bet since
         assert latch.last["how"] == "credit"
 
     def test_a_small_rise_is_not_the_handpay(self):
-        latch = lockup(HandpayLatch(), credits=500)
+        latch = lockup(HandpayLatch(settle_sec=0), credits=500)
         latch.on_exception(RESET)
         latch.on_credits(500 + 2_000)        # a bill went in
         assert latch.last["how"] == "hand"
 
     def test_a_progressive_is_compared_in_credits(self):
-        latch = lockup(HandpayLatch(denom_cents=lambda: 25), credits=0,
+        latch = lockup(HandpayLatch(denom_cents=lambda: 25, settle_sec=0), credits=0,
                        seen="progressive level 4")     # 1,220,000 cents
         latch.on_exception(RESET)
         latch.on_credits(1_220_000 // 25)
         assert latch.last["how"] == "credit"
-        latch = lockup(HandpayLatch(denom_cents=lambda: None), credits=0,
+        latch = lockup(HandpayLatch(denom_cents=lambda: None, settle_sec=0), credits=0,
                        seen="progressive level 4")
         latch.on_exception(RESET)
         latch.on_credits(1_220_000)          # no denomination: not judged
         assert latch.last["how"] == "hand"
 
     def test_no_reading_before_the_lockup(self):
-        latch = HandpayLatch()
+        latch = HandpayLatch(settle_sec=0)
         latch.on_exception(PENDING)
         latch.on_info(parse_handpay_record(record(SEEN["a $22,500.00 win"])))
         latch.on_exception(RESET)
@@ -153,17 +153,17 @@ class TestHowItEnded:
         assert latch.last["how"] == "hand"   # nothing to compare with
 
     def test_cancelled_by_the_player(self):
-        latch = lockup(HandpayLatch())
+        latch = lockup(HandpayLatch(settle_sec=0))
         latch.on_exception(CANCELLED)
         assert latch.pending is None and latch.last["how"] == "cancelled"
 
     def test_the_machine_says_it_is_in_no_handpay(self):
-        latch = lockup(HandpayLatch())
+        latch = lockup(HandpayLatch(settle_sec=0))
         latch.on_no_handpay()
         assert latch.pending is None and latch.last["how"] == "gone"
 
     def test_each_one_is_numbered(self):
-        latch = lockup(HandpayLatch())
+        latch = lockup(HandpayLatch(settle_sec=0))
         latch.on_exception(CANCELLED)
         lockup(latch)
         latch.on_exception(RESET)
@@ -171,7 +171,7 @@ class TestHowItEnded:
         assert latch.last["seq"] == 2 and latch.last["how"] == "hand"
 
     def test_a_reset_with_nothing_pending_changes_nothing(self):
-        latch = HandpayLatch()
+        latch = HandpayLatch(settle_sec=0)
         latch.on_exception(RESET)
         latch.on_reset_ok()
         latch.on_no_handpay()
@@ -179,12 +179,46 @@ class TestHowItEnded:
         assert latch.pending is None and latch.last is None
 
     def test_a_bad_reading_does_not_settle_it(self):
-        latch = lockup(HandpayLatch())
+        latch = lockup(HandpayLatch(settle_sec=0))
         latch.on_exception(RESET)
         latch.on_credits(None)
         assert latch.last is None
         latch.on_credits(500)
         assert latch.last["how"] == "hand"
+
+
+class TestTheWait:
+    """A key-off at the machine is judged on a credit reading taken a
+    few seconds after the reset, not on one from the moment of it."""
+
+    def test_a_reading_at_the_moment_of_the_reset_is_not_used(self):
+        now = [100.0]
+        latch = lockup(HandpayLatch(clock=lambda: now[0]), credits=500)
+        latch.on_exception(RESET)            # the credits key was turned
+        latch.on_credits(500)                # the meter has not caught up
+        assert latch.last is None            # so: not "paid by hand" yet
+        now[0] += HandpayLatch.KEY_OFF_SETTLE_SEC - 0.1
+        latch.on_credits(500)
+        assert latch.last is None
+        now[0] += 0.2
+        latch.on_credits(500 + 1_075_000)    # and now it has
+        assert latch.last["how"] == "credit"
+
+    def test_the_handpay_key_is_by_hand_once_the_wait_is_over(self):
+        now = [100.0]
+        latch = lockup(HandpayLatch(clock=lambda: now[0]), credits=500)
+        latch.on_exception(RESET)
+        now[0] += HandpayLatch.KEY_OFF_SETTLE_SEC
+        latch.on_credits(500)
+        assert latch.last["how"] == "hand"
+
+    def test_the_hubs_reset_does_not_wait(self):
+        now = [100.0]
+        latch = lockup(HandpayLatch(clock=lambda: now[0]))
+        latch.begin_reset()
+        latch.on_exception(RESET)
+        latch.end_reset()
+        assert latch.last["how"] == "credit"
 
 
 def test_the_report_carries_both():
